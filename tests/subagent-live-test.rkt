@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; subagent-live-test.rkt — M5 真机验收：spawn_agent 委派子任务给 gemma
 
 (require
@@ -6,14 +6,14 @@
  racket/string
  racket/file
  racket/pvector
- (file "../model.rkt")
- (file "../event.rkt")
- (file "../provider.rkt")
- (file "../tool.rkt")
- (file "../permission.rkt")
- (file "../loop.rkt")
- (file "../subagent.rkt")
- (file "../tools/builtin.rkt")
+ (file "../src/model.rkt")
+ (file "../src/event.rkt")
+ (file "../src/provider.rkt")
+ (file "../src/tool.rkt")
+ (file "../src/permission.rkt")
+ (file "../src/loop.rkt")
+ (file "../src/subagent.rkt")
+ (file "../src/tools/builtin.rkt")
 ) ; end require
 
 (define tmpdir (make-temporary-file "pi2-sublive-~a" 'directory))

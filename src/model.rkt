@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; model.rkt — pi++ 核心数据模型（design.md §3）
 ;; 所有需持久化的 struct 一律 #:prefab，write/read 直接往返。
 

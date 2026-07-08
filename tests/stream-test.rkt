@@ -1,12 +1,12 @@
-#lang racket-tstring
+#lang tstring racket
 ;; stream-test.rkt — SSE 解析与 accumulator 单测（离线）
 
 (require
  rackunit
  json
  racket/string
- (file "../model.rkt")
- (file "../stream.rkt")
+ (file "../src/model.rkt")
+ (file "../src/stream.rkt")
 ) ; end require
 
 (define (sse-string . chunks)

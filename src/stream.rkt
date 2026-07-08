@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; stream.rkt — SSE 流式解析 + OpenAI 兼容 accumulator（design.md §4.2 / §5.2）
 
 (require

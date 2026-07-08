@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; provider-live-test.rkt — 对本地 LM Studio (gemma-4-31b-it@6bit) 的真机集成测试
 ;; 需要 LM Studio 运行于 localhost:1234。
 
@@ -6,8 +6,8 @@
  rackunit
  racket/async-channel
  racket/string
- (file "../model.rkt")
- (file "../provider.rkt")
+ (file "../src/model.rkt")
+ (file "../src/provider.rkt")
 ) ; end require
 
 (define cfg

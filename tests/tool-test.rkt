@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tool-test.rkt — 工具层与权限单测（M2 前半）
 
 (require
@@ -6,11 +6,11 @@
  racket/string
  racket/file
  racket/list
- (file "../model.rkt")
- (file "../tool.rkt")
- (file "../permission.rkt")
- (file "../tools/builtin.rkt")
- (file "../tools/bash.rkt")
+ (file "../src/model.rkt")
+ (file "../src/tool.rkt")
+ (file "../src/permission.rkt")
+ (file "../src/tools/builtin.rkt")
+ (file "../src/tools/bash.rkt")
 ) ; end require
 
 (define tmpdir (make-temporary-file "pi2-tooltest-~a" 'directory))

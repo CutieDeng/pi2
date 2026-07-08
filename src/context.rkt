@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; context.rkt — 上下文与 token 预算管理（design.md §4.5 / §5.5）
 ;; estimate: 本地启发式（CJK 加权），intmap memo；fit: 三级裁剪的前两级。
 ;; compact!（模型总结压缩）在 loop 之上实现，见 compact.rkt / M4。

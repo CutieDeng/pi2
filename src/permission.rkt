@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; permission.rkt — 权限门控（design.md §4.7）
 ;; 三档模式 × 工具权限级决策矩阵 + always 记忆（经 rktd 持久化）。
 

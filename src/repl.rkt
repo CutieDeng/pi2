@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; repl.rkt — 终端交互层（design.md §4.9 / §5.7）
 
 (require

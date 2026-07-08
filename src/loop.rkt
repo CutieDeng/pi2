@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; loop.rkt — agent 主循环（design.md §4.4 / §5.4）
 ;; 全项目最薄也最核心的一层：组合 context / provider / tool / permission。
 

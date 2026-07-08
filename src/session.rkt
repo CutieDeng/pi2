@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; session.rkt — .rktd 会话持久化与流式重放（design.md §4.6 / §5.6）
 ;; transcript 即真相源；重放复用运行时同一套 state-append 迁移函数。
 
@@ -124,8 +124,8 @@
   ) ; end if
 ) ; end define session-list
 
-;; 默认会话文件名：sessions/<iso-date>-<4位随机>.rktd
-(define (fresh-session-path [dir "sessions"])
+;; 默认会话文件名：data/<iso-date>-<4位随机>.rktd
+(define (fresh-session-path [dir "data"])
   (define d (seconds->date (current-seconds)))
   (define (p2 n) (if (< n 10) f"0{n}" f"{n}"))
   (define tag (number->string (+ 1000 (random 9000))))

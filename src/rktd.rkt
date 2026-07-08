@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; rktd.rkt — .rktd datum-log 流式读写（design.md §4.6 / §5.6）
 ;; 零依赖底层模块：session / permission / config 共用。
 

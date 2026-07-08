@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; loop-test.rkt — 主循环单测（mock provider，离线确定性）
 
 (require
@@ -8,13 +8,13 @@
  racket/list
  racket/file
  racket/pvector
- (file "../model.rkt")
- (file "../event.rkt")
- (file "../provider.rkt")
- (file "../tool.rkt")
- (file "../permission.rkt")
- (file "../loop.rkt")
- (file "../tools/builtin.rkt")
+ (file "../src/model.rkt")
+ (file "../src/event.rkt")
+ (file "../src/provider.rkt")
+ (file "../src/tool.rkt")
+ (file "../src/permission.rkt")
+ (file "../src/loop.rkt")
+ (file "../src/tools/builtin.rkt")
 ) ; end require
 
 ;; mock provider：按脚本依次吐出预设的 assistant 消息

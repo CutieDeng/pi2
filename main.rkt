@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; main.rkt — pi++ 可执行入口（design.md §8）
 ;; 用法：
 ;;   racket main.rkt                          交互式会话
@@ -11,17 +11,24 @@
  racket/cmdline
  racket/string
  racket/port
- (file "model.rkt")
- (file "event.rkt")
- (file "provider.rkt")
- (file "tool.rkt")
- (file "permission.rkt")
- (file "loop.rkt")
- (file "session.rkt")
- (file "repl.rkt")
- (file "subagent.rkt")
- (file "tools/builtin.rkt")
+ racket/runtime-path
+ (file "src/model.rkt")
+ (file "src/event.rkt")
+ (file "src/provider.rkt")
+ (file "src/tool.rkt")
+ (file "src/permission.rkt")
+ (file "src/loop.rkt")
+ (file "src/session.rkt")
+ (file "src/repl.rkt")
+ (file "src/subagent.rkt")
+ (file "src/tools/builtin.rkt")
 ) ; end require
+
+;; 运行时目录锚定到项目根（main.rkt 所在处），与 agent 的目标工作目录无关。
+;; data/  存会话 transcript；cache/  存权限等跨会话缓存。
+(define-runtime-path project-root ".")
+(define data-dir (build-path project-root "data"))
+(define cache-dir (build-path project-root "cache"))
 
 (define DEFAULT-SYSTEM
   (string-join
@@ -74,7 +81,8 @@
 
   ;; 装配 deps；工具集 = 内置工具 + spawn_agent（子 agent 只拿内置工具）
   (define bus (make-bus))
-  (define perm-store (build-path (find-system-path 'home-dir) ".pi2-permissions.rktd"))
+  (make-directory* cache-dir)
+  (define perm-store (build-path cache-dir "permissions.rktd"))
   (define prov (make-openai-provider cfg))
   (define base-tools (builtin-tools cfg))
   (define spawn-tool
@@ -97,10 +105,10 @@
     ) ; end if
   ) ; end define st0
 
-  ;; 会话文件
+  ;; 会话文件：新建时落到 data/，resume 时沿用给定路径
   (define sess-path
     (or (and (unbox resume-path) (string->path (unbox resume-path)))
-        (fresh-session-path)
+        (fresh-session-path data-dir)
     ) ; end or
   ) ; end define sess-path
   (define sess (session-open! sess-path cfg))

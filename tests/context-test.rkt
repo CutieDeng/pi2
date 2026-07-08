@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; context-test.rkt — token 估算与裁剪单测
 
 (require
@@ -6,9 +6,9 @@
  racket/pvector
  racket/list
  racket/async-channel
- (file "../model.rkt")
- (file "../provider.rkt")
- (file "../context.rkt")
+ (file "../src/model.rkt")
+ (file "../src/provider.rkt")
+ (file "../src/context.rkt")
 ) ; end require
 
 ;; ---------------------------------------------------------------- 估算

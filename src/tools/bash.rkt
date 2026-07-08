@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tools/bash.rkt — shell 命令执行工具（design.md §5.3）
 
 (require

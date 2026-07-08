@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tools/search.rkt — glob / grep（design.md §5.3；纯 Racket 实现，无 rg 依赖）
 
 (require

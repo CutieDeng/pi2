@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tools/file.rkt — read_file / write_file / edit_file（design.md §5.3）
 
 (require

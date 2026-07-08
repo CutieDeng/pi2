@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; provider.rkt — OpenAI 兼容流式 LLM 客户端（design.md §4.1 / §5.1）
 ;; 测试/默认后端：本地 LM Studio (http://localhost:1234/v1)。
 

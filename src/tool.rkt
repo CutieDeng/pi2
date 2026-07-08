@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tool.rkt — 工具协议与注册表（design.md §4.3）
 
 (require

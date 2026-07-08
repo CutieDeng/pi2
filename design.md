@@ -663,34 +663,43 @@ main thread ──── repl 读输入循环
 
 ## 8. 文件布局
 
+代码与数据分离：源码收敛在 `src/`，运行时产物落 `data/`（transcript）与 `cache/`（跨会话
+缓存），二者 git 忽略。`main.rkt` 用 `define-runtime-path` 锚定项目根，故 data/cache 始终
+相对项目而非 agent 的目标工作目录。
+
 ```
 pi2/
 ├── design.md            ; 本文档
-├── config.rktd          ; 运行配置（模型/预算/权限模式），read 即 config 数据
-├── main.rkt             ; 可执行入口：解析命令行 + config.rktd → 装配 deps → run-repl!
-├── model.rkt            ; §3 核心数据模型（prefab structs）
-├── rktd.rkt             ; §4.6 datum-log 流式读写（session/permission/config 复用）
-├── event.rkt            ; §4.8 事件总线
-├── provider.rkt         ; §4.1 LLM 客户端
-├── stream.rkt           ; §4.2 SSE 解析 + accumulator
-├── tool.rkt             ; §4.3 工具协议与注册表
-├── tools/               ; 内置工具，一具一文件
-│   ├── bash.rkt
-│   ├── file.rkt         ; read/write/edit
-│   └── search.rkt       ; glob/grep
-├── loop.rkt             ; §4.4 主循环
-├── context.rkt          ; §4.5 上下文管理
-├── session.rkt          ; §4.6 持久化
-├── permission.rkt       ; §4.7 权限
-├── subagent.rkt         ; §4.10 子 agent
-├── repl.rkt             ; §4.9 终端交互
-└── tests/               ; 每模块一个 <mod>-test.rkt（rackunit）
+├── README.md
+├── run-tests.sh
+├── main.rkt             ; 可执行入口：解析命令行 → 装配 deps → run-repl!（锚定 data/、cache/）
+├── src/                 ; 全部源码（#lang tstring racket）
+│   ├── model.rkt        ; §3 核心数据模型（prefab structs）
+│   ├── rktd.rkt         ; §4.6 datum-log 流式读写（session/permission 复用）
+│   ├── event.rkt        ; §4.8 事件总线
+│   ├── provider.rkt     ; §4.1 LLM 客户端
+│   ├── stream.rkt       ; §4.2 SSE 解析 + accumulator
+│   ├── tool.rkt         ; §4.3 工具协议与注册表
+│   ├── tools/           ; 内置工具，一具一文件
+│   │   ├── bash.rkt
+│   │   ├── file.rkt     ; read/write/edit
+│   │   ├── search.rkt   ; glob/grep
+│   │   └── builtin.rkt  ; 内置工具集装配
+│   ├── loop.rkt         ; §4.4 主循环
+│   ├── context.rkt      ; §4.5 上下文管理
+│   ├── session.rkt      ; §4.6 持久化
+│   ├── permission.rkt   ; §4.7 权限
+│   ├── subagent.rkt     ; §4.10 子 agent
+│   └── repl.rkt         ; §4.9 终端交互
+├── tests/               ; 每模块一个 <mod>-test.rkt（rackunit）+ *-live-test.rkt
+├── data/                ; 运行时：会话 transcript <iso>-<rand>.rktd（git 忽略）
+└── cache/               ; 运行时：permissions.rktd 等跨会话缓存（git 忽略）
 ```
 
 依赖方向（→ = 依赖）：`repl → loop → {context, tool, permission} → provider → stream → model`；
 `event`、`session` 被横向引用但自身只依赖 `model`；`rktd` 零依赖，位于最底层。无环。
 
-会话文件：`sessions/<iso-date>-<4位随机>.rktd`（子 agent 为 `...-sub-<n>.rktd`）。
+会话文件：`data/<iso-date>-<4位随机>.rktd`（子 agent transcript 另存，见 §4.10）。
 
 ---
 
@@ -711,10 +720,11 @@ pi2/
 
 ## 10. 实现状态
 
-M1–M5 全部落地并通过验收（Racket v9.2.2 增强版，`#lang racket-tstring`）。
+M1–M5 全部落地并通过验收（Racket v9.2.2 增强版，`#lang tstring racket`）。
 
-- **模块内 f-string**：需 `#lang racket-tstring`（普通 `#lang racket` 下 `f""` 不可用）。
-  嵌套过深、带转义引号的 f-string 会触发 reader 报错，此类处改用 `string-append` + 简单插值。
+- **模块内 f-string**：需 `#lang tstring racket`（`tstring` 语言层包裹指定基础语言，故拿到
+  完整 `racket` 而非 `racket/base`；普通 `#lang racket` 下 `f""` 不可用）。嵌套过深、带转义引号
+  的 f-string 会触发 reader 报错，此类处改用 `string-append` + 简单插值。
 - **API 差异**：实测后端为 OpenAI 兼容协议（LM Studio），故 `provider.rkt` 按 OpenAI
   `chat.completions` 的 `tool_calls` / `reasoning_content` 实现，而非 Anthropic 原生格式；
   §5.2 的 accumulator 三段协议对应到 OpenAI 的 `delta.tool_calls[].index` 分片累积，

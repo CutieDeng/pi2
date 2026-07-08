@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; session-test.rkt — 会话持久化与流式重放单测
 
 (require
@@ -6,8 +6,8 @@
  racket/file
  racket/pvector
  racket/string
- (file "../model.rkt")
- (file "../session.rkt")
+ (file "../src/model.rkt")
+ (file "../src/session.rkt")
 ) ; end require
 
 (define tmpdir (make-temporary-file "pi2-sesstest-~a" 'directory))

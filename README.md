@@ -5,7 +5,7 @@
 
 ## 依赖
 
-- 增强版 Racket（`#lang racket-tstring`，含 `f""` 字符串模板、`pvector`、`racket/intmap`）。
+- 增强版 Racket（源码用 `#lang tstring racket`，含 `f""` 字符串模板、`pvector`、`racket/intmap`）。
 - 一个 OpenAI 兼容的 LLM 端点。默认指向本地 LM Studio (`http://localhost:1234/v1`)，
   默认模型 `gemma-4-31b-it@6bit`。
 
@@ -22,7 +22,7 @@ racket main.rkt -m gemma-4-31b-it@6bit -e http://localhost:1234/v1 --mode normal
 racket main.rkt --mode yolo -p "read config.rkt and summarize it"
 
 # 恢复历史会话
-racket main.rkt --resume sessions/20260709-1030-8905.rktd
+racket main.rkt --resume data/20260709-1030-8905.rktd
 ```
 
 远程端点用环境变量 `PI_API_KEY` 提供密钥。
@@ -39,7 +39,7 @@ racket main.rkt --resume sessions/20260709-1030-8905.rktd
 | `normal`（默认） | 直通 | 直通 | 询问 |
 | `yolo` | 直通 | 直通 | 直通 |
 
-答 `a(lways)` 的工具记入 `~/.pi2-permissions.rktd`，跨会话生效。
+答 `a(lways)` 的工具记入 `cache/permissions.rktd`，跨会话生效。
 
 ## 内置工具
 
@@ -57,14 +57,21 @@ transcript 是 `.rktd` datum 流（prefab struct 的 `write`/`read` 往返），
 ./run-tests.sh --live   # 追加对 LM Studio gemma 的真机验收（3 套）
 ```
 
-## 模块
+## 目录结构
 
 ```
-main.rkt      入口装配          loop.rkt      agent 主循环
-model.rkt     核心数据 (prefab) context.rkt   token 估算/裁剪/compact
-rktd.rkt      datum-log 流式读写 session.rkt   .rktd 持久化/流式重放
-event.rkt     事件总线          permission.rkt 权限门控
-provider.rkt  流式 LLM 客户端    repl.rkt      终端交互
-stream.rkt    SSE/accumulator   subagent.rkt  spawn_agent
-tools/        bash/file/search/builtin
+pi2/
+├── main.rkt              入口装配（锚定 data/ 与 cache/）
+├── run-tests.sh
+├── src/                  全部源码
+│   ├── model.rkt         核心数据 (prefab)      loop.rkt      agent 主循环
+│   ├── rktd.rkt          datum-log 流式读写      context.rkt   token 估算/裁剪/compact
+│   ├── event.rkt         事件总线               session.rkt   .rktd 持久化/流式重放
+│   ├── provider.rkt      流式 LLM 客户端         permission.rkt 权限门控
+│   ├── stream.rkt        SSE/accumulator        repl.rkt      终端交互
+│   ├── tool.rkt          工具协议/注册表         subagent.rkt  spawn_agent
+│   └── tools/            bash · file · search · builtin
+├── tests/               单测 + 真机验收
+├── data/                运行时：会话 transcript (*.rktd)，git 忽略
+└── cache/               运行时：permissions.rktd 等跨会话缓存，git 忽略
 ```

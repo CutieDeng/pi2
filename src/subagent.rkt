@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; subagent.rkt — spawn_agent 工具（design.md §4.10）
 ;; 用受限 config + 独立空 history 递归调 run-turn!；深度硬限制为 1。
 

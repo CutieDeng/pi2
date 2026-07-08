@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; hook-test.rkt — pre-tool-hook 拦截单测（mock provider）
 
 (require
@@ -7,13 +7,13 @@
  racket/string
  racket/file
  racket/pvector
- (file "../model.rkt")
- (file "../event.rkt")
- (file "../provider.rkt")
- (file "../tool.rkt")
- (file "../permission.rkt")
- (file "../loop.rkt")
- (file "../tools/builtin.rkt")
+ (file "../src/model.rkt")
+ (file "../src/event.rkt")
+ (file "../src/provider.rkt")
+ (file "../src/tool.rkt")
+ (file "../src/permission.rkt")
+ (file "../src/loop.rkt")
+ (file "../src/tools/builtin.rkt")
 ) ; end require
 
 (define (mock-provider script-box)

@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; tools/builtin.rkt — 内置工具集装配（design.md §4.3）
 
 (require

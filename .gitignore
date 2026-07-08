@@ -1,0 +1,6 @@
+# runtime artifacts
+/data/
+/cache/
+compiled/
+**/compiled/
+*.pi2tmp

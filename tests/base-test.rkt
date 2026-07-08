@@ -1,13 +1,13 @@
-#lang racket-tstring
+#lang tstring racket
 ;; base-test.rkt — model / rktd / event 单测（M1 基础层）
 
 (require
  rackunit
  racket/pvector
  racket/file
- (file "../model.rkt")
- (file "../rktd.rkt")
- (file "../event.rkt")
+ (file "../src/model.rkt")
+ (file "../src/rktd.rkt")
+ (file "../src/event.rkt")
 ) ; end require
 
 ;; ---------------------------------------------------------------- model

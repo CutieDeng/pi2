@@ -1,4 +1,4 @@
-#lang racket-tstring
+#lang tstring racket
 ;; event.rkt — 事件总线（design.md §4.8）
 ;; 每订阅者一个 async-channel + 消费线程：发布方永不被慢订阅者阻塞。
 

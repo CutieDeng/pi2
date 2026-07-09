@@ -75,25 +75,50 @@
   (check-false (string-contains? out "streaming\r\n"))  ; 尚未提交
 ) ; end test-case
 
-;; ---------------------------------------------------------------- Ctrl-C / EOF
+;; ---------------------------------------------------------------- Ctrl-C 阶梯 / EOF
 
-(test-case "Ctrl-C during a running turn triggers interrupt"
-  (define fired (box #f))
-  (define-values (term st) (make-scripted-terminal ""))
-  (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
-  (console-set-idle! con #f)              ; 模拟运行中（非空闲）
-  (feed! con (bytes 3))                   ; Ctrl-C
-  (check-true (unbox fired))
-) ; end test-case
+;; 阶梯语义（Task 3）：有草稿→清草稿；空+运行中→打断+回显；空+空闲→无动作。
 
-(test-case "Ctrl-C while idle clears the line, no interrupt"
+(test-case "Ctrl-C with draft clears the draft, no interrupt"
   (define fired (box #f))
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
   (console-set-idle! con #t)
-  (feed! con (bytes-append #"abc" (bytes 3)))
-  (check-false (unbox fired))
+  (feed! con (bytes-append #"abc" (bytes 3)))  ; 键入 abc 后 Ctrl-C
+  (check-false (unbox fired))                  ; 不打断
+  ;; 草稿已清空：随后键入 x 回车，提交的是 "x" 而非 "abcx"
+  (feed! con "x\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "x")
+) ; end test-case
+
+(test-case "Ctrl-C with draft while running clears draft, still no interrupt"
+  (define fired (box #f))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
+  (console-set-idle! con #f)                   ; 运行中
+  (feed! con (bytes-append #"draft" (bytes 3)))
+  (check-false (unbox fired))                  ; 有草稿优先清草稿，不打断
+) ; end test-case
+
+(test-case "Ctrl-C on empty while running interrupts and echoes ^C"
+  (define fired (box #f))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
+  (console-set-idle! con #f)                   ; 运行中，空框
+  (feed! con (bytes 3))
+  (check-true (unbox fired))
   (check-true (string-contains? (scripted-output st) "^C"))
+) ; end test-case
+
+(test-case "Ctrl-C on empty while idle is a no-op"
+  (define fired (box #f))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
+  (console-set-idle! con #t)
+  (define before (string-length (scripted-output st)))
+  (feed! con (bytes 3))
+  (check-false (unbox fired))
+  (check-false (string-contains? (scripted-output st) "^C"))  ; 无回显
 ) ; end test-case
 
 (test-case "Ctrl-D on empty routes eof to submit channel"
@@ -118,6 +143,68 @@
   (check-equal? ans "y")
   ;; 回答不应泄漏到正常 submit 通道
   (check-false (async-channel-try-get (console-submit-channel con)))
+) ; end test-case
+
+;; ---------------------------------------------------------------- 输入框：分隔线
+
+(test-case "idle input box draws a separator line"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:prompt "> "))
+  (console-set-idle! con #t)
+  (check-true (string-contains? (scripted-output st) "─"))   ; U+2500 分隔线
+) ; end test-case
+
+;; ---------------------------------------------------------------- '/' 命令预览
+
+(test-case "typing a slash renders the command hint preview"
+  (define hint
+    (lambda (text)
+      (if (and (> (string-length text) 0) (char=? (string-ref text 0) #\/))
+          (list "  /model <id>  switch model")
+          '())))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:hint hint))
+  (console-set-idle! con #t)
+  (feed! con "/mo")
+  (check-true (string-contains? (scripted-output st) "/model"))  ; 预览已渲染
+) ; end test-case
+
+(test-case "hint disappears once input no longer starts with slash"
+  (define calls (box '()))
+  (define hint
+    (lambda (text)
+      (set-box! calls (cons text (unbox calls)))
+      (if (and (> (string-length text) 0) (char=? (string-ref text 0) #\/)) (list "HINT") '())))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:hint hint))
+  (console-set-idle! con #t)
+  (feed! con "hello")                     ; 非命令
+  ;; hint 被调用过但对非 '/' 文本返回空，输出不含 HINT
+  (check-false (string-contains? (scripted-output st) "HINT"))
+) ; end test-case
+
+;; ---------------------------------------------------------------- 滚动缓存（超长会话提取）
+
+(test-case "committed output lines land in the scrollback cache"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "alpha\nbeta\ngamma\n")
+  (check-equal? (console-tail-lines con 2) '("beta" "gamma"))
+  (check-equal? (console-tail-lines con 10) '("alpha" "beta" "gamma"))
+) ; end test-case
+
+(test-case "cache is bounded (ring evicts oldest)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:cache-lines 3))
+  (for ([i (in-range 6)]) (console-emit! con f"line{i}\n"))
+  (check-equal? (console-tail-lines con 100) '("line3" "line4" "line5"))  ; 仅保留最后 3
+) ; end test-case
+
+(test-case "cached lines are stripped of ANSI styling"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "\e[31mred\e[0m\n")
+  (check-equal? (console-tail-lines con 1) '("red"))
 ) ; end test-case
 
 (displayln "tui-console-test: all passed")

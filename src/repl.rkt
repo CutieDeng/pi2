@@ -19,6 +19,7 @@
  (file "session.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
+ (file "tui/sanitize.rkt")
 ) ; end require
 
 ;; ---------------------------------------------------------------- ANSI
@@ -29,6 +30,35 @@
 (define (green s) f"\e[32m{s}\e[0m")
 (define (red s) f"\e[31m{s}\e[0m")
 (define (yellow s) f"\e[33m{s}\e[0m")
+
+;; ---------------------------------------------------------------- 元命令表
+
+;; '/' 元命令组：名称 · 参数 · 说明。既驱动 /help，也驱动 TUI 实时预览面板。
+(define COMMANDS
+  '(("/help"    ""     "show commands")
+    ("/quit"    ""     "exit (session saved)")
+    ("/clear"   ""     "clear conversation history")
+    ("/usage"   ""     "token usage so far")
+    ("/compact" ""     "summarize old history to save context")
+    ("/history" ""     "message count and roles")
+    ("/tail"    "[n]"  "show last n cached output lines (default 20)")
+    ("/model"   "<id>" "switch model")
+   ) ; end list
+) ; end define COMMANDS
+
+;; 当前输入若以 '/' 起头，返回匹配命令的暗色预览行（供 console 实时渲染）。
+(define (command-hint-lines text)
+  (cond
+    [(and (positive? (string-length text)) (char=? (string-ref text 0) #\/))
+     (define parts (string-split text))
+     (define tok (if (null? parts) "/" (car parts)))
+     (for/list ([c (in-list COMMANDS)] #:when (string-prefix? (car c) tok))
+       (dim f"  {(car c)} {(cadr c)}  {(caddr c)}")
+     ) ; end for/list
+    ] ; end command case
+    [else '()]
+  ) ; end cond
+) ; end define command-hint-lines
 
 ;; ---------------------------------------------------------------- 渲染订阅者
 
@@ -46,14 +76,14 @@
             (set-box! in-thinking #t)
             (emit (dim "\n💭 "))
           ) ; end unless
-          (emit (dim (evt:delta-text e)))
+          (emit (dim (sanitize-untrusted (evt:delta-text e))))
          ] ; end thinking case
          [(text)
           (when (unbox in-thinking)
             (set-box! in-thinking #f)
             (emit "\n")
           ) ; end when
-          (emit (evt:delta-text e))
+          (emit (sanitize-untrusted (evt:delta-text e)))
          ] ; end text case
          [else (void)]                       ; tool-json 增量不直接渲染
        ) ; end case
@@ -68,7 +98,7 @@
        (emit (string-append " " (dim f"— {ms}ms") "\n"))
       ] ; end tool-end case
       [(evt:error? e)
-       (emit (red f"\n[error] {(exn-message (evt:error-exn e))}\n"))
+       (emit (red f"\n[error] {(sanitize-untrusted (exn-message (evt:error-exn e)))}\n"))
       ] ; end error case
       [(evt:turn-end? e)
        (emit "\n")
@@ -79,7 +109,7 @@
 ) ; end define make-renderer
 
 (define (summarize-input input)
-  (define s (format "~a" input))
+  (define s (sanitize-untrusted (format "~a" input)))   ; 参数来自模型，消毒后再显示
   (if (> (string-length s) 60)
       (string-append (substring s 0 60) "…")
       s
@@ -139,7 +169,8 @@
   (define main-th (current-thread))
   (define con
     (make-console term #:prompt (green "› ")
-                  #:interrupt (lambda () (break-thread main-th)))  ; Ctrl-C → 取消当前轮
+                  #:interrupt (lambda () (break-thread main-th))  ; Ctrl-C → 取消当前轮
+                  #:hint command-hint-lines)                      ; '/' 元命令实时预览
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
@@ -287,17 +318,10 @@
   (case name
     [("/quit" "/exit" "/q") (values st #f)]
     [("/help")
-     (say (dim (string-join
-       '("commands:"
-         "  /help            show this"
-         "  /quit            exit (session saved)"
-         "  /clear           clear conversation history"
-         "  /usage           token usage so far"
-         "  /compact         summarize old history to save context"
-         "  /history         message count and roles"
-         "  /model <id>      switch model"
-        ) ; end list
-       "\n")))
+     (say (dim "commands:"))
+     (for ([c (in-list COMMANDS)])
+       (say (dim f"  {(car c)} {(cadr c)}  {(caddr c)}"))
+     ) ; end for
      (values st #t)
     ] ; end help case
     [("/clear")
@@ -330,6 +354,22 @@
      ) ; end for
      (values st #t)
     ] ; end history case
+    [("/tail")
+     ;; 从控制台滚动缓存提取最后 n 行——超长会话的局部信息显示。
+     (define con (current-console))
+     (cond
+       [(not con) (say (dim "/tail 仅在交互式 TUI 可用")) (values st #t)]
+       [else
+        (define n (if (and (pair? args) (string->number (car args)))
+                      (inexact->exact (string->number (car args)))
+                      20))
+        (define lines (console-tail-lines con n))
+        (say (dim f"— last {(length lines)} cached lines —"))
+        (for ([l (in-list lines)]) (say l))
+        (values st #t)
+       ] ; end else
+     ) ; end cond
+    ] ; end tail case
     [("/model")
      (cond
        [(null? args) (say (red "usage: /model <id>")) (values st #t)]

@@ -29,10 +29,16 @@ racket main.rkt --resume data/20260709-1030-8905.rktd
 
 ### 行编辑快捷键（交互式 TUI）
 
-交互式会话全程处于原始模式，底部固定一条输入行、异步输出滚动其上：agent 流式
-输出时用户可继续键入而不会被撞进输出流（杜绝 cooked 回显冲突），按键仅回显至输入行。
-支持 readline 常用键位与 Unicode 正确渲染（CJK/emoji 双宽光标对齐）。
-管道输入自动回退纯 `read-line`。
+交互式会话全程处于原始模式，屏幕底部固定一个「输入文本框」（分隔线 + 输入行），
+异步输出滚动其上方：agent 流式输出时用户可继续键入而不会被撞进输出流（杜绝 cooked
+回显冲突），按键仅回显至输入框。支持 readline 常用键位与 Unicode 正确渲染
+（CJK/emoji 双宽光标对齐）。管道输入自动回退纯 `read-line`。
+
+- **滚动**：输出留在主屏，用终端**原生 scrollback**（鼠标滚轮/触控板）即可上翻历史；
+  另有内存滚动缓存支撑超长会话的局部提取（见 `/tail`）。
+- **命令预览**：输入以 `/` 起头时，底部实时显示匹配的元命令预览面板，边打边收窄。
+- **安全**：模型/工具输出默认经消毒，剥离 ESC/控制字符，杜绝终端转义注入（改标题、
+  清屏、光标劫持等）。
 
 | 键 | 作用 | 键 | 作用 |
 |---|---|---|---|
@@ -41,12 +47,16 @@ racket main.rkt --resume data/20260709-1030-8905.rktd
 | `Ctrl-W` `Alt-⌫` | 删前一词 | `Alt-D` | 删后一词 |
 | `Ctrl-K` | 删到行尾 | `Ctrl-U` | 删到行首 |
 | `Ctrl-Y` | 粘贴 kill-ring | `↑/↓` `Ctrl-P/N` | 历史 |
-| `Ctrl-L` | 清屏 | `Ctrl-C` | 取消当前行 |
-| `Ctrl-D` | 空行时退出 | `\` 结尾 | 续行（多行输入） |
+| `Ctrl-L` | 清屏 | `Ctrl-D` | 空行时退出 |
+
+`Ctrl-C` 分级：**输入框有草稿** → 清空草稿；**草稿为空且 agent 运行中** → 打断当前轮
+并回显 `^C`；**草稿为空且空闲** → 无动作。
 
 ### 斜杠命令
 
-`/help` `/quit` `/clear` `/usage` `/compact` `/history` `/model <id>`
+`/help` `/quit` `/clear` `/usage` `/compact` `/history` `/tail [n]` `/model <id>`
+
+输入 `/` 时 TUI 会实时预览可用命令。`/tail [n]` 从滚动缓存取最后 n 行（默认 20）。
 
 ### 权限模式
 
@@ -97,8 +107,9 @@ pi2/
 │       ├── keys.rkt      按键/转义序列解析
 │       ├── terminal.rkt  终端抽象（真实 tty + 脚本后端）
 │       ├── lineedit.rkt  行编辑器 + readline 快捷键
+│       ├── sanitize.rkt  不可信文本消毒（剥离终端转义注入）
 │       ├── tui.rkt       组装 tui-read-line（同步单行读）
-│       └── console.rkt   异步实时控制台（底部输入行 + 上方滚动输出）
+│       └── console.rkt   异步实时控制台（输入框 + 滚动输出 + 缓存 + 命令预览）
 ├── tests/               单测 + 真机验收（raco test；info.rkt 排除 live）
 ├── data/                运行时：会话 transcript (*.rktd)，git 忽略
 └── cache/               运行时：permissions.rktd 等跨会话缓存，git 忽略

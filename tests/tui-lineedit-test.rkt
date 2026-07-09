@@ -162,4 +162,23 @@
   (check-equal? (visible-width "中文") 4)
 ) ; end test-case
 
+(test-case "Shift+Enter inserts newline; multi-line value + row metrics"
+  (define st
+    (for/fold ([s (make-ledit)]) ([k (parse-keys (bytes-append #"ab" #"\e[13;2u" #"cd"))])
+      (define-values (s* _a) (ledit-apply s k))
+      s*))
+  (check-equal? (ledit-value st) "ab\ncd")
+  (check-equal? (ledit-line-count st) 2)
+  (check-equal? (ledit-cursor-row st) 1)          ; 光标在第 2 行
+  ;; 渲染含分行与末行光标定位
+  (define r (ledit-render st "> "))
+  (check-true (string-contains? r "> ab"))
+  (check-true (string-contains? r "cd"))
+) ; end test-case
+
+(test-case "plain Enter submits, not newline"
+  (define-values (s* a) (ledit-apply (make-ledit #:text "hi") (car (parse-keys #"\r"))))
+  (check-eq? a 'submit)
+) ; end test-case
+
 (displayln "tui-lineedit-test: all passed")

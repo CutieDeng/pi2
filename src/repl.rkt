@@ -211,8 +211,11 @@
             (define st*
               (with-handlers ([exn:break?
                                (lambda (_e)
-                                 (say (yellow "[cancelled]"))
                                  (provider-cancel! (deps-provider d))
+                                 ;; 中断提示作为独立元信息块：先换行结束流式输出，
+                                 ;; 再单起一行，不与上文回显同块（也不回显 ^C）。
+                                 (emit "\n")
+                                 (say (yellow "⎯ interrupted ⎯"))
                                  st
                                ) ; end lambda
                               ]

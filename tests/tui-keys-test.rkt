@@ -93,4 +93,24 @@
   (check-false (kev-ctrl? (kchar #\a)))
 ) ; end test-case
 
+(test-case "Shift/Alt+Enter parse to enter with modifiers (multi-line)"
+  ;; CSI-u（kitty 键协议）
+  (define su (car (parse-keys #"\e[13;2u")))
+  (check-eq? (kev-name su) 'enter)
+  (check-true (kev-shift? su))
+  ;; modifyOtherKeys 形式
+  (define mk (car (parse-keys #"\e[27;2;13~")))
+  (check-eq? (kev-name mk) 'enter)
+  (check-true (kev-shift? mk))
+  ;; Alt/Option+Enter（可移植回退）
+  (define ae (car (parse-keys #"\e\r")))
+  (check-eq? (kev-name ae) 'enter)
+  (check-true (kev-alt? ae))
+  ;; 普通 Enter 无修饰
+  (define pe (car (parse-keys #"\r")))
+  (check-eq? (kev-name pe) 'enter)
+  (check-false (kev-shift? pe))
+  (check-false (kev-alt? pe))
+) ; end test-case
+
 (displayln "tui-keys-test: all passed")

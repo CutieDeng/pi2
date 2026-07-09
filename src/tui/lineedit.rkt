@@ -209,7 +209,10 @@
   (define n (string-length t))
   (define ctrl? (kev-ctrl? k))
   (case name
-    [(enter) (values st 'submit)]
+    ;; Shift/Alt+Enter 插入换行（多行输入）；普通 Enter 提交。
+    [(enter) (if (or (kev-shift? k) (kev-alt? k))
+                 (values (insert-str st "\n") 'edit)
+                 (values st 'submit))]
     [(left) (if ctrl?
                 (values (struct-copy ledit st [cursor (word-start-before t c)]) 'edit)
                 (values (struct-copy ledit st [cursor (max 0 (sub1 c))]) 'edit))]
@@ -241,19 +244,54 @@
   (regexp-replace* #rx"\e\\[[0-9;?]*[ -/]*[@-~]" s "")
 ) ; end define strip-ansi
 
-;; 生成把当前行重绘到终端的 ANSI 串：回到行首、清行、写 prompt+text、定位光标。
-;; 单视觉行模型（假定 prompt+text 不超过一屏宽；超宽时依赖终端自动折行，光标列可能偏移）。
+;; 文本按 \n 切成的视觉行（保留空行）
+(define (text-lines t) (regexp-split #rx"\n" t))
+
+;; 输入占用的行数（多行输入）
+(define (ledit-line-count st) (length (text-lines (ledit-text st))))
+
+;; 光标所在行号（0 基）= 光标前的 \n 个数
+(define (ledit-cursor-row st)
+  (for/sum ([ch (in-string (substring (ledit-text st) 0 (ledit-cursor st)))]
+            #:when (char=? ch #\newline)) 1)
+) ; end define ledit-cursor-row
+
+;; 光标定位到 (row,col)：给定行内偏移，算出行号与该行的字符偏移
+(define (cursor-row/col lines c)
+  (let loop ([ls lines] [idx 0] [rem c])
+    (define L (string-length (car ls)))
+    (if (or (null? (cdr ls)) (<= rem L))
+        (values idx (min rem L))
+        (loop (cdr ls) (add1 idx) (- rem L 1)))     ; -1 跳过 \n
+  ) ; end let loop
+) ; end define cursor-row/col
+
+;; 生成把当前输入重绘到终端的 ANSI 串。多行感知：逐行输出，末尾把光标上移到
+;; 光标所在行、右移到目标列。单行时退化为原「回行首/清行/定位列」。
+;; （每行按显示宽度定位；单条逻辑行超屏宽的自动折行不额外记账，同既有假设。）
 (define (ledit-render st prompt)
   (define t (ledit-text st))
   (define c (ledit-cursor st))
-  (define target-col (+ (visible-width prompt) (string-width-upto t c)))
+  (define lines (text-lines t))
+  (define pw (visible-width prompt))
+  ;; 逐行：第一行带 prompt，其后各行换行另起；每行 \e[K 清到行尾
+  (define body
+    (let loop ([ls lines] [first? #t] [acc '()])
+      (cond
+        [(null? ls) (apply string-append (reverse acc))]
+        [first? (loop (cdr ls) #f (cons f"\r\e[K{prompt}{(car ls)}" acc))]
+        [else   (loop (cdr ls) #f (cons f"\r\n\e[K{(car ls)}" acc))]
+      ) ; end cond
+    ) ; end let loop
+  ) ; end define body
+  (define-values (crow coff) (cursor-row/col lines c))
+  (define col (+ (if (= crow 0) pw 0) (string-width-upto (list-ref lines crow) coff)))
+  (define up (- (sub1 (length lines)) crow))    ; 光标行到末行的行差
   (string-append
-   "\r"                                       ; 回行首
-   "\e[K"                                      ; 清到行尾
-   prompt
-   t
-   "\r"                                        ; 再回行首
-   (if (> target-col 0) f"\e[{target-col}C" "")  ; 右移到光标列
+   body
+   (if (> up 0) f"\e[{up}A" "")                  ; 上移到光标行
+   "\r"
+   (if (> col 0) f"\e[{col}C" "")                ; 右移到光标列
   ) ; end string-append
 ) ; end define ledit-render
 
@@ -265,6 +303,8 @@
  ledit-value
  ledit-apply
  ledit-render
+ ledit-line-count
+ ledit-cursor-row
  visible-width
  strip-ansi
  word-start-before

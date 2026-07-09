@@ -118,12 +118,38 @@
        [(#\H) (knamed 'home mods)]
        [(#\F) (knamed 'end mods)]
        [(#\Z) (knamed 'tab '(shift))]        ; CSI Z = Shift-Tab
-       [(#\~) (tilde->kev (if (pair? nums) (car nums) 0) mods)]
+       [(#\u) (csiu->kev nums mods)]          ; CSI u（kitty 键协议：修饰键消歧）
+       [(#\~)
+        (if (and (pair? nums) (= (car nums) 27))
+            (moK->kev nums)                    ; \e[27;mod;code~（xterm modifyOtherKeys）
+            (tilde->kev (if (pair? nums) (car nums) 0) mods))
+       ] ; end tilde
        [else (knamed 'escape)]
      ) ; end case
     ] ; end else
   ) ; end cond
 ) ; end define csi->kev
+
+;; CSI-u / modifyOtherKeys 的键码 → kev。核心用途：识别带修饰的 Enter（Shift/Alt+Enter）
+;; 以支持多行输入；普通可打印码位也还原为字符。
+(define (csiu->kev nums mods)
+  (define code (if (pair? nums) (car nums) 0))
+  (cond
+    [(or (= code 13) (= code 10)) (knamed 'enter mods)]
+    [(= code 9) (knamed 'tab mods)]
+    [(= code 27) (knamed 'escape mods)]
+    [(or (= code 127) (= code 8)) (knamed 'backspace mods)]
+    [(and (>= code 32) (< code #x110000)) (kchar (integer->char code) mods)]
+    [else (knamed 'escape mods)]
+  ) ; end cond
+) ; end define csiu->kev
+
+;; \e[27;mod;code~ —— xterm modifyOtherKeys 形式，键码在第三参数。
+(define (moK->kev nums)
+  (define mod (if (>= (length nums) 2) (cadr nums) 1))
+  (define code (if (>= (length nums) 3) (caddr nums) 0))
+  (csiu->kev (list code) (decode-mods mod))
+) ; end define moK->kev
 
 (define (tilde->kev n mods)
   (case n
@@ -183,6 +209,7 @@
        [(= b2 (char->integer #\[)) (parse-csi in)]
        [(= b2 (char->integer #\O)) (parse-ss3 in)]
        [(= b2 #x1B) (knamed 'escape)]        ; ESC ESC
+       [(or (= b2 #x0D) (= b2 #x0A)) (knamed 'enter '(alt))]  ; Alt/Option+Enter（多行）
        [(= b2 #x7F) (knamed 'backspace '(alt))]
        [(and (>= b2 #x01) (< b2 #x20))       ; Alt+Ctrl+letter
         (kchar (integer->char (+ b2 96)) '(ctrl alt))

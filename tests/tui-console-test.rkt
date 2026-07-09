@@ -66,13 +66,14 @@
   (check-true (string-contains? tail "abc"))
 ) ; end test-case
 
-(test-case "partial output (no newline) is held and shown, not committed"
+(test-case "partial output (no newline) is shown but not committed to cache"
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term))
   (console-emit! con "streaming")         ; 无换行
-  (define out (scripted-output st))
-  (check-true (string-contains? out "streaming"))
-  (check-false (string-contains? out "streaming\r\n"))  ; 尚未提交
+  (check-true (string-contains? (scripted-output st) "streaming"))  ; 已显示（框上方）
+  (check-equal? (console-tail-lines con 10) '())                    ; 未提交入缓存
+  (console-emit! con "!\n")               ; 补上换行 → 提交
+  (check-equal? (console-tail-lines con 10) '("streaming!"))
 ) ; end test-case
 
 ;; ---------------------------------------------------------------- Ctrl-C 阶梯 / EOF
@@ -100,14 +101,14 @@
   (check-false (unbox fired))                  ; 有草稿优先清草稿，不打断
 ) ; end test-case
 
-(test-case "Ctrl-C on empty while running interrupts and echoes ^C"
+(test-case "Ctrl-C on empty while running interrupts (no ^C echo)"
   (define fired (box #f))
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
   (console-set-idle! con #f)                   ; 运行中，空框
   (feed! con (bytes 3))
   (check-true (unbox fired))
-  (check-true (string-contains? (scripted-output st) "^C"))
+  (check-false (string-contains? (scripted-output st) "^C"))  ; 禁止 ^C 回显
 ) ; end test-case
 
 (test-case "Ctrl-C on empty while idle is a no-op"
@@ -115,10 +116,46 @@
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term #:interrupt (lambda () (set-box! fired #t))))
   (console-set-idle! con #t)
-  (define before (string-length (scripted-output st)))
   (feed! con (bytes 3))
   (check-false (unbox fired))
-  (check-false (string-contains? (scripted-output st) "^C"))  ; 无回显
+  (check-false (string-contains? (scripted-output st) "^C"))
+) ; end test-case
+
+;; ---------------------------------------------------------------- 空回车 / 多行输入
+
+(test-case "empty Enter does not dispatch (just a newline)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con "\r")                              ; 空回车
+  (check-false (async-channel-try-get (console-submit-channel con)))  ; 未派发
+  (feed! con "x\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "x")
+) ; end test-case
+
+(test-case "Shift+Enter inserts a newline; plain Enter submits multi-line"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  ;; "ab" + Shift+Enter(CSI-u) + "cd" + Enter
+  (feed! con (bytes-append #"ab" #"\e[13;2u" #"cd" #"\r"))
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "ab\ncd")
+) ; end test-case
+
+(test-case "Alt+Enter also inserts a newline (portable fallback)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con (bytes-append #"foo" #"\e\r" #"bar" #"\r"))
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "foo\nbar")
+) ; end test-case
+
+;; ---------------------------------------------------------------- 光标：帧式写入
+
+(test-case "writes are framed with cursor hide/show (no cursor on output body)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "hello\n")
+  (define out (scripted-output st))
+  (check-true (string-contains? out "\e[?25l"))   ; 写时藏光标
+  (check-true (string-contains? out "\e[?25h"))   ; 写毕复现（落在框内）
 ) ; end test-case
 
 (test-case "Ctrl-D on empty routes eof to submit channel"

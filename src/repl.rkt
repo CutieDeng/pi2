@@ -1,9 +1,14 @@
 #lang tstring racket
-;; repl.rkt — 终端交互层（design.md §4.9 / §5.7）
+;; repl.rkt — 终端交互层（design.md §4.9 / §5.7 / §11）
+;; 交互式走异步实时控制台（console）：全程 raw 模式、底部固定输入行、输出滚动其上，
+;; 用户可在 agent 流式输出时异步键入而不撞入输出。管道/非交互回退纯 read-line。
+;; 所有输出（流式渲染、斜杠命令回显、权限询问）统一经 emit 汇聚，避免绕过控制台锁。
 
 (require
  racket/string
  racket/list
+ racket/math                                 ; exact-round
+ racket/async-channel
  racket/pvector
  (file "model.rkt")
  (file "event.rkt")
@@ -12,7 +17,8 @@
  (file "loop.rkt")
  (file "context.rkt")
  (file "session.rkt")
- (file "tui/tui.rkt")
+ (file "tui/terminal.rkt")
+ (file "tui/console.rkt")
 ) ; end require
 
 ;; ---------------------------------------------------------------- ANSI
@@ -26,10 +32,11 @@
 
 ;; ---------------------------------------------------------------- 渲染订阅者
 
-;; 流式渲染：delta 逐段输出。用 box 跟踪当前是否在 thinking 段以便着色/换行。
-(define (make-renderer)
+;; make-renderer : (string -> void) -> (event -> void)
+;; 把 bus 事件转成文本，经 emit 汇聚到控制台/stdout。不直接触碰终端，故与
+;; console 的写锁协调一致，也可离线测试。
+(define (make-renderer emit)
   (define in-thinking (box #f))
-  (define any-text (box #f))
   (lambda (e)
     (cond
       [(evt:delta? e)
@@ -37,40 +44,34 @@
          [(thinking)
           (unless (unbox in-thinking)
             (set-box! in-thinking #t)
-            (display (dim "\n💭 "))
+            (emit (dim "\n💭 "))
           ) ; end unless
-          (display (dim (evt:delta-text e)))
+          (emit (dim (evt:delta-text e)))
          ] ; end thinking case
          [(text)
           (when (unbox in-thinking)
             (set-box! in-thinking #f)
-            (newline)
+            (emit "\n")
           ) ; end when
-          (set-box! any-text #t)
-          (display (evt:delta-text e))
+          (emit (evt:delta-text e))
          ] ; end text case
-         [else (void)]                      ; tool-json 增量不直接渲染
+         [else (void)]                       ; tool-json 增量不直接渲染
        ) ; end case
-       (flush-output)
       ] ; end delta case
       [(evt:tool-start? e)
        (define b (evt:tool-start-block e))
        (define arg-str (dim (string-append "(" (summarize-input (tool-use-block-input b)) ")")))
-       (display (string-append "\n" (cyan "⏺") " " (bold (tool-use-block-name b)) arg-str))
-       (flush-output)
+       (emit (string-append "\n" (cyan "⏺") " " (bold (tool-use-block-name b)) arg-str))
       ] ; end tool-start case
       [(evt:tool-end? e)
        (define ms (exact-round (evt:tool-end-ms e)))
-       (display (string-append " " (dim f"— {ms}ms") "\n"))
-       (flush-output)
+       (emit (string-append " " (dim f"— {ms}ms") "\n"))
       ] ; end tool-end case
       [(evt:error? e)
-       (display (red f"\n[error] {(exn-message (evt:error-exn e))}\n"))
-       (flush-output)
+       (emit (red f"\n[error] {(exn-message (evt:error-exn e))}\n"))
       ] ; end error case
       [(evt:turn-end? e)
-       (newline)
-       (flush-output)
+       (emit "\n")
       ] ; end turn-end case
       [else (void)]
     ) ; end cond
@@ -85,15 +86,10 @@
   ) ; end if
 ) ; end define summarize-input
 
-(require racket/math)                        ; exact-round
+;; ---------------------------------------------------------------- 权限询问
 
-;; ---------------------------------------------------------------- 询问
-
-;; 阻塞式权限询问（tty 交互）
-(define (tty-asker prompt)
-  (display (yellow f"\n{prompt} [y/n/a(lways)] "))
-  (flush-output)
-  (define line (read-line))
+;; y/n/a(lways) 一行 → 决策符号
+(define (parse-answer line)
   (cond
     [(eof-object? line) 'no]
     [else
@@ -104,79 +100,149 @@
      ) ; end case
     ] ; end else
   ) ; end cond
+) ; end define parse-answer
+
+;; 阻塞式权限询问（管道/非交互：纯 stdin）
+(define (tty-asker prompt)
+  (display (yellow f"\n{prompt} [y/n/a(lways)] "))
+  (flush-output)
+  (parse-answer (read-line))
 ) ; end define tty-asker
+
+;; 交互模式征询走控制台（改道下一提交行）；无控制台时回退 tty-asker。
+;; 供 main 装配进 deps；run-repl! 会在交互期 parameterize current-console。
+(define current-console (make-parameter #f))
+
+(define (interactive-asker prompt)
+  (define con (current-console))
+  (if con
+      (parse-answer (console-ask! con (yellow f"{prompt} [y/n/a(lways)] ")))
+      (tty-asker prompt)
+  ) ; end if
+) ; end define interactive-asker
 
 ;; ---------------------------------------------------------------- 主循环
 
-;; run-repl! : deps agent-state session -> void
-;; 返回时会话已持久化。
+;; run-repl! : deps agent-state session -> void（返回时会话已持久化）
 (define (run-repl! d st0 sess #:banner? [banner? #t])
   (define bus (deps-bus d))
-  (define unsub (bus-subscribe! bus (make-renderer)))
-  (when banner?
-    (displayln (bold "pi++ — Racket LLM agent"))
-    (displayln (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
-  ) ; end when
-  (define interactive? (terminal-port? (current-input-port)))
-  (define term (and interactive? (make-real-terminal)))
-  (define history (box '()))                  ; 已提交行，最新在前（TUI 历史）
-  (when interactive? (newline))
-  (let loop ([st st0])
-    (define line (read-input term interactive? (unbox history)))
-    (cond
-      [(eof-object? line)
-       (unsub) (session-close! sess)
-       (when interactive? (displayln (dim "bye")))
-      ] ; end eof case
-      [(tui-cancelled? line) (loop st)]        ; 提示符处 Ctrl-C：忽略，重出提示符
-      [(string=? (string-trim line) "") (loop st)]
-      [else
-       (set-box! history (cons line (unbox history)))
-       (repl-dispatch line st d sess bus unsub loop)
-      ] ; end else
-    ) ; end cond
-  ) ; end let loop
+  (if (terminal-port? (current-input-port))
+      (run-repl/console! d st0 sess bus banner?)
+      (run-repl/plain! d st0 sess bus banner?)
+  ) ; end if
 ) ; end define run-repl!
 
-;; 分派一行输入：斜杠命令 or 驱动一轮对话
-(define (repl-dispatch line st d sess bus unsub loop)
-  (cond
-    [(string-prefix? (string-trim line) "/")
-     (define-values (st* continue?) (handle-command (string-trim line) st d sess))
-     (if continue?
-         (loop st*)
-         (begin (unsub) (session-close! sess))
-     ) ; end if
-    ] ; end command case
-    [else
-     (define user-msg (text-msg 'user line))
+;; -------- 交互式：异步实时控制台
+
+(define (run-repl/console! d st0 sess bus banner?)
+  (define term (make-real-terminal))
+  (define main-th (current-thread))
+  (define con
+    (make-console term #:prompt (green "› ")
+                  #:interrupt (lambda () (break-thread main-th)))  ; Ctrl-C → 取消当前轮
+  ) ; end define con
+  (define emit (lambda (s) (console-emit! con s)))
+  (define (say s) (emit (string-append s "\n")))
+  (define unsub (bus-subscribe! bus (make-renderer emit)))
+  (parameterize ([current-console con])
+    (console-start! con)
+    (when banner?
+      (say (bold "pi++ — Racket LLM agent"))
+      (say (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
+    ) ; end when
+    ;; reader 线程：持续读键、即时回显、提交行投递到 submit 通道
+    (define reader
+      (thread (lambda ()
+                (let rloop ()
+                  (case (console-handle-key! con (term-read-key term))
+                    [(eof) (void)]
+                    [else (rloop)]
+                  ) ; end case
+                ) ; end let rloop
+              )) ; end thread
+    ) ; end define reader
+    (dynamic-wind
+     void
+     (lambda ()
+       (let loop ([st st0])
+         (console-set-idle! con #t)
+         (define line (async-channel-get (console-submit-channel con)))
+         (console-set-idle! con #f)
+         (cond
+           [(eof-object? line) (unsub) (session-close! sess)]
+           [(string=? (string-trim line) "") (loop st)]
+           [(string-prefix? (string-trim line) "/")
+            (define-values (st* continue?) (handle-command (string-trim line) st d sess say))
+            (if continue? (loop st*) (begin (unsub) (session-close! sess)))
+           ] ; end command case
+           [else
+            (define user-msg (text-msg 'user line))
+            (define st*
+              (with-handlers ([exn:break?
+                               (lambda (_e)
+                                 (say (yellow "[cancelled]"))
+                                 (provider-cancel! (deps-provider d))
+                                 st
+                               ) ; end lambda
+                              ]
+                              [exn:fail?
+                               (lambda (e) (say (red f"[error] {(exn-message e)}")) st)
+                              ]) ; end handlers
+                (parameterize-break #t (run-turn! st user-msg d))
+              ) ; end with-handlers
+            ) ; end define st*
+            (bus-drain! bus)
+            (persist-turn! sess st st*)
+            (loop st*)
+           ] ; end else
+         ) ; end cond
+       ) ; end let loop
+     ) ; end body
+     (lambda ()
+       (kill-thread reader)
+       (console-stop! con)
+     ) ; end after
+    ) ; end dynamic-wind
+  ) ; end parameterize
+) ; end define run-repl/console!
+
+;; -------- 非交互：纯 read-line（管道友好）
+
+(define (run-repl/plain! d st0 sess bus banner?)
+  (define emit (lambda (s) (display s) (flush-output)))
+  (define (say s) (emit (string-append s "\n")))
+  (define unsub (bus-subscribe! bus (make-renderer emit)))
+  (when banner?
+    (say (bold "pi++ — Racket LLM agent"))
+    (say (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
+  ) ; end when
+  (let loop ([st st0])
+    (define line (read-input/plain))
+    (cond
+      [(eof-object? line) (unsub) (session-close! sess)]
+      [(string=? (string-trim line) "") (loop st)]
+      [(string-prefix? (string-trim line) "/")
+       (define-values (st* continue?) (handle-command (string-trim line) st d sess say))
+       (if continue? (loop st*) (begin (unsub) (session-close! sess)))
+      ] ; end command case
+      [else
+       (define user-msg (text-msg 'user line))
        (define st*
-         (with-handlers ([exn:break?
-                          (lambda (_e)
-                            (displayln (yellow "\n[cancelled]"))
-                            (provider-cancel! (deps-provider d))
-                            st                ; 回滚到本轮开始前
-                          ) ; end lambda
-                         ]
-                         [exn:fail?
-                          (lambda (e)
-                            (displayln (red f"\n[error] {(exn-message e)}"))
-                            st
-                          ) ; end lambda
+         (with-handlers ([exn:fail?
+                          (lambda (e) (say (red f"[error] {(exn-message e)}")) st)
                          ]) ; end handlers
            (run-turn! st user-msg d)
          ) ; end with-handlers
        ) ; end define st*
-       (bus-drain! bus)                     ; 渲染订阅者处理完本轮
-       ;; 持久化本轮新增的全部消息（user/assistant/tool-result 按序）+ usage 增量
+       (bus-drain! bus)
        (persist-turn! sess st st*)
        (loop st*)
-    ] ; end else
-  ) ; end cond
-) ; end define repl-dispatch
+      ] ; end else
+    ) ; end cond
+  ) ; end let loop
+) ; end define run-repl/plain!
 
-;; 持久化 st→st* 之间新增的历史消息与 usage 增量。
-;; 这样 tool-result（内部 user 轮）也被完整落盘，保证 resume 的配对不破。
+;; 持久化 st→st* 之间新增的历史消息与 usage 增量（tool-result 亦完整落盘，保 resume 配对）
 (define (persist-turn! sess st-before st-after)
   (define before (pvector-length (agent-state-history st-before)))
   (define after (pvector-length (agent-state-history st-after)))
@@ -196,30 +262,7 @@
   ) ; end unless
 ) ; end define persist-turn!
 
-;; 读一行输入：交互式走 TUI 行编辑器，管道输入回退纯 read-line。
-;; 返回 string | eof | tui-cancelled。以 \ 结尾续行（多行输入）。
-(define (read-input term interactive? history)
-  (if interactive?
-      (read-input/tui term history)
-      (read-input/plain)
-  ) ; end if
-) ; end define read-input
-
-(define (read-input/tui term history)
-  (let loop ([acc '()] [prompt (green "› ")])
-    (define line (tui-read-line term #:prompt prompt #:history history))
-    (cond
-      [(not (string? line))
-       (if (null? acc) line (string-join (reverse acc) "\n"))
-      ] ; end eof/cancel case
-      [(string-suffix? line "\\")
-       (loop (cons (substring line 0 (sub1 (string-length line))) acc) (dim "… "))
-      ] ; end continuation case
-      [else (string-join (reverse (cons line acc)) "\n")]
-    ) ; end cond
-  ) ; end let loop
-) ; end define read-input/tui
-
+;; 纯 read-line（\ 结尾续行）
 (define (read-input/plain)
   (let loop ([acc '()])
     (define line (read-line))
@@ -235,15 +278,16 @@
 
 ;; ---------------------------------------------------------------- 斜杠命令
 
-;; 返回 (values new-state continue?)
-(define (handle-command cmd st d sess)
+;; handle-command : cmd st d sess say -> (values new-state continue?)
+;; say : (string -> void) 输出一行（经控制台/stdout 汇聚）
+(define (handle-command cmd st d sess say)
   (define parts (string-split cmd))
   (define name (car parts))
   (define args (cdr parts))
   (case name
     [("/quit" "/exit" "/q") (values st #f)]
     [("/help")
-     (displayln (dim (string-join
+     (say (dim (string-join
        '("commands:"
          "  /help            show this"
          "  /quit            exit (session saved)"
@@ -253,55 +297,51 @@
          "  /history         message count and roles"
          "  /model <id>      switch model"
         ) ; end list
-       "\n"))
-     ) ; end displayln
+       "\n")))
      (values st #t)
     ] ; end help case
     [("/clear")
-     (displayln (dim "history cleared"))
+     (say (dim "history cleared"))
      (values (make-initial-state (agent-state-config st)) #t)
     ] ; end clear case
     [("/usage")
      (define u (agent-state-token-usage st))
-     (displayln f"tokens — input: {(usage-input-tokens u)}, output: {(usage-output-tokens u)}, turns: {(agent-state-turn-count st)}")
+     (say f"tokens — input: {(usage-input-tokens u)}, output: {(usage-output-tokens u)}, turns: {(agent-state-turn-count st)}")
      (values st #t)
     ] ; end usage case
     [("/compact")
-     (displayln (dim "compacting…"))
+     (say (dim "compacting…"))
      (define st*
        (with-handlers ([exn:fail?
-                        (lambda (e)
-                          (displayln (red f"compact failed: {(exn-message e)}"))
-                          st
-                        ) ; end lambda
+                        (lambda (e) (say (red f"compact failed: {(exn-message e)}")) st)
                        ]) ; end handlers
          (compact! st (deps-provider d))
        ) ; end with-handlers
      ) ; end define st*
-     (displayln (dim f"history: {(pvector-length (agent-state-history st))} → {(pvector-length (agent-state-history st*))} messages"))
+     (say (dim f"history: {(pvector-length (agent-state-history st))} → {(pvector-length (agent-state-history st*))} messages"))
      (values st* #t)
     ] ; end compact case
     [("/history")
      (define hist (agent-state-history st))
-     (displayln f"{(pvector-length hist)} messages:")
+     (say f"{(pvector-length hist)} messages:")
      (for ([m (in-pvector hist)] [i (in-naturals)])
        (define preview (message-text m))
-       (displayln (dim f"  {i}. {(message-role m)}: {(substring preview 0 (min 50 (string-length preview)))}"))
+       (say (dim f"  {i}. {(message-role m)}: {(substring preview 0 (min 50 (string-length preview)))}"))
      ) ; end for
      (values st #t)
     ] ; end history case
     [("/model")
      (cond
-       [(null? args) (displayln (red "usage: /model <id>")) (values st #t)]
+       [(null? args) (say (red "usage: /model <id>")) (values st #t)]
        [else
         (define cfg* (struct-copy config (agent-state-config st) [model (car args)]))
-        (displayln (dim f"model → {(car args)}"))
+        (say (dim f"model → {(car args)}"))
         (values (struct-copy agent-state st [config cfg*]) #t)
        ] ; end else
      ) ; end cond
     ] ; end model case
     [else
-     (displayln (red f"unknown command: {name} (try /help)"))
+     (say (red f"unknown command: {name} (try /help)"))
      (values st #t)
     ] ; end else
   ) ; end case
@@ -313,5 +353,7 @@
  run-repl!
  make-renderer
  tty-asker
+ interactive-asker
+ current-console
  persist-turn!
 ) ; end provide

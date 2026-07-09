@@ -735,9 +735,11 @@ M1–M5 全部落地并通过验收（Racket v9.2.2 增强版，`#lang tstring r
 - **hooks**：`on-tool-start` 拦截做成 loop 的**同步** `pre-tool-hook`（bus 订阅者是异步的，
   无法回传 `'block`），返回字符串即拦截并转 error tool-result。
 
-测试矩阵（`./run-tests.sh [--live]`）：11 套离线单测 + 3 套对 `gemma-4-31b-it@6bit` 的
-真机验收（流式/工具调用/取消、完整工具循环、子 agent 委派）。端到端实测：agent 读文件、
-`edit_file` 修 bug、`bash` 跑 `python3` 验证结果，全链路自主完成。
+测试驱动改用原生 `raco test`（自动发现、`-j` 并行、集成 rackunit 汇总与非零退出），
+`tests/info.rkt` 的 `test-omit-paths` 把 live 测试排除在离线遍历外；`run-tests.sh` 退化为薄封装。
+测试矩阵（`./run-tests.sh [--live]`）：离线单测（含 TUI width/keys/lineedit/e2e/console）+ 3 套对
+`gemma-4-31b-it@6bit` 的真机验收（流式/工具调用/取消、完整工具循环、子 agent 委派）。端到端实测：
+agent 读文件、`edit_file` 修 bug、`bash` 跑 `python3` 验证结果，全链路自主完成。
 
 ---
 
@@ -748,10 +750,12 @@ readline 快捷键、Unicode 正确渲染，并把输入源抽象为可脚本化
 
 ### 11.1 分层
 
-四层解耦，自底向上、依赖单向：
+解耦分层，自底向上、依赖单向；顶层有两个装配：`tui.rkt`（同步单行读）与
+`console.rkt`（异步实时控制台），二者共用下方三层：
 
 ```
-tui.rkt        组装：tui-read-line（raw 括入/编辑循环/渲染分发）
+tui.rkt        同步装配：tui-read-line（raw 括入/编辑循环/渲染分发）
+console.rkt    异步装配：底部固定输入行 + 上方滚动输出，写操作单锁串行化
   ├─ lineedit.rkt   行编辑器：纯状态迁移 (ledit-apply) + 渲染 (ledit-render) 分离
   ├─ terminal.rkt   终端抽象：real（stty raw）/ scripted（脚本化，测试用）
   ├─ keys.rkt       字节流 → 按键事件（CSI/SS3/Alt/UTF-8）
@@ -777,8 +781,35 @@ tui.rkt        组装：tui-read-line（raw 括入/编辑循环/渲染分发）
   输出捕获 string port 实现同一接口。`tui-run-scripted` 一行驱动完整编辑会话并返回
   `(values 结果 输出)`——TUI 端到端测试因此完全离线、确定性，无需 pty。
 
-### 11.3 集成
+### 11.3 异步实时控制台（console.rkt）
 
-`repl.rkt` 交互式走 `read-input/tui`（TUI 编辑器 + 历史），管道输入回退
-`read-input/plain`（纯 `read-line`），二者都支持 `\` 结尾续行。真实 tty 经 pty 实测：
-逐键重绘、Ctrl-U 清行、按词删除、CJK 双宽光标对齐均正确。
+裸的「读一行 → 跑一轮 → 再读一行」有个交互缺陷：提交 prompt 后 agent 异步流式输出时，
+若用户继续键入，cooked 模式的默认回显会把按键撞进输出流与状态信息里。`console.rkt`
+按标准做法（参照 prompt_toolkit `patch_stdout` / readline redisplay）解决：
+
+- **全程 raw 模式**（`-echo`）：终端不再自动回显，从根上杜绝按键撞入输出。
+- **底部固定输入行 + 上方滚动输出**：屏幕底部动态区 = `[可选 pending 半行] + [可选输入行]`，
+  异步输出一律滚动到其上方。输入为空且正在跑 turn 时隐藏输入行，输出自然贴底（无多余
+  空提示符）；用户一旦开始键入，输入行即刻钉底。
+- **单锁串行化一切终端写**：reader 线程的按键回显、main 线程的流式输出、权限询问都走
+  同一把 `semaphore`。`console-emit!` 每次落屏都：擦掉动态区 → 提交完整输出行为永久滚动历史
+  （`\n` 规整为 `\r\n`）→ 底部重绘输入行。故用户已键入内容始终正确回显，不与异步消息冲突。
+- **重绘的行数记账**：`rows` 记录上次动态区占用行数，重绘先 `\e[{n}A` 上移再 `\e[J` 清屏；
+  用**相对**光标移动，滚动安全。
+- **两线程 + 取消**：reader 线程持续 `parse-key` 读键并即时回显，提交行投递到 `async-channel`；
+  main 线程取行、跑 `run-turn!`。raw 模式下 Ctrl-C 不再产生 SIGINT，故由 reader 显式
+  `break-thread` 主线程（仅在非空闲时），主线程 `parameterize-break` 内的 `run-turn!` 收
+  `exn:break` 取消当轮并 `provider-cancel!`。空闲时 Ctrl-C 只清当前行。
+- **询问改道**：权限征询经 `console-ask!`——临时把「下一条提交行」改道到本地 channel，
+  主线程阻塞取回，避免与正常 prompt 输入混淆。
+- **可离线测试**：`console-handle-key!` / `console-emit!` 均为同步纯写协调，配脚本化终端即可
+  断言「键入 abc 时输出 line1 不会撕裂 abc」「\n 规整为 \r\n」「Ctrl-C 触发 interrupt」等
+  （`tests/tui-console-test.rkt`），线程与取消策略留在 repl，不入测试路径。
+
+### 11.4 集成
+
+`repl.rkt` 交互式（真实 tty）走 `console.rkt` 异步控制台；管道/非交互回退
+`read-input/plain`（纯 `read-line`，支持 `\` 续行）。斜杠命令输出、流式渲染、权限询问
+统一经 `emit` 汇聚（交互期为 `console-emit!`，非交互为 `display`），避免绕过控制台锁。
+真实 tty 经 pty 实测：逐键重绘、CJK 双宽光标对齐、提交行回显、流式答案落屏、Ctrl-D
+干净退出均正确。

@@ -29,8 +29,10 @@ racket main.rkt --resume data/20260709-1030-8905.rktd
 
 ### 行编辑快捷键（交互式 TUI）
 
-交互式会话在原始模式下逐键编辑，支持 readline 常用键位与 Unicode 正确渲染
-（CJK/emoji 双宽光标对齐）。管道输入自动回退纯 `read-line`。
+交互式会话全程处于原始模式，底部固定一条输入行、异步输出滚动其上：agent 流式
+输出时用户可继续键入而不会被撞进输出流（杜绝 cooked 回显冲突），按键仅回显至输入行。
+支持 readline 常用键位与 Unicode 正确渲染（CJK/emoji 双宽光标对齐）。
+管道输入自动回退纯 `read-line`。
 
 | 键 | 作用 | 键 | 作用 |
 |---|---|---|---|
@@ -67,9 +69,13 @@ transcript 是 `.rktd` datum 流（prefab struct 的 `write`/`read` 往返），
 
 ## 测试
 
+原生 `raco test`：自动发现 `tests/` 下的单测、并行执行、汇总通过数、失败即非零退出。
+`tests/info.rkt` 的 `test-omit-paths` 把需要 LM Studio 的真机(live)测试排除在离线遍历外。
+
 ```sh
-./run-tests.sh          # 离线单测（7 套，无需 LLM）
-./run-tests.sh --live   # 追加对 LM Studio gemma 的真机验收（3 套）
+./run-tests.sh          # 离线单测：raco test -j 4 tests/（无需 LLM）
+./run-tests.sh --live   # 追加对 LM Studio gemma 的真机验收（provider/loop/subagent）
+raco test tests/tui-console-test.rkt   # 也可直接对单个文件跑
 ```
 
 ## 目录结构
@@ -91,8 +97,9 @@ pi2/
 │       ├── keys.rkt      按键/转义序列解析
 │       ├── terminal.rkt  终端抽象（真实 tty + 脚本后端）
 │       ├── lineedit.rkt  行编辑器 + readline 快捷键
-│       └── tui.rkt       组装 tui-read-line
-├── tests/               单测 + 真机验收
+│       ├── tui.rkt       组装 tui-read-line（同步单行读）
+│       └── console.rkt   异步实时控制台（底部输入行 + 上方滚动输出）
+├── tests/               单测 + 真机验收（raco test；info.rkt 排除 live）
 ├── data/                运行时：会话 transcript (*.rktd)，git 忽略
 └── cache/               运行时：permissions.rktd 等跨会话缓存，git 忽略
 ```

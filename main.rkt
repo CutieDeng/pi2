@@ -94,7 +94,7 @@
                #:registry (make-registry (append base-tools (list spawn-tool)))
                #:bus bus
                #:policy (make-policy cfg #:store-path perm-store)
-               #:asker tty-asker
+               #:asker interactive-asker
     ) ; end make-deps
   ) ; end define d
 
@@ -117,7 +117,7 @@
   (cond
     ;; 单次问答模式
     [(unbox prompt)
-     (define unsub (bus-subscribe! bus (make-renderer)))
+     (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
      (define st* (run-turn! st0 (text-msg 'user (unbox prompt)) d))
      (bus-drain! bus)
      (persist-turn! sess st0 st*)

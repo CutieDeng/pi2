@@ -13,6 +13,10 @@ OFFLINE=(
   tests/context-test.rkt
   tests/session-test.rkt
   tests/hook-test.rkt
+  tests/tui-width-test.rkt
+  tests/tui-keys-test.rkt
+  tests/tui-lineedit-test.rkt
+  tests/tui-e2e-test.rkt
 )
 
 LIVE=(

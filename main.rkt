@@ -1,3 +1,4 @@
+#!/usr/bin/env racket
 #lang tstring racket
 ;; main.rkt — pi++ 可执行入口（design.md §8）
 ;; 用法：

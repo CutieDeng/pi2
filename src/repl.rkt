@@ -12,6 +12,7 @@
  (file "loop.rkt")
  (file "context.rkt")
  (file "session.rkt")
+ (file "tui/tui.rkt")
 ) ; end require
 
 ;; ---------------------------------------------------------------- ANSI
@@ -117,27 +118,38 @@
     (displayln (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
   ) ; end when
   (define interactive? (terminal-port? (current-input-port)))
+  (define term (and interactive? (make-real-terminal)))
+  (define history (box '()))                  ; 已提交行，最新在前（TUI 历史）
+  (when interactive? (newline))
   (let loop ([st st0])
-    (when interactive?
-      (display (green "\n› "))
-      (flush-output)
-    ) ; end when
-    (define line (read-user-input))
+    (define line (read-input term interactive? (unbox history)))
     (cond
       [(eof-object? line)
        (unsub) (session-close! sess)
-       (when interactive? (displayln (dim "\nbye")))
+       (when interactive? (displayln (dim "bye")))
       ] ; end eof case
+      [(tui-cancelled? line) (loop st)]        ; 提示符处 Ctrl-C：忽略，重出提示符
       [(string=? (string-trim line) "") (loop st)]
-      [(string-prefix? (string-trim line) "/")
-       (define-values (st* continue?) (handle-command (string-trim line) st d sess))
-       (if continue?
-           (loop st*)
-           (begin (unsub) (session-close! sess))
-       ) ; end if
-      ] ; end command case
       [else
-       (define user-msg (text-msg 'user line))
+       (set-box! history (cons line (unbox history)))
+       (repl-dispatch line st d sess bus unsub loop)
+      ] ; end else
+    ) ; end cond
+  ) ; end let loop
+) ; end define run-repl!
+
+;; 分派一行输入：斜杠命令 or 驱动一轮对话
+(define (repl-dispatch line st d sess bus unsub loop)
+  (cond
+    [(string-prefix? (string-trim line) "/")
+     (define-values (st* continue?) (handle-command (string-trim line) st d sess))
+     (if continue?
+         (loop st*)
+         (begin (unsub) (session-close! sess))
+     ) ; end if
+    ] ; end command case
+    [else
+     (define user-msg (text-msg 'user line))
        (define st*
          (with-handlers ([exn:break?
                           (lambda (_e)
@@ -159,10 +171,9 @@
        ;; 持久化本轮新增的全部消息（user/assistant/tool-result 按序）+ usage 增量
        (persist-turn! sess st st*)
        (loop st*)
-      ] ; end else
-    ) ; end cond
-  ) ; end let loop
-) ; end define run-repl!
+    ] ; end else
+  ) ; end cond
+) ; end define repl-dispatch
 
 ;; 持久化 st→st* 之间新增的历史消息与 usage 增量。
 ;; 这样 tool-result（内部 user 轮）也被完整落盘，保证 resume 的配对不破。
@@ -185,8 +196,31 @@
   ) ; end unless
 ) ; end define persist-turn!
 
-;; 多行输入：以 \ 结尾续行
-(define (read-user-input)
+;; 读一行输入：交互式走 TUI 行编辑器，管道输入回退纯 read-line。
+;; 返回 string | eof | tui-cancelled。以 \ 结尾续行（多行输入）。
+(define (read-input term interactive? history)
+  (if interactive?
+      (read-input/tui term history)
+      (read-input/plain)
+  ) ; end if
+) ; end define read-input
+
+(define (read-input/tui term history)
+  (let loop ([acc '()] [prompt (green "› ")])
+    (define line (tui-read-line term #:prompt prompt #:history history))
+    (cond
+      [(not (string? line))
+       (if (null? acc) line (string-join (reverse acc) "\n"))
+      ] ; end eof/cancel case
+      [(string-suffix? line "\\")
+       (loop (cons (substring line 0 (sub1 (string-length line))) acc) (dim "… "))
+      ] ; end continuation case
+      [else (string-join (reverse (cons line acc)) "\n")]
+    ) ; end cond
+  ) ; end let loop
+) ; end define read-input/tui
+
+(define (read-input/plain)
   (let loop ([acc '()])
     (define line (read-line))
     (cond
@@ -197,7 +231,7 @@
       [else (string-join (reverse (cons line acc)) "\n")]
     ) ; end cond
   ) ; end let loop
-) ; end define read-user-input
+) ; end define read-input/plain
 
 ;; ---------------------------------------------------------------- 斜杠命令
 

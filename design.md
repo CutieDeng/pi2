@@ -735,6 +735,50 @@ M1–M5 全部落地并通过验收（Racket v9.2.2 增强版，`#lang tstring r
 - **hooks**：`on-tool-start` 拦截做成 loop 的**同步** `pre-tool-hook`（bus 订阅者是异步的，
   无法回传 `'block`），返回字符串即拦截并转 error tool-result。
 
-测试矩阵（`./run-tests.sh [--live]`）：7 套离线单测 + 3 套对 `gemma-4-31b-it@6bit` 的
+测试矩阵（`./run-tests.sh [--live]`）：11 套离线单测 + 3 套对 `gemma-4-31b-it@6bit` 的
 真机验收（流式/工具调用/取消、完整工具循环、子 agent 委派）。端到端实测：agent 读文件、
 `edit_file` 修 bug、`bash` 跑 `python3` 验证结果，全链路自主完成。
+
+---
+
+## 11. TUI 抽象层
+
+`src/tui/` 提供一套完整的终端 UI 抽象，替换裸 `read-line`，支持原始模式逐键编辑、
+readline 快捷键、Unicode 正确渲染，并把输入源抽象为可脚本化后端以支撑自动化测试。
+
+### 11.1 分层
+
+四层解耦，自底向上、依赖单向：
+
+```
+tui.rkt        组装：tui-read-line（raw 括入/编辑循环/渲染分发）
+  ├─ lineedit.rkt   行编辑器：纯状态迁移 (ledit-apply) + 渲染 (ledit-render) 分离
+  ├─ terminal.rkt   终端抽象：real（stty raw）/ scripted（脚本化，测试用）
+  ├─ keys.rkt       字节流 → 按键事件（CSI/SS3/Alt/UTF-8）
+  └─ width.rkt      Unicode 显示宽度（wcwidth 等价）
+```
+
+### 11.2 关键设计
+
+- **纯解析器**：`parse-key : input-port → kev` 只消费字节端口，故脚本化字节串与真实
+  tty 共用同一套解析。CSI (`ESC[`)、SS3 (`ESCO`)、修饰符 (`ESC[1;5C`=Ctrl-Right)、
+  Alt+char、UTF-8 多字节续读全部覆盖；孤立 ESC 用 `byte-ready?` 消歧。
+- **编辑逻辑纯函数化**：`(ledit-apply st kev) → (values st* action)` 无 IO，动作码
+  `'edit/'submit/'cancel/'eof/'clear-screen/'ignore` 交给上层。因此每个快捷键都能离线断言
+  缓冲区与光标，无需真实终端。
+- **Unicode 渲染**：光标按**字符**移动，重绘按**显示宽度**定位——`ledit-render` 用
+  `string-width-upto` 算出光标目标列，`\r` 回行首后 `\e[{col}C` 右移。prompt 可能含 ANSI
+  颜色码，`visible-width` 先 `strip-ansi` 再计宽，保证列数不被转义序列污染。CJK/emoji 双宽、
+  组合符零宽均正确。
+- **raw 模式的时机**：`tui-read-line` 用 `dynamic-wind` 仅在**编辑期**进 raw，提交/取消后
+  立即恢复 cooked。故 agent 执行阶段仍是 cooked 模式，Ctrl-C 依旧走 SIGINT→`exn:break`
+  中断当前轮——两种 Ctrl-C 语义（编辑期取消行 vs 执行期中断轮）各得其所。
+- **CLI 式输入抽象**：`terminal` 是函数表 struct，`make-scripted-terminal` 用预置按键队列 +
+  输出捕获 string port 实现同一接口。`tui-run-scripted` 一行驱动完整编辑会话并返回
+  `(values 结果 输出)`——TUI 端到端测试因此完全离线、确定性，无需 pty。
+
+### 11.3 集成
+
+`repl.rkt` 交互式走 `read-input/tui`（TUI 编辑器 + 历史），管道输入回退
+`read-input/plain`（纯 `read-line`），二者都支持 `\` 结尾续行。真实 tty 经 pty 实测：
+逐键重绘、Ctrl-U 清行、按词删除、CJK 双宽光标对齐均正确。

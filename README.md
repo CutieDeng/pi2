@@ -27,6 +27,21 @@ racket main.rkt --resume data/20260709-1030-8905.rktd
 
 远程端点用环境变量 `PI_API_KEY` 提供密钥。
 
+### 行编辑快捷键（交互式 TUI）
+
+交互式会话在原始模式下逐键编辑，支持 readline 常用键位与 Unicode 正确渲染
+（CJK/emoji 双宽光标对齐）。管道输入自动回退纯 `read-line`。
+
+| 键 | 作用 | 键 | 作用 |
+|---|---|---|---|
+| `←/→` `Ctrl-B/F` | 左右移动 | `Ctrl-A/E` `Home/End` | 行首/行尾 |
+| `Alt-B/F` `Ctrl-←/→` | 按词移动 | `Backspace` `Del` | 删前/删后字符 |
+| `Ctrl-W` `Alt-⌫` | 删前一词 | `Alt-D` | 删后一词 |
+| `Ctrl-K` | 删到行尾 | `Ctrl-U` | 删到行首 |
+| `Ctrl-Y` | 粘贴 kill-ring | `↑/↓` `Ctrl-P/N` | 历史 |
+| `Ctrl-L` | 清屏 | `Ctrl-C` | 取消当前行 |
+| `Ctrl-D` | 空行时退出 | `\` 结尾 | 续行（多行输入） |
+
 ### 斜杠命令
 
 `/help` `/quit` `/clear` `/usage` `/compact` `/history` `/model <id>`
@@ -70,7 +85,13 @@ pi2/
 │   ├── provider.rkt      流式 LLM 客户端         permission.rkt 权限门控
 │   ├── stream.rkt        SSE/accumulator        repl.rkt      终端交互
 │   ├── tool.rkt          工具协议/注册表         subagent.rkt  spawn_agent
-│   └── tools/            bash · file · search · builtin
+│   ├── tools/            bash · file · search · builtin
+│   └── tui/              终端 UI 抽象层
+│       ├── width.rkt     Unicode 显示宽度 (wcwidth)
+│       ├── keys.rkt      按键/转义序列解析
+│       ├── terminal.rkt  终端抽象（真实 tty + 脚本后端）
+│       ├── lineedit.rkt  行编辑器 + readline 快捷键
+│       └── tui.rkt       组装 tui-read-line
 ├── tests/               单测 + 真机验收
 ├── data/                运行时：会话 transcript (*.rktd)，git 忽略
 └── cache/               运行时：permissions.rktd 等跨会话缓存，git 忽略

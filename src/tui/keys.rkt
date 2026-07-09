@@ -94,16 +94,35 @@
     ) ; end let loop
   ) ; end define final
   (define param-str (get-output-string params))
-  (define nums
-    (for/list ([p (in-list (string-split param-str ";"))])
-      (or (string->number p) 0)
-    ) ; end for/list
-  ) ; end define nums
-  (define mods
-    (if (>= (length nums) 2) (decode-mods (cadr nums)) '())
-  ) ; end define mods
-  (csi->kev final nums mods)
+  (cond
+    ;; SGR 鼠标事件：ESC [ < btn ; col ; row (M|m)。滚轮 → 滚动键。
+    [(and final (regexp-match? #rx"^<" param-str)
+          (or (= final (char->integer #\M)) (= final (char->integer #\m))))
+     (sgr-mouse->kev param-str)
+    ] ; end mouse
+    [else
+     (define nums
+       (for/list ([p (in-list (string-split param-str ";"))])
+         (or (string->number p) 0)
+       ) ; end for/list
+     ) ; end define nums
+     (define mods
+       (if (>= (length nums) 2) (decode-mods (cadr nums)) '())
+     ) ; end define mods
+     (csi->kev final nums mods)
+    ] ; end else
+  ) ; end cond
 ) ; end define parse-csi
+
+;; SGR 鼠标：仅关心滚轮（按钮码 bit6 置位；bit0：0=上,1=下）。其余（点击/移动）忽略。
+(define (sgr-mouse->kev param-str)
+  (define digits (substring param-str 1))       ; 去掉前导 '<'
+  (define btn (or (string->number (car (string-split digits ";"))) 0))
+  (cond
+    [(bitwise-bit-set? btn 6) (if (even? btn) (knamed 'scroll-up) (knamed 'scroll-down))]
+    [else (knamed 'escape)]                      ; 非滚轮鼠标事件：当作无操作
+  ) ; end cond
+) ; end define sgr-mouse->kev
 
 (define (csi->kev final nums mods)
   (cond

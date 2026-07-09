@@ -62,10 +62,14 @@
 
 ;; ---------------------------------------------------------------- 渲染订阅者
 
-;; make-renderer : (string -> void) -> (event -> void)
-;; 把 bus 事件转成文本，经 emit 汇聚到控制台/stdout。不直接触碰终端，故与
-;; console 的写锁协调一致，也可离线测试。
-(define (make-renderer emit)
+;; 工作动画标签（首 token 前 / 每次等待模型输出时显示的转轮标签）
+(define STATUS-WORKING "thinking…")
+
+;; make-renderer : emit status! -> (event -> void)
+;; emit    : (string -> void)  文本汇聚到控制台/stdout
+;; status! : (boolean -> void) #t=显示工作动画，#f=清除（console 输出到达时亦自动清除）
+;; 不直接触碰终端，故与 console 的写锁协调一致，也可离线测试。
+(define (make-renderer emit [status! void])
   (define in-thinking (box #f))
   (lambda (e)
     (cond
@@ -96,12 +100,14 @@
       [(evt:tool-end? e)
        (define ms (exact-round (evt:tool-end-ms e)))
        (emit (string-append " " (dim f"— {ms}ms") "\n"))
+       (status! #t)                          ; 工具毕，等待模型下一段输出 → 转轮
       ] ; end tool-end case
       [(evt:error? e)
        (emit (red f"\n[error] {(sanitize-untrusted (exn-message (evt:error-exn e)))}\n"))
       ] ; end error case
       [(evt:turn-end? e)
        (emit "\n")
+       (status! #f)                          ; 本轮结束，停动画
       ] ; end turn-end case
       [else (void)]
     ) ; end cond
@@ -174,7 +180,8 @@
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
-  (define unsub (bus-subscribe! bus (make-renderer emit)))
+  (define (statusf on?) (console-set-status! con (and on? STATUS-WORKING)))
+  (define unsub (bus-subscribe! bus (make-renderer emit statusf)))
   (parameterize ([current-console con])
     (console-start! con)
     (when banner?
@@ -208,6 +215,7 @@
            ] ; end command case
            [else
             (define user-msg (text-msg 'user line))
+            (statusf #t)                        ; 首 token 前即显示工作动画
             (define st*
               (with-handlers ([exn:break?
                                (lambda (_e)
@@ -225,6 +233,7 @@
                 (parameterize-break #t (run-turn! st user-msg d))
               ) ; end with-handlers
             ) ; end define st*
+            (statusf #f)                        ; 收尾：确保停动画
             (bus-drain! bus)
             (persist-turn! sess st st*)
             (loop st*)

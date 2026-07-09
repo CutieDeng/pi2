@@ -1,23 +1,24 @@
 #lang tstring racket
-;; tui/console.rkt — 异步实时控制台（design.md §11.3–§11.7）
+;; tui/console.rkt — 全屏异步实时控制台（design.md §11.3–§11.8）
 ;;
-;; 底部固定「输入文本框」（分隔线 + [命令预览] + 提示行），异步输出滚动其上方。
-;; 全程 raw 模式（-echo）杜绝 cooked 回显把按键撞进流式输出；所有终端写入经同一把锁
-;; 串行化，故 reader 线程回显、main 线程流式输出、权限询问互不冲突。
+;; 接管终端窗口：进 alternate screen、禁用默认滚屏、以「自有滚动缓存 + 视口」实现滚动，
+;; 每帧整屏重绘。屏幕自上而下 = [内容区(输出视口)] [可选状态行] [分隔线] [命令预览] [输入框]。
 ;;
 ;; 关键能力：
-;;   · 输入框始终钉在末端并显示光标；LLM 流式输出滚动其上方，输出体上不驻留光标
-;;     （每帧以 \e[?25l/\e[?25h 括起写入，光标只在框内闪烁）。
-;;   · 滚动：输出留在主屏，终端原生 scrollback（鼠标/触控板）可用；另配内存环形缓存
-;;     支撑超长会话的局部提取（console-tail-lines / /tail）。
-;;   · Ctrl-C 阶梯：有草稿→清草稿；空+运行中→打断（不回显 ^C）；空+空闲→无动作。
-;;   · 空输入回车不派发，仅换行。多行输入（Shift/Alt+Enter 插 \n）正确渲染与回显。
-;;   · '/' 元命令实时预览面板（内容由上层经 #:hint 提供）。
+;;   · 覆写终端原生滚屏：alt screen（无原生 scrollback），滚动由我们控制——
+;;     鼠标滚轮（SGR）/ PageUp·PageDown 翻动自有视口；新输出到达时自动跟随到底部。
+;;   · 输入框恒钉底部并显示光标；LLM 流式输出滚动于内容区，输出体上无光标游走
+;;     （每帧 \e[?25l…\e[?25h 括起，末尾绝对定位光标到框内）。
+;;   · LLM 工作动画：等待模型输出（尤其首 token 前）时，状态行显示 braille 转轮 + 标签，
+;;     由 animator 线程每 120ms 推进，明示「正在工作」。
+;;   · 全程 raw；单锁串行化一切写；Ctrl-C 阶梯（不回显 ^C）；空回车不派发仅换行；
+;;     Shift/Alt+Enter 多行；'/' 命令实时预览；权限询问改道；输出消毒在渲染层。
 ;;
-;; 绘制拆成「返回字符串的纯函数」+ 单次 framed 写入，故整帧原子、无光标游走，且可离线测试。
+;; 渲染为「纯函数拼字符串 + 单次 framed 写入」，故整帧原子、可离线（脚本终端 80×24）测试。
 
 (require
  racket/async-channel
+ racket/list
  (file "keys.rkt")
  (file "width.rkt")
  (file "terminal.rkt")
@@ -26,52 +27,93 @@
 
 ;; ------------------------------------------------------------ 环形缓存（scrollback）
 
-;; 定长环形缓冲：O(1) 追加、自动淘汰最旧，界定超长会话的内存占用。
 (struct ring (vec cap [size #:mutable] [head #:mutable]))
-
 (define (make-ring cap) (ring (make-vector cap #f) cap 0 0))
-
 (define (ring-push! r x)
   (define i (modulo (+ (ring-head r) (ring-size r)) (ring-cap r)))
   (vector-set! (ring-vec r) i x)
   (if (< (ring-size r) (ring-cap r))
       (set-ring-size! r (add1 (ring-size r)))
-      (set-ring-head! r (modulo (add1 (ring-head r)) (ring-cap r)))
-  ) ; end if
-) ; end define ring-push!
-
-(define (ring-tail r n)                       ; 取最后 n 项（最旧→最新）
+      (set-ring-head! r (modulo (add1 (ring-head r)) (ring-cap r)))))
+(define (ring-tail r n)                        ; 最后 n 项（最旧→最新）
   (define k (min n (ring-size r)))
   (for/list ([j (in-range (- (ring-size r) k) (ring-size r))])
-    (vector-ref (ring-vec r) (modulo (+ (ring-head r) j) (ring-cap r)))
-  ) ; end for/list
-) ; end define ring-tail
+    (vector-ref (ring-vec r) (modulo (+ (ring-head r) j) (ring-cap r)))))
+
+;; ------------------------------------------------------------ ANSI 感知折行
+
+;; 从 i 处（ESC）消费一个转义序列，返回 (values 序列串 下一索引)。主要 CSI；其余取两字符。
+(define (read-escape s i)
+  (define n (string-length s))
+  (cond
+    [(and (< (add1 i) n) (char=? (string-ref s (add1 i)) #\[))
+     (let loop ([j (+ i 2)])
+       (cond
+         [(>= j n) (values (substring s i j) j)]
+         [(let ([c (char->integer (string-ref s j))]) (and (>= c #x40) (<= c #x7E)))
+          (values (substring s i (add1 j)) (add1 j))]
+         [else (loop (add1 j))]))]
+    [else (values (substring s i (min n (+ i 2))) (min n (+ i 2)))]
+  ) ; end cond
+) ; end define read-escape
+
+;; 把一条逻辑行按显示宽度 w 折成若干视觉行（转义序列零宽、不被拆断）。
+(define (wrap-visual s w0)
+  (define w (max 1 w0))                         ; 防退化尺寸导致死循环
+  (cond
+    [(= (string-length s) 0) (list "")]
+    [else
+     (let loop ([i 0] [cur (open-output-string)] [curw 0] [rows '()])
+       (cond
+         [(>= i (string-length s)) (reverse (cons (get-output-string cur) rows))]
+         [(char=? (string-ref s i) #\u1b)
+          (define-values (seq j) (read-escape s i))
+          (write-string seq cur)
+          (loop j cur curw rows)]
+         [else
+          (define ch (string-ref s i))
+          (define cw (char-width ch))
+          (cond
+            [(and (> curw 0) (> (+ curw cw) w))       ; 满宽：断行
+             (loop i (open-output-string) 0 (cons (get-output-string cur) rows))]
+            [else (write-char ch cur) (loop (add1 i) cur (+ curw cw) rows)])
+         ] ; end else
+       ) ; end cond
+     ) ; end let loop
+    ] ; end else
+  ) ; end cond
+) ; end define wrap-visual
+
+(define (wrap-count s w) (length (wrap-visual s w)))
 
 ;; ------------------------------------------------------------ console
 
-;; 动态区（钉在屏幕底部）自顶向下：
-;;   [pending 半行] [分隔线] [命令预览行…] [提示行/多行输入(光标)]
-;; curup 记录「上次绘制后光标距动态区顶部的行数」，重绘前据此上移到顶再清屏
-;; （相对光标移动，滚动安全；也正确处理多行输入光标不在末行的情形）。
+(define SPINNER #("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"))
+(define SCROLL-STEP 3)
+(define DEFAULT-CACHE-LINES 4000)
+
 (struct console
   (term       ; terminal
-   lock       ; semaphore(1) — 串行化一切终端写
+   lock       ; semaphore(1)
    ledit      ; box of ledit
    prompt     ; box of string
-   pending    ; box of string — 尚未换行的输出尾
-   curup      ; box of exact  — 上次绘制后光标距动态区顶部的行数
-   route      ; box of ('input | channel) — 提交行去向
+   pending    ; box of string — 未换行的输出尾
+   cache      ; ring — 已提交输出行（带样式）
+   vrows      ; box of exact — 已提交行的视觉行数合计（视口 clamp 用）
+   view       ; box of exact — 视口上滚行数（0=跟随底部）
+   cols       ; box of exact — 终端列
+   termrows   ; box of exact — 终端行
+   route      ; box of ('input | channel)
    submit     ; async-channel
-   idle       ; box of boolean — 是否空闲（决定 Ctrl-C 是否打断）
+   idle       ; box of boolean
    history    ; box of (listof string)
-   interrupt  ; (-> void) — 空框且运行中的 Ctrl-C 回调
-   cols       ; box of exact — 终端列宽（分隔线用）
-   hint       ; (string -> (listof string)) — 命令预览行
-   cache      ; ring — 已提交输出行缓存（去 ANSI）
+   interrupt  ; (-> void)
+   hint       ; (string -> (listof string))
+   status     ; box of (or/c #f string) — 工作动画标签
+   spin       ; box of exact — 转轮帧索引
+   animator   ; box of (or/c #f thread)
   ) ; end fields
 ) ; end struct console
-
-(define DEFAULT-CACHE-LINES 4000)
 
 (define (make-console term
                       #:prompt [prompt "> "]
@@ -81,76 +123,158 @@
                       #:cache-lines [cache-lines DEFAULT-CACHE-LINES])
   (console term (make-semaphore 1)
            (box (make-ledit #:history history))
-           (box prompt) (box "") (box 0) (box 'input)
-           (make-async-channel) (box #f) (box history)
-           interrupt (box 80) hint (make-ring cache-lines))
+           (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
+           (box 80) (box 24) (box 'input) (make-async-channel)
+           (box #f) (box history) interrupt hint
+           (box #f) (box 0) (box #f))
 ) ; end define make-console
+
+;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
+(define (clamp-dim v default lo) (max lo (if (and v (> v 0)) v default)))
 
 (define (console-submit-channel con) (console-submit con))
 (define (console-history-list con) (unbox (console-history con)))
-(define (console-tail-lines con n) (ring-tail (console-cache con) n))
+(define (console-tail-lines con n) (map strip-ansi (ring-tail (console-cache con) n)))
 
-;; ------------------------------------------------------------ 绘制（返回字符串，须持锁）
+;; ------------------------------------------------------------ 布局度量
 
-;; 分隔线：整宽暗色横线，界定「上文输出」与「底部输入框」。
+(define (box-hints con) ((console-hint con) (ledit-text (unbox (console-ledit con)))))
+
+(define (box-row-count con hints)
+  (+ (if (unbox (console-status con)) 1 0)    ; 状态行
+     1                                        ; 分隔线
+     (length hints)                           ; 命令预览
+     (ledit-line-count (unbox (console-ledit con))))  ; 输入行（多行）
+) ; end define box-row-count
+
+(define (content-height con hints)
+  (max 1 (- (unbox (console-termrows con)) (box-row-count con hints)))
+) ; end define content-height
+
+(define (pending-vrows con)
+  (define p (unbox (console-pending con)))
+  (if (positive? (string-length p)) (wrap-count p (unbox (console-cols con))) 0)
+) ; end define pending-vrows
+
+(define (total-vrows con) (+ (unbox (console-vrows con)) (pending-vrows con)))
+
+;; ------------------------------------------------------------ 绘制原语
+
 (define (separator-line con)
   (define bar (make-string (max 1 (unbox (console-cols con))) (integer->char #x2500)))
   f"\e[2m{bar}\e[0m"
 ) ; end define separator-line
 
-;; 提示行之上的附加整行：分隔线 + 命令预览。
-(define (box-extra-rows con)
-  (cons (separator-line con)
-        ((console-hint con) (ledit-text (unbox (console-ledit con)))))
-) ; end define box-extra-rows
-
-;; 擦掉当前动态区：上移到顶行、清到屏幕末。返回 ANSI 串，并把 curup 归零。
-(define (clear-dynamic-str con)
-  (define u (unbox (console-curup con)))
-  (set-box! (console-curup con) 0)
-  (string-append (if (> u 0) f"\e[{u}A" "") "\r" "\e[J")
-) ; end define clear-dynamic-str
-
-;; 在底部绘制动态区（输入框始终可见）。返回 ANSI 串，并更新 curup。
-(define (draw-dynamic-str con)
+;; 尾部若干逻辑行（含 pending 作为最后一行）
+(define (tail-logical con k)
   (define pend (unbox (console-pending con)))
-  (define has-pend? (positive? (string-length pend)))
+  (define has? (positive? (string-length pend)))
+  (define committed (ring-tail (console-cache con) (if has? (max 0 (sub1 k)) k)))
+  (if has? (append committed (list pend)) committed)
+) ; end define tail-logical
+
+;; 补/截到恰好 n 行（不足在顶部补空行，多则保留末 n 行）
+(define (fit-rows rows n)
+  (define m (length rows))
+  (cond [(= m n) rows]
+        [(< m n) (append (make-list (- n m) "") rows)]
+        [else (list-tail rows (- m n))]))
+
+;; 输入框各视觉行（首行带 prompt；续行不缩进，与光标列计算一致）
+(define (input-display-lines con)
   (define ed (unbox (console-ledit con)))
-  (define full-rows (append (if has-pend? (list pend) '()) (box-extra-rows con)))
-  (set-box! (console-curup con) (+ (length full-rows) (ledit-cursor-row ed)))
-  (string-append
-   (apply string-append
-          (for/list ([r (in-list full-rows)]) (string-append r "\r\n")))
-   (ledit-render ed (unbox (console-prompt con)))
-  ) ; end string-append
-) ; end define draw-dynamic-str
+  (define prompt (unbox (console-prompt con)))
+  (define lines (regexp-split #rx"\n" (ledit-text ed)))
+  (cons (string-append prompt (car lines)) (cdr lines))
+) ; end define input-display-lines
 
-(define (redraw-str con) (string-append (clear-dynamic-str con) (draw-dynamic-str con)))
+;; 光标在输入框内的 (行,列)：行 0 基、列 1 基（含 prompt 宽度）
+(define (input-cursor-rc con)
+  (define ed (unbox (console-ledit con)))
+  (define prompt (unbox (console-prompt con)))
+  (define t (ledit-text ed))
+  (define c (ledit-cursor ed))
+  (define lines (regexp-split #rx"\n" t))
+  (let loop ([ls lines] [row 0] [rem c])
+    (define L (string-length (car ls)))
+    (if (or (null? (cdr ls)) (<= rem L))
+        (values row (add1 (+ (if (= row 0) (visible-width prompt) 0)
+                             (string-width-upto (car ls) (min rem L)))))
+        (loop (cdr ls) (add1 row) (- rem L 1))))
+) ; end define input-cursor-rc
 
-;; 单次原子写入：以 \e[?25l/…/\e[?25h 括起，写时藏光标、写毕在框内复现，故输出体上无游标。
+;; 整屏帧字符串（末尾绝对定位光标到输入框）
+(define (render-frame con)
+  (define W (unbox (console-cols con)))
+  (define H (unbox (console-termrows con)))
+  (define hints (box-hints con))
+  (define status (unbox (console-status con)))
+  (define Ch (content-height con hints))
+  ;; 内容视口
+  (define vis
+    (append-map (lambda (l) (wrap-visual l W))
+                (tail-logical con (+ Ch (unbox (console-view con)) 2))))
+  (define m (length vis))
+  (define N (total-vrows con))
+  (define maxv (max 0 (- N Ch)))
+  (define v (max 0 (min maxv (unbox (console-view con)))))
+  (set-box! (console-view con) v)
+  (define endi (- m v))
+  (define starti (max 0 (- endi Ch)))
+  (define window (take (drop vis starti) (- endi starti)))
+  (define content (fit-rows window Ch))
+  ;; 底部框
+  (define box-lines
+    (append
+     (if status (list (dim-status con status)) '())
+     (list (separator-line con))
+     hints
+     (input-display-lines con)))
+  (define all-rows (append content box-lines))
+  (define body
+    (string-append
+     "\e[H"
+     (string-join (for/list ([r (in-list all-rows)]) (string-append "\e[K" r)) "\r\n")
+     "\e[J"))
+  ;; 光标绝对位置
+  (define-values (crow ccol) (input-cursor-rc con))
+  (define input-row0 (+ Ch (if status 1 0) 1 (length hints) 1))  ; 输入首行(1 基)
+  (string-append body f"\e[{(+ input-row0 crow)};{ccol}H")
+) ; end define render-frame
+
+(define (dim s) f"\e[2m{s}\e[0m")
+(define (dim-status con label)
+  (dim (string-append (vector-ref SPINNER (unbox (console-spin con))) " " label))
+) ; end define dim-status
+
+;; 单次原子写入：藏光标→写整帧→（帧末已定位）复现光标。
 (define (frame! con s)
   (term-write (console-term con) (string-append "\e[?25l" s "\e[?25h"))
 ) ; end define frame!
 
+(define (redraw! con) (frame! con (render-frame con)))
+
 ;; ------------------------------------------------------------ 输出
 
-;; console-emit! : 异步输出经此串行落屏。完整行提交为永久滚动历史（\n→\r\n）并入缓存；
-;; 未换行尾入 pending 于框上方滚动显示。
 (define (console-emit! con text)
   (call-with-semaphore (console-lock con)
     (lambda ()
+      (when (unbox (console-status con)) (set-box! (console-status con) #f))  ; 有输出→停动画
+      (define W (unbox (console-cols con)))
       (define combined (string-append (unbox (console-pending con)) text))
       (define segs (regexp-split #rx"\n" combined))
       (define complete (reverse (cdr (reverse segs))))
       (define newpend (last segs))
-      (define cs (clear-dynamic-str con))
-      (for ([l (in-list complete)]) (ring-push! (console-cache con) (strip-ansi l)))
-      (define commit
-        (if (null? complete) ""
-            (apply string-append
-                   (for/list ([l (in-list complete)]) (string-append l "\r\n")))))
+      (define added
+        (for/sum ([l (in-list complete)])
+          (ring-push! (console-cache con) l)
+          (wrap-count l W)))
+      (set-box! (console-vrows con) (+ (unbox (console-vrows con)) added))
       (set-box! (console-pending con) newpend)
-      (frame! con (string-append cs commit (draw-dynamic-str con)))
+      ;; 上滚状态下保持视口锚定（新行不把用户拽走）
+      (when (> (unbox (console-view con)) 0)
+        (set-box! (console-view con) (+ (unbox (console-view con)) added)))
+      (redraw! con)
     ) ; end lambda
   ) ; end call-with-semaphore
 ) ; end define console-emit!
@@ -167,72 +291,83 @@
 
 ;; ------------------------------------------------------------ 按键处理
 
+(define (scroll-key? k)
+  (and (eq? (kev-kind k) 'named)
+       (memq (kev-name k) '(scroll-up scroll-down pgup pgdn))))
+
 (define (console-handle-key! con k)
-  (define st0 (unbox (console-ledit con)))
-  (define-values (st* action) (ledit-apply st0 k))
-  (set-box! (console-ledit con) st*)
-  (case action
-    [(submit) (handle-submit! con st*)]
-    [(cancel) (handle-cancel! con st0)]
-    [(eof)    (route-value! con eof) 'eof]
-    [(clear-screen)
-     (call-with-semaphore (console-lock con)
-       (lambda ()
-         (set-box! (console-curup con) 0)
-         (frame! con (string-append "\e[2J\e[H" (draw-dynamic-str con)))))
-     'continue
-    ] ; end clear-screen
-    [else                                        ; edit / ignore
-     (call-with-semaphore (console-lock con) (lambda () (frame! con (redraw-str con))))
-     'continue
+  (cond
+    [(scroll-key? k) (do-scroll! con k) 'continue]
+    [else
+     (define st0 (unbox (console-ledit con)))
+     (define-values (st* action) (ledit-apply st0 k))
+     (set-box! (console-ledit con) st*)
+     (case action
+       [(submit) (handle-submit! con st*)]
+       [(cancel) (handle-cancel! con st0)]
+       [(eof)    (route-value! con eof) 'eof]
+       [(clear-screen) (call-with-semaphore (console-lock con) (lambda () (redraw! con))) 'continue]
+       [else (call-with-semaphore (console-lock con) (lambda () (redraw! con))) 'continue]
+     ) ; end case
     ] ; end else
-  ) ; end case
+  ) ; end cond
 ) ; end define console-handle-key!
 
-;; 提交行回显串：首行带 prompt，续行以等宽缩进对齐（多行输入）。
-(define (echo-str con line)
+(define (do-scroll! con k)
+  (call-with-semaphore (console-lock con)
+    (lambda ()
+      (define Ch (content-height con (box-hints con)))
+      (define step (case (kev-name k)
+                     [(pgup pgdn) (max 1 (sub1 Ch))]
+                     [else SCROLL-STEP]))
+      (define dir (if (memq (kev-name k) '(scroll-up pgup)) 1 -1))
+      (define maxv (max 0 (- (total-vrows con) Ch)))
+      (set-box! (console-view con)
+                (max 0 (min maxv (+ (unbox (console-view con)) (* dir step)))))
+      (redraw! con)
+    ) ; end lambda
+  ) ; end call-with-semaphore
+) ; end define do-scroll!
+
+;; 提交行推入内容缓存（回显），并更新视觉行计数
+(define (push-echo! con line)
   (define prompt (unbox (console-prompt con)))
   (define lines (regexp-split #rx"\n" line))
-  (define indent (make-string (visible-width prompt) #\space))
-  (string-append
-   prompt (car lines)
-   (apply string-append (for/list ([l (in-list (cdr lines))]) f"\r\n{indent}{l}"))
-   "\r\n"
-  ) ; end string-append
-) ; end define echo-str
+  (define echo-rows (cons (string-append prompt (car lines)) (cdr lines)))
+  (define W (unbox (console-cols con)))
+  (for ([r (in-list echo-rows)])
+    (ring-push! (console-cache con) r)
+    (set-box! (console-vrows con) (+ (unbox (console-vrows con)) (wrap-count r W))))
+) ; end define push-echo!
 
 (define (handle-submit! con st*)
   (define line (ledit-value st*))
   (cond
-    ;; 空输入回车：不派发、不响应，仅换行（框下移一行）
-    [(string=? (string-trim line) "")
+    [(string=? (string-trim line) "")            ; 空回车：不派发，仅推一空行
      (call-with-semaphore (console-lock con)
        (lambda ()
-         (define cs (clear-dynamic-str con))
+         (ring-push! (console-cache con) "")
+         (set-box! (console-vrows con) (add1 (unbox (console-vrows con))))
+         (set-box! (console-view con) 0)
          (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
-         (frame! con (string-append cs "\r\n" (draw-dynamic-str con)))))
+         (redraw! con)))
      'continue
     ] ; end empty
     [else
      (call-with-semaphore (console-lock con)
        (lambda ()
-         (define cs (clear-dynamic-str con))
-         (define echo (echo-str con line))
-         (for ([l (in-list (regexp-split #rx"\n" line))])
-           (ring-push! (console-cache con) (strip-ansi l)))
+         (push-echo! con line)
          (set-box! (console-history con) (cons line (unbox (console-history con))))
+         (set-box! (console-view con) 0)
          (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
-         (frame! con (string-append cs echo (draw-dynamic-str con)))))
+         (redraw! con)))
      (route-value! con line)
      'continue
     ] ; end else
   ) ; end cond
 ) ; end define handle-submit!
 
-;; Ctrl-C 阶梯（不回显 ^C）：
-;;   有草稿      → 清空输入框，不打断
-;;   空 + 运行中 → 清空并打断当前 turn（中断提示由 repl 作为独立元信息给出）
-;;   空 + 空闲   → 无动作
+;; Ctrl-C 阶梯（不回显 ^C）：有草稿→清草稿；空+运行中→打断；空+空闲→无动作。
 (define (handle-cancel! con st0)
   (define had-text? (positive? (string-length (ledit-text st0))))
   (define running? (not (unbox (console-idle con))))
@@ -241,13 +376,13 @@
      (call-with-semaphore (console-lock con)
        (lambda ()
          (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
-         (frame! con (redraw-str con))))
+         (redraw! con)))
     ] ; end clear-draft
     [running?
      (call-with-semaphore (console-lock con)
        (lambda ()
          (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
-         (frame! con (redraw-str con))))
+         (redraw! con)))
      ((console-interrupt con))
     ] ; end interrupt
     [else (void)]
@@ -255,15 +390,19 @@
   'continue
 ) ; end define handle-cancel!
 
-;; ------------------------------------------------------------ 空闲状态 / 询问
+;; ------------------------------------------------------------ 空闲 / 状态 / 询问
 
-;; 记录空闲态（供 Ctrl-C 判定）并刷新输入框。
-(define (console-set-idle! con v)
+(define (console-set-idle! con v) (set-box! (console-idle con) v))
+
+;; 工作动画：v = 标签串（显示转轮）或 #f（清除）。仅在变化时重绘。
+(define (console-set-status! con v)
   (call-with-semaphore (console-lock con)
-    (lambda () (set-box! (console-idle con) v) (frame! con (redraw-str con))))
-) ; end define console-set-idle!
+    (lambda ()
+      (unless (equal? (unbox (console-status con)) v)
+        (set-box! (console-status con) v)
+        (redraw! con))))
+) ; end define console-set-status!
 
-;; console-ask! : 运行中同步征询一行。临时改 prompt 并把下一提交行改道到本地通道。
 (define (console-ask! con prompt-str)
   (define ch (make-channel))
   (define old-prompt (unbox (console-prompt con)))
@@ -272,35 +411,67 @@
       (set-box! (console-prompt con) prompt-str)
       (set-box! (console-ledit con) (make-ledit))
       (set-box! (console-route con) ch)
-      (frame! con (redraw-str con))))
+      (redraw! con)))
   (define ans (channel-get ch))
   (call-with-semaphore (console-lock con)
     (lambda ()
       (set-box! (console-prompt con) old-prompt)
       (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
-      (frame! con (redraw-str con))))
+      (redraw! con)))
   ans
 ) ; end define console-ask!
+
+;; ------------------------------------------------------------ animator（工作动画线程）
+
+;; 每 ~1s 重查终端尺寸；变化则更新并重绘（处理窗口 resize，无 SIGWINCH 依赖）。
+(define (poll-resize! con)
+  (define-values (c r) (term-size (console-term con)))
+  (define nc (clamp-dim c 80 20))
+  (define nr (clamp-dim r 24 4))
+  (when (or (not (= nc (unbox (console-cols con)))) (not (= nr (unbox (console-termrows con)))))
+    (call-with-semaphore (console-lock con)
+      (lambda ()
+        (set-box! (console-cols con) nc)
+        (set-box! (console-termrows con) nr)
+        (redraw! con))))
+) ; end define poll-resize!
+
+(define (start-animator! con)
+  (set-box! (console-animator con)
+    (thread
+     (lambda ()
+       (let loop ([tick 0])
+         (sleep 0.12)
+         (when (unbox (console-status con))
+           (call-with-semaphore (console-lock con)
+             (lambda ()
+               (set-box! (console-spin con)
+                         (modulo (add1 (unbox (console-spin con))) (vector-length SPINNER)))
+               (redraw! con))))
+         (when (>= tick 8) (poll-resize! con))     ; ~每秒查一次尺寸
+         (loop (if (>= tick 8) 0 (add1 tick))))))
+  ) ; end set-box!
+) ; end define start-animator!
 
 ;; ------------------------------------------------------------ 生命周期
 
 (define (console-start! con)
   (term-raw-on! (console-term con))
-  (term-write (console-term con) "\e[>4;1m")   ; modifyOtherKeys=1：让 Shift+Enter 可辨识
-  (define-values (cols _rows) (term-size (console-term con)))
-  (call-with-semaphore (console-lock con)
-    (lambda ()
-      (set-box! (console-cols con) (or cols 80))
-      (set-box! (console-idle con) #t)
-      (frame! con (draw-dynamic-str con))))
+  ;; 进 alt screen（禁原生 scrollback）+ SGR 鼠标上报 + modifyOtherKeys
+  (term-write (console-term con) "\e[?1049h\e[?1000h\e[?1006h\e[>4;1m")
+  (define-values (c r) (term-size (console-term con)))
+  (set-box! (console-cols con) (clamp-dim c 80 20))
+  (set-box! (console-termrows con) (clamp-dim r 24 4))
+  (start-animator! con)
+  (call-with-semaphore (console-lock con) (lambda () (set-box! (console-idle con) #t) (redraw! con)))
 ) ; end define console-start!
 
 (define (console-stop! con)
+  (when (unbox (console-animator con)) (kill-thread (unbox (console-animator con))))
   (call-with-semaphore (console-lock con)
     (lambda ()
-      (term-write (console-term con) (string-append (clear-dynamic-str con) "\e[?25h"))
-      (set-box! (console-idle con) #f)))
-  (term-write (console-term con) "\e[>4;0m")   ; 关闭 modifyOtherKeys
+      (term-write (console-term con)
+                  "\e[?1000l\e[?1006l\e[>4;0m\e[?25h\e[?1049l")))  ; 复原鼠标/键/光标/主屏
   (term-raw-off! (console-term con))
 ) ; end define console-stop!
 
@@ -315,6 +486,7 @@
  console-emit!
  console-handle-key!
  console-set-idle!
+ console-set-status!
  console-ask!
  console-start!
  console-stop!

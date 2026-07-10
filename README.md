@@ -21,11 +21,28 @@ racket main.rkt -m gemma-4-31b-it@6bit -e http://localhost:1234/v1 --mode normal
 # 单次问答（管道友好）
 racket main.rkt --mode yolo -p "read config.rkt and summarize it"
 
-# 恢复历史会话
-racket main.rkt --resume data/20260709-1030-8905.rktd
+# 恢复会话
+racket main.rkt -c                       # 恢复最近一次会话
+racket main.rkt -i                       # 交互选择器挑一个恢复
+racket main.rkt --list                   # 列出会话并退出
+racket main.rkt --resume 3               # 按 --list 序号恢复
+racket main.rkt --resume data/20260709-1030-8905.rktd   # 或按路径
+racket main.rkt --resume 3 --fork-at 6   # 从第 6 条消息分叉出新分支
+racket main.rkt --rm 3                    # 删除某会话
 ```
 
 远程端点用环境变量 `PI_API_KEY` 提供密钥。
+
+## 会话恢复
+
+transcript 存于 `data/*.rktd`（每记录即时 flush，崩溃只丢未完成的尾记录，重放容忍截断）。
+
+- **选择**：`-c/--continue`（最近一次）、`-i/--pick`（交互选择器，↑/↓/Enter/Esc）、
+  `--list`（编号表格）、`--resume <序号|路径>`；交互中 `/resume` 可随时切换会话。
+- **恢复预览**：恢复时终端渲染**最近几条对话**（+「…(N earlier)」省略提示），一眼接续上下文。
+- **标题**：列表/选择器每项自动以**首条 user 消息**派生标题，附时间、模型、消息数。
+- **分叉**：`--resume <src> --fork-at N` 重放前 N 条到一个**新** `.rktd`，从该点另起分支。
+- **清理**：从未产生消息的空会话在关闭时自动删除；`--rm <序号|路径>` 显式删除。
 
 ### 行编辑快捷键（交互式 TUI）
 
@@ -64,9 +81,10 @@ racket main.rkt --resume data/20260709-1030-8905.rktd
 
 ### 斜杠命令
 
-`/help` `/quit` `/clear` `/usage` `/compact` `/history` `/tail [n]` `/model <id>`
+`/help` `/quit` `/clear` `/usage` `/compact` `/history` `/tail [n]` `/resume` `/model <id>`
 
-输入 `/` 时 TUI 会实时预览可用命令。`/tail [n]` 从滚动缓存取最后 n 行（默认 20）。
+输入 `/` 时 TUI 会实时预览可用命令。`/tail [n]` 从滚动缓存取最后 n 行（默认 20）；
+`/resume` 弹出会话选择器切换到另一会话（Esc 取消）。
 
 ### 权限模式
 
@@ -125,6 +143,7 @@ pi2/
 │       ├── terminal.rkt  终端抽象（真实 tty + 脚本后端）
 │       ├── lineedit.rkt  行编辑器 + readline 快捷键
 │       ├── sanitize.rkt  不可信文本消毒（剥离终端转义注入）
+│       ├── picker.rkt    可选列表控件（会话选择器；纯状态机 + 渲染）
 │       ├── tui.rkt       组装 tui-read-line（同步单行读）
 │       └── console.rkt   全屏异步控制台（alt-screen + 自有滚动视口 + 工作动画 + 命令预览）
 ├── tests/               单测 + 真机验收（raco test；info.rkt 排除 live）

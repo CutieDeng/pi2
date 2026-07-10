@@ -23,6 +23,7 @@
  (file "width.rkt")
  (file "terminal.rkt")
  (file "lineedit.rkt")
+ (file "picker.rkt")
 ) ; end require
 
 ;; ------------------------------------------------------------ 环形缓存（scrollback）
@@ -112,8 +113,12 @@
    status     ; box of (or/c #f string) — 工作动画标签
    spin       ; box of exact — 转轮帧索引
    animator   ; box of (or/c #f thread)
+   picker     ; box of (or/c #f pmode) — /resume 内嵌选择器模式
   ) ; end fields
 ) ; end struct console
+
+;; 选择器模式态（内嵌于 console，键由 reader 线程喂给 pick-step）
+(struct pmode (state items render-item title ch) #:mutable)
 
 (define (make-console term
                       #:prompt [prompt "> "]
@@ -126,7 +131,7 @@
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f))
+           (box #f) (box 0) (box #f) (box #f))
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -252,7 +257,21 @@
   (term-write (console-term con) (string-append "\e[?25l" s "\e[?25h"))
 ) ; end define frame!
 
-(define (redraw! con) (frame! con (render-frame con)))
+;; 选择器模式：整屏画列表、藏光标（无输入框光标）；否则常规整帧。
+(define (redraw! con)
+  (define pk (unbox (console-picker con)))
+  (cond
+    [pk
+     (define lines (pick-render-lines (pmode-state pk) (pmode-items pk) (pmode-title pk)
+                                      (pmode-render-item pk)
+                                      (max 20 (unbox (console-cols con)))
+                                      (max 4 (unbox (console-termrows con)))))
+     (term-write (console-term con)
+                 (string-append "\e[?25l\e[H" (string-join lines "\r\n") "\e[J"))
+    ] ; end picker
+    [else (frame! con (render-frame con))]
+  ) ; end cond
+) ; end define redraw!
 
 ;; ------------------------------------------------------------ 输出
 
@@ -297,6 +316,7 @@
 
 (define (console-handle-key! con k)
   (cond
+    [(unbox (console-picker con)) (handle-picker-key! con k) 'continue]
     [(scroll-key? k) (do-scroll! con k) 'continue]
     [else
      (define st0 (unbox (console-ledit con)))
@@ -312,6 +332,23 @@
     ] ; end else
   ) ; end cond
 ) ; end define console-handle-key!
+
+;; 选择器模式下的按键：喂给 pick-step；选定/取消则清模式并把结果投递到通道。
+(define (handle-picker-key! con k)
+  (define pk (unbox (console-picker con)))
+  (define-values (st* r) (pick-step (pmode-state pk) k))
+  (cond
+    [(eq? r 'continue)
+     (call-with-semaphore (console-lock con)
+       (lambda () (set-pmode-state! pk st*) (redraw! con)))
+    ] ; end continue
+    [else
+     (define result (if (and (pair? r) (eq? (car r) 'chosen)) (cadr r) #f))
+     (call-with-semaphore (console-lock con) (lambda () (set-box! (console-picker con) #f)))
+     (channel-put (pmode-ch pk) result)        ; console-pick! 取回后会重绘常规界面
+    ] ; end done
+  ) ; end cond
+) ; end define handle-picker-key!
 
 (define (do-scroll! con k)
   (call-with-semaphore (console-lock con)
@@ -421,6 +458,25 @@
   ans
 ) ; end define console-ask!
 
+;; console-pick! : 运行中同步弹出选择器（/resume）。键由 reader 线程喂给 pick-step，
+;; 主线程在此阻塞取回选中下标（取消 → #f）。
+(define (console-pick! con items #:title [title "select"]
+                       #:render-item [render-item (lambda (x) (format "~a" x))])
+  (cond
+    [(null? items) #f]
+    [else
+     (define ch (make-channel))
+     (call-with-semaphore (console-lock con)
+       (lambda ()
+         (set-box! (console-picker con) (pmode (pick-init (length items)) items render-item title ch))
+         (redraw! con)))
+     (define res (channel-get ch))
+     (call-with-semaphore (console-lock con)
+       (lambda () (set-box! (console-picker con) #f) (redraw! con)))
+     res]
+  ) ; end cond
+) ; end define console-pick!
+
 ;; ------------------------------------------------------------ animator（工作动画线程）
 
 ;; 每 ~1s 重查终端尺寸；变化则更新并重绘（处理窗口 resize，无 SIGWINCH 依赖）。
@@ -488,6 +544,7 @@
  console-set-idle!
  console-set-status!
  console-ask!
+ console-pick!
  console-start!
  console-stop!
 ) ; end provide

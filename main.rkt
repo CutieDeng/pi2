@@ -23,6 +23,8 @@
  (file "src/repl.rkt")
  (file "src/subagent.rkt")
  (file "src/tools/builtin.rkt")
+ (file "src/tui/terminal.rkt")
+ (file "src/tui/picker.rkt")
 ) ; end require
 
 ;; 运行时目录锚定到项目根（main.rkt 所在处），与 agent 的目标工作目录无关。
@@ -54,6 +56,43 @@
   ) ; end string-join
 ) ; end define DEFAULT-SYSTEM
 
+;; ---------------------------------------------------------------- 会话选择辅助
+
+(define (print-session-table infos)
+  (cond
+    [(null? infos) (displayln "no sessions in data/")]
+    [else
+     (for ([info (in-list infos)] [i (in-naturals 1)])
+       (printf "~a\t~a\n" i (session-info->line info)))]
+  ) ; end cond
+) ; end define print-session-table
+
+;; 把 --resume/--rm 的实参（列表序号 或 路径）解析为存在的会话路径字符串；无则 #f
+(define (resolve-source arg infos data-dir)
+  (define n (string->number arg))
+  (cond
+    [(and n (exact-integer? n) (>= n 1) (<= n (length infos)))
+     (session-info-path (list-ref infos (sub1 n)))]
+    [(file-exists? arg) arg]
+    [(file-exists? (build-path data-dir arg)) (path->string (build-path data-dir arg))]
+    [else #f]
+  ) ; end cond
+) ; end define resolve-source
+
+;; 交互选择器 → 会话路径（取消返回 #f = 新建）
+(define (pick-session-path infos)
+  (cond
+    [(null? infos) (eprintf "no sessions to resume; starting fresh\n") #f]
+    [(not (terminal-port? (current-input-port)))
+     (eprintf "--pick requires a terminal\n") (exit 1)]
+    [else
+     (define idx (run-picker (make-real-terminal) infos
+                             #:title "Resume a session (Esc = new session)"
+                             #:render-item session-info->line))
+     (and idx (session-info-path (list-ref infos idx)))]
+  ) ; end cond
+) ; end define pick-session-path
+
 (module+ main
   (define model (box #f))
   (define endpoint (box #f))
@@ -62,17 +101,56 @@
   (define prompt (box #f))
   (define mode (box #f))
   (define workdir (box (path->string (current-directory))))
+  (define continue? (box #f))
+  (define pick? (box #f))
+  (define list? (box #f))
+  (define fork-at (box #f))
+  (define rm-arg (box #f))
 
   (command-line
    #:program "pi++"
    #:once-each
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
-   [("--resume") path "resume a .rktd session" (set-box! resume-path path)]
+   [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
+   [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
+   [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
+   [("--list") "list sessions and exit" (set-box! list? #t)]
+   [("--fork-at") n "fork the resumed session at message N (new branch)" (set-box! fork-at (string->number n))]
+   [("--rm") arg "delete a session (list index or path) and exit" (set-box! rm-arg arg)]
    [("-p" "--prompt") p "one-shot prompt (non-interactive)" (set-box! prompt p)]
    [("--mode") md "permission mode: yolo|normal|strict" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
   ) ; end command-line
+
+  ;; ---- 解析会话选择：--list / --rm 即时退出；否则解析出待恢复路径（可能 #f=新建）
+  (define infos (session-infos data-dir))
+  (when (unbox list?) (print-session-table infos) (exit 0))
+  (when (unbox rm-arg)
+    (define p (resolve-source (unbox rm-arg) infos data-dir))
+    (cond
+      [p (session-delete! p) (printf "removed ~a\n" p)]
+      [else (eprintf "no such session: ~a\n" (unbox rm-arg))])
+    (exit 0)
+  ) ; end when
+  (define source
+    (cond
+      [(unbox continue?)
+       (or (session-latest data-dir) (begin (eprintf "no sessions to continue\n") (exit 1)))]
+      [(unbox pick?) (pick-session-path infos)]
+      [(unbox resume-path)
+       (or (resolve-source (unbox resume-path) infos data-dir)
+           (begin (eprintf "no such session: ~a\n" (unbox resume-path)) (exit 1)))]
+      [else #f]
+    ) ; end cond
+  ) ; end define source
+  ;; --fork-at：从 source 分叉出新会话文件，恢复该分支
+  (define resolved
+    (let ([s (if (and source (unbox fork-at))
+                 (session-fork! source data-dir #:at (unbox fork-at))
+                 source)])
+      (and s (if (path? s) (path->string s) s))))
+  (set-box! resume-path resolved)              ; 下游按已解析路径工作
 
   ;; 组装 config：resume 时以存档 config 为基，命令行覆盖
   (define base-cfg
@@ -138,7 +216,9 @@
     ] ; end one-shot case
     ;; 交互式
     [else
-     (run-repl! d st0 sess)
+     (run-repl! d st0 sess
+                #:data-dir (path->string data-dir)
+                #:resumed? (and (unbox resume-path) #t))
     ] ; end else
   ) ; end cond
 ) ; end module+ main

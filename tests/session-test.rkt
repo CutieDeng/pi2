@@ -4,6 +4,7 @@
 (require
  rackunit
  racket/file
+ racket/list
  racket/pvector
  racket/string
  (file "../src/model.rkt")
@@ -75,12 +76,58 @@
   (check-equal? (rec-type (car datums)) 'meta)
 ) ; end test-case
 
-(test-case "session-list reads only meta"
-  (define d (session-list tmpdir))
-  (check-true (>= (length d) 3))
-  (for ([sm (in-list d)])
-    (check-true (session-meta? sm))
-  ) ; end for
+(test-case "session-infos: rich metadata + auto-title from first user message"
+  (define infos (session-infos tmpdir))
+  (check-true (>= (length infos) 3))
+  (for ([i (in-list infos)]) (check-true (session-info? i)))
+  (define s1 (findf (lambda (i) (string-suffix? (session-info-path i) "s1.rktd")) infos))
+  (check-true (session-info? s1))
+  (check-equal? (session-info-title s1) "你好 agent")   ; 首条 user 消息
+  (check-equal? (session-info-model s1) "test-model")
+  (check-equal? (session-info-nmsg s1) 4)
+  ;; 排序：最近修改在前
+  (check-equal? (session-info-mtime (first infos))
+                (apply max (map session-info-mtime infos)))
+) ; end test-case
+
+(test-case "session-info->line renders a single line with the title"
+  (define s1 (findf (lambda (i) (string-suffix? (session-info-path i) "s1.rktd"))
+                    (session-infos tmpdir)))
+  (check-true (string-contains? (session-info->line s1) "你好 agent"))
+) ; end test-case
+
+(test-case "session-latest returns the most recently written session"
+  (define p (build-path tmpdir "latest.rktd"))
+  (define s (session-open! p (default-config)))
+  (session-append-msg! s (text-msg 'user "newest"))
+  (session-close! s)
+  (check-equal? (session-latest tmpdir) (path->string p))
+) ; end test-case
+
+(test-case "empty fresh session is auto-pruned on close"
+  (define p (build-path tmpdir "empty.rktd"))
+  (define s (session-open! p (default-config)))       ; 只有 meta，无消息
+  (session-close! s)
+  (check-false (file-exists? p))                       ; 自动清理
+) ; end test-case
+
+(test-case "session-delete! removes a session file"
+  (define p (build-path tmpdir "todelete.rktd"))
+  (define s (session-open! p (default-config)))
+  (session-append-msg! s (text-msg 'user "x"))
+  (session-close! s)
+  (check-true (file-exists? p))
+  (session-delete! p)
+  (check-false (file-exists? p))
+) ; end test-case
+
+(test-case "session-fork! branches at message N into a new file"
+  (define src (build-path tmpdir "s1.rktd"))          ; 4 条消息
+  (define new-path (session-fork! src tmpdir #:at 2))
+  (check-true (file-exists? new-path))
+  (define st (session-replay new-path))
+  (check-equal? (pvector-length (agent-state-history st)) 2)
+  (check-equal? (message-text (pvector-ref (agent-state-history st) 0)) "你好 agent")
 ) ; end test-case
 
 (delete-directory/files tmpdir)

@@ -42,6 +42,7 @@
     ("/compact" ""     "summarize old history to save context")
     ("/history" ""     "message count and roles")
     ("/tail"    "[n]"  "show last n cached output lines (default 20)")
+    ("/resume"  ""     "pick another session to resume")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -160,17 +161,19 @@
 ;; ---------------------------------------------------------------- 主循环
 
 ;; run-repl! : deps agent-state session -> void（返回时会话已持久化）
-(define (run-repl! d st0 sess #:banner? [banner? #t])
+;; data-dir: 会话目录（/resume 选择器与列表用）；resumed?: 是否为恢复启动（渲染预览）
+(define (run-repl! d st0 sess #:banner? [banner? #t]
+                   #:data-dir [data-dir "data"] #:resumed? [resumed? #f])
   (define bus (deps-bus d))
   (if (terminal-port? (current-input-port))
-      (run-repl/console! d st0 sess bus banner?)
-      (run-repl/plain! d st0 sess bus banner?)
+      (run-repl/console! d st0 sess bus banner? data-dir resumed?)
+      (run-repl/plain! d st0 sess bus banner? data-dir resumed?)
   ) ; end if
 ) ; end define run-repl!
 
 ;; -------- 交互式：异步实时控制台
 
-(define (run-repl/console! d st0 sess bus banner?)
+(define (run-repl/console! d st0 sess bus banner? data-dir resumed?)
   (define term (make-real-terminal))
   (define main-th (current-thread))
   (define con
@@ -182,12 +185,14 @@
   (define (say s) (emit (string-append s "\n")))
   (define (statusf on?) (console-set-status! con (and on? STATUS-WORKING)))
   (define unsub (bus-subscribe! bus (make-renderer emit statusf)))
+  (define sess-box (box sess))                  ; /resume 可切换会话
   (parameterize ([current-console con])
     (console-start! con)
     (when banner?
       (say (bold "pi++ — Racket LLM agent"))
       (say (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
     ) ; end when
+    (when resumed? (render-resume-preview emit st0))   ; 恢复启动：预览最近几条
     ;; reader 线程：持续读键、即时回显、提交行投递到 submit 通道
     (define reader
       (thread (lambda ()
@@ -207,11 +212,12 @@
          (define line (async-channel-get (console-submit-channel con)))
          (console-set-idle! con #f)
          (cond
-           [(eof-object? line) (unsub) (session-close! sess)]
+           [(eof-object? line) (unsub) (session-close! (unbox sess-box))]
            [(string=? (string-trim line) "") (loop st)]
            [(string-prefix? (string-trim line) "/")
-            (define-values (st* continue?) (handle-command (string-trim line) st d sess say))
-            (if continue? (loop st*) (begin (unsub) (session-close! sess)))
+            (define-values (st* continue?)
+              (handle-command (string-trim line) st d sess-box say emit data-dir))
+            (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
            ] ; end command case
            [else
             (define user-msg (text-msg 'user line))
@@ -235,7 +241,7 @@
             ) ; end define st*
             (statusf #f)                        ; 收尾：确保停动画
             (bus-drain! bus)
-            (persist-turn! sess st st*)
+            (persist-turn! (unbox sess-box) st st*)
             (loop st*)
            ] ; end else
          ) ; end cond
@@ -251,22 +257,25 @@
 
 ;; -------- 非交互：纯 read-line（管道友好）
 
-(define (run-repl/plain! d st0 sess bus banner?)
+(define (run-repl/plain! d st0 sess bus banner? data-dir resumed?)
   (define emit (lambda (s) (display s) (flush-output)))
   (define (say s) (emit (string-append s "\n")))
   (define unsub (bus-subscribe! bus (make-renderer emit)))
+  (define sess-box (box sess))
   (when banner?
     (say (bold "pi++ — Racket LLM agent"))
     (say (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
   ) ; end when
+  (when resumed? (render-resume-preview emit st0))
   (let loop ([st st0])
     (define line (read-input/plain))
     (cond
-      [(eof-object? line) (unsub) (session-close! sess)]
+      [(eof-object? line) (unsub) (session-close! (unbox sess-box))]
       [(string=? (string-trim line) "") (loop st)]
       [(string-prefix? (string-trim line) "/")
-       (define-values (st* continue?) (handle-command (string-trim line) st d sess say))
-       (if continue? (loop st*) (begin (unsub) (session-close! sess)))
+       (define-values (st* continue?)
+         (handle-command (string-trim line) st d sess-box say emit data-dir))
+       (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
       ] ; end command case
       [else
        (define user-msg (text-msg 'user line))
@@ -278,12 +287,54 @@
          ) ; end with-handlers
        ) ; end define st*
        (bus-drain! bus)
-       (persist-turn! sess st st*)
+       (persist-turn! (unbox sess-box) st st*)
        (loop st*)
       ] ; end else
     ) ; end cond
   ) ; end let loop
 ) ; end define run-repl/plain!
+
+;; ---------------------------------------------------------------- 恢复预览
+
+;; 恢复会话时把最近几条对话渲染进终端（design 选择：last few exchanges）。
+(define RESUME-PREVIEW-N 3)
+(define PREVIEW-CAP 280)                          ; 单条预览最大字符
+
+(define (clip-text s)
+  (define t (string-normalize-spaces s))
+  (if (> (string-length t) PREVIEW-CAP) (string-append (substring t 0 PREVIEW-CAP) "…") t)
+) ; end define clip-text
+
+(define (format-msg-preview m)
+  (define role (message-role m))
+  (define txt (message-text m))
+  (define tools (message-tool-uses m))
+  (string-append
+   (cond
+     [(and (eq? role 'user) (> (string-length (string-trim txt)) 0))
+      (green f"› {(clip-text txt)}\n")]
+     [(and (eq? role 'assistant) (> (string-length (string-trim txt)) 0))
+      f"{(sanitize-untrusted (clip-text txt))}\n"]
+     [else ""])
+   (apply string-append
+          (for/list ([t (in-list tools)])
+            (string-append (cyan "⏺") " " (bold (tool-use-block-name t)) "\n")))
+  ) ; end string-append
+) ; end define format-msg-preview
+
+;; 渲染 st 历史的末尾几条（+ 省略与分隔提示）
+(define (render-resume-preview emit st)
+  (define hist (state-history-list st))
+  (define total (length hist))
+  (when (> total 0)
+    (define tail (if (> total RESUME-PREVIEW-N) (take-right hist RESUME-PREVIEW-N) hist))
+    (define omitted (- total (length tail)))
+    (emit (dim f"\n── resumed · {total} messages ──\n"))
+    (when (> omitted 0) (emit (dim f"…({omitted} earlier)\n")))
+    (for ([m (in-list tail)]) (emit (format-msg-preview m)))
+    (emit (dim "────────────\n"))
+  ) ; end when
+) ; end define render-resume-preview
 
 ;; 持久化 st→st* 之间新增的历史消息与 usage 增量（tool-result 亦完整落盘，保 resume 配对）
 (define (persist-turn! sess st-before st-after)
@@ -321,9 +372,9 @@
 
 ;; ---------------------------------------------------------------- 斜杠命令
 
-;; handle-command : cmd st d sess say -> (values new-state continue?)
-;; say : (string -> void) 输出一行（经控制台/stdout 汇聚）
-(define (handle-command cmd st d sess say)
+;; handle-command : cmd st d sess-box say emit data-dir -> (values new-state continue?)
+;; sess-box: box of 当前 session（/resume 可切换）；emit: 原样输出（预览用）
+(define (handle-command cmd st d sess-box say emit data-dir)
   (define parts (string-split cmd))
   (define name (car parts))
   (define args (cdr parts))
@@ -382,6 +433,37 @@
        ] ; end else
      ) ; end cond
     ] ; end tail case
+    [("/resume")
+     ;; 内嵌选择器切换会话：关闭当前、重放所选、按当前 config 续写，并预览。
+     (define con (current-console))
+     (cond
+       [(not con) (say (dim "/resume 仅在交互式 TUI 可用")) (values st #t)]
+       [else
+        (define cur (let ([p (session-path (unbox sess-box))]) (if (path? p) (path->string p) p)))
+        (define others (filter (lambda (i) (not (equal? (session-info-path i) cur)))
+                               (session-infos data-dir)))
+        (cond
+          [(null? others) (say (dim "no other sessions to resume")) (values st #t)]
+          [else
+           (define idx (console-pick! con others
+                                      #:title "Resume a session (Esc = cancel)"
+                                      #:render-item session-info->line))
+           (cond
+             [(not idx) (values st #t)]           ; 取消
+             [else
+              (define path (session-info-path (list-ref others idx)))
+              (session-close! (unbox sess-box))
+              (define st* (session-replay path #:config (agent-state-config st)))
+              (set-box! sess-box (session-open! (string->path path) (agent-state-config st*)))
+              (render-resume-preview emit st*)
+              (values st* #t)
+             ] ; end chosen
+           ) ; end cond
+          ] ; end else
+        ) ; end cond
+       ] ; end else
+     ) ; end cond
+    ] ; end resume case
     [("/model")
      (cond
        [(null? args) (say (red "usage: /model <id>")) (values st #t)]

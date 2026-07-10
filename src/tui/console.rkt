@@ -114,6 +114,7 @@
    spin       ; box of exact — 转轮帧索引
    animator   ; box of (or/c #f thread)
    picker     ; box of (or/c #f pmode) — /resume 内嵌选择器模式
+   complete   ; (string -> (or/c #f string)) — Tab 补全（返回补全后的整行或 #f）
   ) ; end fields
 ) ; end struct console
 
@@ -125,13 +126,14 @@
                       #:history [history '()]
                       #:interrupt [interrupt void]
                       #:hint [hint (lambda (_t) '())]
+                      #:complete [complete (lambda (_t) #f)]
                       #:cache-lines [cache-lines DEFAULT-CACHE-LINES])
   (console term (make-semaphore 1)
            (box (make-ledit #:history history))
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f) (box #f))
+           (box #f) (box 0) (box #f) (box #f) complete)
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -314,10 +316,14 @@
   (and (eq? (kev-kind k) 'named)
        (memq (kev-name k) '(scroll-up scroll-down pgup pgdn))))
 
+(define (tab-key? k)
+  (and (eq? (kev-kind k) 'named) (eq? (kev-name k) 'tab) (not (kev-shift? k))))
+
 (define (console-handle-key! con k)
   (cond
     [(unbox (console-picker con)) (handle-picker-key! con k) 'continue]
     [(scroll-key? k) (do-scroll! con k) 'continue]
+    [(tab-key? k) (do-complete! con) 'continue]
     [else
      (define st0 (unbox (console-ledit con)))
      (define-values (st* action) (ledit-apply st0 k))
@@ -349,6 +355,19 @@
     ] ; end done
   ) ; end cond
 ) ; end define handle-picker-key!
+
+;; Tab 补全：把当前输入交给 complete 回调，返回新行则替换（光标落末尾）。
+(define (do-complete! con)
+  (define cur (ledit-text (unbox (console-ledit con))))
+  (define done ((console-complete con) cur))
+  (when (and (string? done) (not (string=? done cur)))
+    (call-with-semaphore (console-lock con)
+      (lambda ()
+        (set-box! (console-ledit con)
+                  (make-ledit #:history (unbox (console-history con)) #:text done))
+        (redraw! con)))
+  ) ; end when
+) ; end define do-complete!
 
 (define (do-scroll! con k)
   (call-with-semaphore (console-lock con)

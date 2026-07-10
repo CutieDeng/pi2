@@ -47,6 +47,42 @@
    ) ; end list
 ) ; end define COMMANDS
 
+;; 两串的最长公共前缀
+(define (common-prefix a b)
+  (define n (min (string-length a) (string-length b)))
+  (let loop ([i 0])
+    (if (and (< i n) (char=? (string-ref a i) (string-ref b i))) (loop (add1 i)) (substring a 0 i)))
+) ; end define common-prefix
+
+(define (longest-common-prefix strs)
+  (if (null? strs) "" (for/fold ([p (car strs)]) ([s (in-list (cdr strs))]) (common-prefix p s)))
+) ; end define longest-common-prefix
+
+;; Tab 补全：输入处于「/命令名」编辑中时，唯一匹配补全为「/name 」，多匹配补到最长公共前缀。
+;; 已进入参数区（命令名后有空格）或非 '/' 起头 → 返回 #f（不补全）。
+(define (command-complete text)
+  (cond
+    [(and (positive? (string-length text)) (char=? (string-ref text 0) #\/))
+     (define parts (string-split text))
+     (define tok (if (null? parts) "/" (car parts)))
+     (cond
+       [(> (string-length text) (string-length tok)) #f]   ; 命令名后已有空格/参数
+       [else
+        (define matches (filter (lambda (c) (string-prefix? (car c) tok)) COMMANDS))
+        (cond
+          [(null? matches) #f]
+          [(= (length matches) 1)
+           (define name (caar matches))
+           (if (string=? tok name) #f (string-append name " "))]
+          [else
+           (define lcp (longest-common-prefix (map car matches)))
+           (if (> (string-length lcp) (string-length tok)) lcp #f)])]
+     ) ; end cond
+    ] ; end slash
+    [else #f]
+  ) ; end cond
+) ; end define command-complete
+
 ;; 当前输入若以 '/' 起头，返回匹配命令的暗色预览行（供 console 实时渲染）。
 (define (command-hint-lines text)
   (cond
@@ -179,7 +215,8 @@
   (define con
     (make-console term #:prompt (green "› ")
                   #:interrupt (lambda () (break-thread main-th))  ; Ctrl-C → 取消当前轮
-                  #:hint command-hint-lines)                      ; '/' 元命令实时预览
+                  #:hint command-hint-lines                       ; '/' 元命令实时预览
+                  #:complete command-complete)                    ; Tab 补全 '/' 命令
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
@@ -490,4 +527,6 @@
  interactive-asker
  current-console
  persist-turn!
+ command-complete
+ command-hint-lines
 ) ; end provide

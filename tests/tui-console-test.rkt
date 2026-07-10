@@ -172,6 +172,25 @@
   (check-true (string-contains? (last-frame st) "─"))    ; 分隔线
 ) ; end test-case
 
+(test-case "Tab applies the completion callback to the input line"
+  (define comp (lambda (t) (if (string=? t "/mo") "/model " #f)))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:complete comp))
+  (feed! con "/mo")
+  (feed! con #"\t")                        ; Tab
+  (feed! con "\r")                         ; submit
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "/model ")
+) ; end test-case
+
+(test-case "Tab is a no-op when completion returns #f"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:complete (lambda (_t) #f)))
+  (feed! con "abc")
+  (feed! con #"\t")
+  (feed! con "\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "abc")
+) ; end test-case
+
 (test-case "typing a slash renders the command hint preview"
   (define hint (lambda (t) (if (and (> (string-length t) 0) (char=? (string-ref t 0) #\/))
                                (list "  /model <id>  switch model") '())))

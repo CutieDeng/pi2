@@ -228,7 +228,7 @@
     [(up) (history-nav st 'prev)]
     [(down) (history-nav st 'next)]
     [(escape) (values st 'ignore)]
-    [(tab) (values st 'ignore)]              ; 补全留待后续
+    [(tab) (values st 'ignore)]              ; Tab 由 console 截获做 '/' 命令补全
     [else (values st 'ignore)]
   ) ; end case
 ) ; end define apply-named

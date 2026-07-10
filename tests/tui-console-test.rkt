@@ -243,4 +243,37 @@
   (check-false (string-contains? (last-frame st) "thinking…"))
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 贴底内联小选框
+
+(test-case "console-choose! returns the selected index"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (define reader
+    (thread (lambda () (sync (system-idle-evt))
+                       (feed! con (bytes-append #"\e[B" #"\r")))))  ; ↓ 到第 2 项, Enter
+  (check-equal? (console-choose! con "Approve?" '("Yes" "No")) 1)
+) ; end test-case
+
+(test-case "inline choose renders options AND keeps conversation visible above"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "hello world\n")
+  (define reader
+    (thread (lambda () (sync (system-idle-evt)) (feed! con #"\e"))))  ; Esc 取消
+  (check-false (console-choose! con "Approve tool `bash`?" '("Yes" "No — deny")))
+  (define out (scripted-output st))
+  (check-true (string-contains? out "Approve tool"))    ; 标题
+  (check-true (string-contains? out "No — deny"))        ; 选项
+  (check-true (string-contains? out "hello world"))      ; 对话内容仍在（未被全屏遮挡）
+) ; end test-case
+
+(test-case "inline choose highlights the current option (reverse video)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (define reader (thread (lambda () (sync (system-idle-evt)) (feed! con #"\e"))))
+  (console-choose! con "pick" '("aaa" "bbb"))
+  ;; 选中项以反显 \e[7m 渲染，且带 › 标记
+  (check-true (string-contains? (scripted-output st) "\e[7m› aaa"))
+) ; end test-case
+
 (displayln "tui-console-test: all passed")

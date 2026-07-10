@@ -194,9 +194,7 @@
     ("No — and tell the agent why"   . reason)))
 
 (define (interactive-approve con prompt)
-  (define idx (console-pick! con (map car APPROVE-OPTIONS)
-                             #:title (sanitize-untrusted prompt)
-                             #:render-item (lambda (x) x)))
+  (define idx (console-choose! con (sanitize-untrusted prompt) (map car APPROVE-OPTIONS)))
   (cond
     [(not idx) 'no]                              ; Esc = 拒绝
     [else

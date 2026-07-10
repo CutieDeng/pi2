@@ -113,13 +113,17 @@
    status     ; box of (or/c #f string) — 工作动画标签
    spin       ; box of exact — 转轮帧索引
    animator   ; box of (or/c #f thread)
-   picker     ; box of (or/c #f pmode) — /resume 内嵌选择器模式
+   picker     ; box of (or/c #f pmode) — /resume 全屏选择器模式
    complete   ; (string -> (or/c #f string)) — Tab 补全（返回补全后的整行或 #f）
+   choose     ; box of (or/c #f cmode) — 贴底内联小选框模式
   ) ; end fields
 ) ; end struct console
 
-;; 选择器模式态（内嵌于 console，键由 reader 线程喂给 pick-step）
+;; 全屏选择器模式态（内嵌于 console，键由 reader 线程喂给 pick-step）
 (struct pmode (state items render-item title ch) #:mutable)
+
+;; 贴底内联小选框模式态：title + 选项在底部框区渲染，上方对话仍可见
+(struct cmode (title options [state #:mutable] ch))
 
 (define (make-console term
                       #:prompt [prompt "> "]
@@ -133,7 +137,7 @@
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f) (box #f) complete)
+           (box #f) (box 0) (box #f) (box #f) complete (box #f))
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -210,14 +214,18 @@
         (loop (cdr ls) (add1 row) (- rem L 1))))
 ) ; end define input-cursor-rc
 
-;; 整屏帧字符串（末尾绝对定位光标到输入框）
-(define (render-frame con)
+;; 裁剪到 w 显示列（CJK 双宽计入）
+(define (clip-str s w)
+  (let loop ([i 0] [cw 0])
+    (cond
+      [(>= i (string-length s)) s]
+      [(> (+ cw (char-width (string-ref s i))) w) (substring s 0 i)]
+      [else (loop (add1 i) (+ cw (char-width (string-ref s i))))]))
+) ; end define clip-str
+
+;; 内容视口：给定内容区高度 Ch，返回恰 Ch 行（顶部按需补空）。
+(define (compute-content con Ch)
   (define W (unbox (console-cols con)))
-  (define H (unbox (console-termrows con)))
-  (define hints (box-hints con))
-  (define status (unbox (console-status con)))
-  (define Ch (content-height con hints))
-  ;; 内容视口
   (define vis
     (append-map (lambda (l) (wrap-visual l W))
                 (tail-logical con (+ Ch (unbox (console-view con)) 2))))
@@ -228,26 +236,58 @@
   (set-box! (console-view con) v)
   (define endi (- m v))
   (define starti (max 0 (- endi Ch)))
-  (define window (take (drop vis starti) (- endi starti)))
-  (define content (fit-rows window Ch))
-  ;; 底部框
+  (fit-rows (take (drop vis starti) (- endi starti)) Ch)
+) ; end define compute-content
+
+;; 把内容行 + 底部框行组装成整屏 body（\e[H + 每行 \e[K + \r\n 拼接 + \e[J）
+(define (assemble-body content box-lines)
+  (string-append
+   "\e[H"
+   (string-join (for/list ([r (in-list (append content box-lines))]) (string-append "\e[K" r)) "\r\n")
+   "\e[J")
+) ; end define assemble-body
+
+;; 整屏帧字符串。choose 模式渲染贴底内联小选框，否则常规输入框。
+(define (render-frame con)
+  (define W (unbox (console-cols con)))
+  (define H (unbox (console-termrows con)))
+  (if (unbox (console-choose con))
+      (render-choose-frame con W H (unbox (console-choose con)))
+      (render-input-frame con W H))
+) ; end define render-frame
+
+(define (render-input-frame con W H)
+  (define hints (box-hints con))
+  (define status (unbox (console-status con)))
+  (define Ch (content-height con hints))
+  (define content (compute-content con Ch))
   (define box-lines
     (append
      (if status (list (dim-status con status)) '())
      (list (separator-line con))
      hints
      (input-display-lines con)))
-  (define all-rows (append content box-lines))
-  (define body
-    (string-append
-     "\e[H"
-     (string-join (for/list ([r (in-list all-rows)]) (string-append "\e[K" r)) "\r\n")
-     "\e[J"))
-  ;; 光标绝对位置
   (define-values (crow ccol) (input-cursor-rc con))
   (define input-row0 (+ Ch (if status 1 0) 1 (length hints) 1))  ; 输入首行(1 基)
-  (string-append body f"\e[{(+ input-row0 crow)};{ccol}H")
-) ; end define render-frame
+  (string-append (assemble-body content box-lines) f"\e[{(+ input-row0 crow)};{ccol}H")
+) ; end define render-input-frame
+
+;; 贴底内联小选框：底部 = [标题] + [选项…]，内容区（对话）仍占其上方并可见。
+(define (render-choose-frame con W H cm)
+  (define opts (cmode-options cm))
+  (define idx (pick-state-idx (cmode-state cm)))
+  (define box-lines
+    (cons f"\e[1m{(clip-str (cmode-title cm) W)}\e[0m"
+          (for/list ([o (in-list opts)] [i (in-naturals)])
+            (define t (clip-str o (max 1 (- W 2))))
+            (if (= i idx) f"\e[7m› {t}\e[0m" f"  {t}"))))
+  (define bh (length box-lines))
+  (define Ch (max 1 (- H bh)))
+  (define content (compute-content con Ch))
+  ;; 光标落在选中项行首（高亮已指示选择；此处仅作视觉锚点）
+  (define cur-row (+ Ch 2 idx))                   ; 内容 Ch 行 + 标题 1 行 + (idx+1)
+  (string-append (assemble-body content box-lines) f"\e[{cur-row};1H")
+) ; end define render-choose-frame
 
 (define (dim s) f"\e[2m{s}\e[0m")
 (define (dim-status con label)
@@ -321,6 +361,7 @@
 
 (define (console-handle-key! con k)
   (cond
+    [(unbox (console-choose con)) (handle-choose-key! con k) 'continue]
     [(unbox (console-picker con)) (handle-picker-key! con k) 'continue]
     [(scroll-key? k) (do-scroll! con k) 'continue]
     [(tab-key? k) (do-complete! con) 'continue]
@@ -368,6 +409,21 @@
         (redraw! con)))
   ) ; end when
 ) ; end define do-complete!
+
+;; 内联小选框按键：复用 pick-step 导航；选定/取消清模式并投递结果到通道。
+(define (handle-choose-key! con k)
+  (define cm (unbox (console-choose con)))
+  (define-values (st* r) (pick-step (cmode-state cm) k))
+  (cond
+    [(eq? r 'continue)
+     (call-with-semaphore (console-lock con)
+       (lambda () (set-cmode-state! cm st*) (redraw! con)))]
+    [else
+     (define result (if (and (pair? r) (eq? (car r) 'chosen)) (cadr r) #f))
+     (call-with-semaphore (console-lock con) (lambda () (set-box! (console-choose con) #f)))
+     (channel-put (cmode-ch cm) result)]        ; console-choose! 取回后重绘常规界面
+  ) ; end cond
+) ; end define handle-choose-key!
 
 (define (do-scroll! con k)
   (call-with-semaphore (console-lock con)
@@ -496,6 +552,24 @@
   ) ; end cond
 ) ; end define console-pick!
 
+;; console-choose! : 运行中弹出**贴底内联小选框**（对话仍可见），返回选中下标或 #f（取消）。
+;; 供权限审批等轻量选择用；键由 reader 线程喂给 handle-choose-key!。
+(define (console-choose! con title options)
+  (cond
+    [(null? options) #f]
+    [else
+     (define ch (make-channel))
+     (call-with-semaphore (console-lock con)
+       (lambda ()
+         (set-box! (console-choose con) (cmode title options (pick-init (length options)) ch))
+         (redraw! con)))
+     (define res (channel-get ch))
+     (call-with-semaphore (console-lock con)
+       (lambda () (set-box! (console-choose con) #f) (redraw! con)))
+     res]
+  ) ; end cond
+) ; end define console-choose!
+
 ;; ------------------------------------------------------------ animator（工作动画线程）
 
 ;; 每 ~1s 重查终端尺寸；变化则更新并重绘（处理窗口 resize，无 SIGWINCH 依赖）。
@@ -564,6 +638,7 @@
  console-set-status!
  console-ask!
  console-pick!
+ console-choose!
  console-start!
  console-stop!
 ) ; end provide

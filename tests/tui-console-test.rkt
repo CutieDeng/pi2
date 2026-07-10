@@ -276,4 +276,35 @@
   (check-true (string-contains? (scripted-output st) "\e[7m› aaa"))
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 工作进度动画
+
+(test-case "working: sweep style animates the separator (basic tty, bold heavy line)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:progress-style 'sweep))
+  (console-set-working! con #t)
+  (define f (last-frame st))
+  (check-true (string-contains? f "━"))          ; 扫光粗线
+  (check-true (string-contains? f "\e[1m"))       ; bold
+  (check-false (string-contains? f "█"))          ; sweep 不用块字符/颜色
+) ; end test-case
+
+(test-case "working: bar style animates a 256-color block progress bar (capable tty)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:progress-style 'bar))
+  (console-set-working! con #t)
+  (define f (last-frame st))
+  (check-true (string-contains? f "█"))           ; 块
+  (check-true (string-contains? f "\e[38;5;"))    ; 256 色
+) ; end test-case
+
+(test-case "separator reverts to a static dim line when work ends"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:progress-style 'sweep))
+  (console-set-working! con #t)
+  (console-set-working! con #f)
+  (define f (last-frame st))
+  (check-false (string-contains? f "━"))          ; 不再扫光
+  (check-true (string-contains? f "─"))           ; 静态暗线
+) ; end test-case
+
 (displayln "tui-console-test: all passed")

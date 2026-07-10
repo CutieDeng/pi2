@@ -116,8 +116,25 @@
    picker     ; box of (or/c #f pmode) — /resume 全屏选择器模式
    complete   ; (string -> (or/c #f string)) — Tab 补全（返回补全后的整行或 #f）
    choose     ; box of (or/c #f cmode) — 贴底内联小选框模式
+   working    ; box of boolean — 整轮工作中（驱动底边隔离条进度动画）
+   progress-style ; 'bar | 'sweep — 进度动画形式（依 tty 能力选择）
   ) ; end fields
 ) ; end struct console
+
+;; 依终端能力选进度动画形式：truecolor/256 色 → 富进度条 'bar；否则 → 隔离条扫光 'sweep。
+;; 环境变量 PI_PROGRESS=bar|sweep 可强制。
+(define (detect-progress-style)
+  (define forced (getenv "PI_PROGRESS"))
+  (define ct (getenv "COLORTERM"))
+  (define term (getenv "TERM"))
+  (cond
+    [(equal? forced "bar") 'bar]
+    [(equal? forced "sweep") 'sweep]
+    [(and ct (regexp-match? #rx"truecolor|24bit" ct)) 'bar]
+    [(and term (regexp-match? #rx"256color" term)) 'bar]
+    [else 'sweep]
+  ) ; end cond
+) ; end define detect-progress-style
 
 ;; 全屏选择器模式态（内嵌于 console，键由 reader 线程喂给 pick-step）
 (struct pmode (state items render-item title ch) #:mutable)
@@ -131,13 +148,14 @@
                       #:interrupt [interrupt void]
                       #:hint [hint (lambda (_t) '())]
                       #:complete [complete (lambda (_t) #f)]
+                      #:progress-style [progress-style (detect-progress-style)]
                       #:cache-lines [cache-lines DEFAULT-CACHE-LINES])
   (console term (make-semaphore 1)
            (box (make-ledit #:history history))
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f) (box #f) complete (box #f))
+           (box #f) (box 0) (box #f) (box #f) complete (box #f) (box #f) progress-style)
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -171,10 +189,44 @@
 
 ;; ------------------------------------------------------------ 绘制原语
 
+;; 底边隔离条：空闲时静态暗线；工作中按 tty 能力播放进度动画。
 (define (separator-line con)
-  (define bar (make-string (max 1 (unbox (console-cols con))) (integer->char #x2500)))
-  f"\e[2m{bar}\e[0m"
+  (define W (max 1 (unbox (console-cols con))))
+  (cond
+    [(not (unbox (console-working con))) f"\e[2m{(make-string W (integer->char #x2500))}\e[0m"]
+    [(eq? (console-progress-style con) 'bar) (progress-bar-line W (unbox (console-spin con)))]
+    [else (progress-sweep-line W (unbox (console-spin con)))]
+  ) ; end cond
 ) ; end define separator-line
+
+;; 富进度条（256 色）：一段青色渐变块在暗线上左右横扫（不定进度）。
+(define BAR-GRAD #(23 30 37 44 51 44 37 30 23))
+(define (progress-bar-line W phase)
+  (define seg (min W (max 6 (quotient W 6))))
+  (define span (max 1 (- W seg)))
+  (define t (modulo phase (* 2 span)))
+  (define pos (if (< t span) t (- (* 2 span) t)))   ; 0..span 乒乓
+  (string-append
+   (apply string-append
+          (for/list ([i (in-range W)])
+            (define d (- i pos))
+            (if (and (>= d 0) (< d seg))
+                f"\e[38;5;{(vector-ref BAR-GRAD (modulo d (vector-length BAR-GRAD)))}m█"
+                "\e[38;5;236m─")))
+   "\e[0m")
+) ; end define progress-bar-line
+
+;; 隔离条扫光（基础 ANSI，无色）：一段粗亮线在暗细线上右移扫过（含间隙循环）。
+(define (progress-sweep-line W phase)
+  (define TAIL 12)
+  (define head (modulo phase (+ W TAIL)))
+  (string-append
+   (apply string-append
+          (for/list ([i (in-range W)])
+            (define d (- head i))
+            (if (and (>= d 0) (< d TAIL)) "\e[1m━" "\e[2m─")))
+   "\e[0m")
+) ; end define progress-sweep-line
 
 ;; 尾部若干逻辑行（含 pending 作为最后一行）
 (define (tail-logical con k)
@@ -291,7 +343,8 @@
 
 (define (dim s) f"\e[2m{s}\e[0m")
 (define (dim-status con label)
-  (dim (string-append (vector-ref SPINNER (unbox (console-spin con))) " " label))
+  (define frame (vector-ref SPINNER (modulo (unbox (console-spin con)) (vector-length SPINNER))))
+  (dim (string-append frame " " label))
 ) ; end define dim-status
 
 ;; 单次原子写入：藏光标→写整帧→（帧末已定位）复现光标。
@@ -507,6 +560,15 @@
 (define (console-set-idle! con v) (set-box! (console-idle con) v))
 
 ;; 工作动画：v = 标签串（显示转轮）或 #f（清除）。仅在变化时重绘。
+;; 整轮工作态：true 时底边隔离条播放进度动画。仅变化时重绘。
+(define (console-set-working! con on?)
+  (call-with-semaphore (console-lock con)
+    (lambda ()
+      (unless (eq? (unbox (console-working con)) (and on? #t))
+        (set-box! (console-working con) (and on? #t))
+        (redraw! con))))
+) ; end define console-set-working!
+
 (define (console-set-status! con v)
   (call-with-semaphore (console-lock con)
     (lambda ()
@@ -591,11 +653,14 @@
      (lambda ()
        (let loop ([tick 0])
          (sleep 0.12)
-         (when (unbox (console-status con))
+         ;; 工作中（整轮）或等待首 token（status）时推进动画帧并重绘；
+         ;; 选框/选择器交互期不打扰。
+         (when (and (or (unbox (console-working con)) (unbox (console-status con)))
+                    (not (unbox (console-choose con)))
+                    (not (unbox (console-picker con))))
            (call-with-semaphore (console-lock con)
              (lambda ()
-               (set-box! (console-spin con)
-                         (modulo (add1 (unbox (console-spin con))) (vector-length SPINNER)))
+               (set-box! (console-spin con) (modulo (add1 (unbox (console-spin con))) 100000))
                (redraw! con))))
          (when (>= tick 8) (poll-resize! con))     ; ~每秒查一次尺寸
          (loop (if (>= tick 8) 0 (add1 tick))))))
@@ -636,6 +701,7 @@
  console-handle-key!
  console-set-idle!
  console-set-status!
+ console-set-working!
  console-ask!
  console-pick!
  console-choose!

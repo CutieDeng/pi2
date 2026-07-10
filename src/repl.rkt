@@ -281,7 +281,8 @@
            ] ; end command case
            [else
             (define user-msg (text-msg 'user line))
-            (statusf #t)                        ; 首 token 前即显示工作动画
+            (console-set-working! con #t)       ; 整轮：底边隔离条进度动画
+            (statusf #t)                        ; 首 token 前：转轮标签
             (define st*
               (with-handlers ([exn:break?
                                (lambda (_e)
@@ -300,6 +301,7 @@
               ) ; end with-handlers
             ) ; end define st*
             (statusf #f)                        ; 收尾：确保停动画
+            (console-set-working! con #f)       ; 停底边进度动画
             (bus-drain! bus)
             (persist-turn! (unbox sess-box) st st*)
             (loop st*)

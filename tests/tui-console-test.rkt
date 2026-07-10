@@ -307,4 +307,31 @@
   (check-true (string-contains? f "─"))           ; 静态暗线
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 速率档 / OSC 进度条
+
+(test-case "token/s maps to 4 animation-speed tiers"
+  (check-equal? (rate->step 0) 1)
+  (check-equal? (rate->step 5) 1)
+  (check-equal? (rate->step 20) 2)
+  (check-equal? (rate->step 45) 3)
+  (check-equal? (rate->step 120) 4)
+) ; end test-case
+
+(test-case "OSC 9;4 progress emitted around working when enabled"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:osc? #t))
+  (console-set-working! con #t)
+  (check-true (string-contains? (scripted-output st) "\e]9;4;3"))   ; indeterminate
+  (console-set-working! con #f)
+  (check-true (string-contains? (scripted-output st) "\e]9;4;0"))   ; clear
+) ; end test-case
+
+(test-case "OSC 9;4 suppressed when disabled"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term #:osc? #f))
+  (console-set-working! con #t)
+  (console-set-working! con #f)
+  (check-false (string-contains? (scripted-output st) "\e]9;4"))
+) ; end test-case
+
 (displayln "tui-console-test: all passed")

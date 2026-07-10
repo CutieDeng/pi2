@@ -102,15 +102,17 @@
 ;; 工作动画标签（首 token 前 / 每次等待模型输出时显示的转轮标签）
 (define STATUS-WORKING "thinking…")
 
-;; make-renderer : emit status! -> (event -> void)
+;; make-renderer : emit status! tick! -> (event -> void)
 ;; emit    : (string -> void)  文本汇聚到控制台/stdout
 ;; status! : (boolean -> void) #t=显示工作动画，#f=清除（console 输出到达时亦自动清除）
+;; tick!   : (exact -> void)   上报本段输出字符数（供 token/s 速率估计）
 ;; 不直接触碰终端，故与 console 的写锁协调一致，也可离线测试。
-(define (make-renderer emit [status! void])
+(define (make-renderer emit [status! void] [tick! void])
   (define in-thinking (box #f))
   (lambda (e)
     (cond
       [(evt:delta? e)
+       (tick! (string-length (evt:delta-text e)))   ; 计入速率估计
        (case (evt:delta-kind e)
          [(thinking)
           (unless (unbox in-thinking)
@@ -244,7 +246,8 @@
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
   (define (statusf on?) (console-set-status! con (and on? STATUS-WORKING)))
-  (define unsub (bus-subscribe! bus (make-renderer emit statusf)))
+  (define (tickf n) (console-tick-tokens! con n))
+  (define unsub (bus-subscribe! bus (make-renderer emit statusf tickf)))
   (define sess-box (box sess))                  ; /resume 可切换会话
   (parameterize ([current-console con])
     (console-start! con)

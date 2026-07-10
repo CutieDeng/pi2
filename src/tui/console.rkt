@@ -118,8 +118,24 @@
    choose     ; box of (or/c #f cmode) — 贴底内联小选框模式
    working    ; box of boolean — 整轮工作中（驱动底边隔离条进度动画）
    progress-style ; 'bar | 'sweep — 进度动画形式（依 tty 能力选择）
+   rate       ; box of real — 估计 token/s（EMA），驱动 4 档动画速率
+   rate-acc   ; box of exact — 上次采样以来累计的输出字符数
+   rate-t     ; box of real — 上次采样时刻（ms）
+   osc?       ; boolean — 是否发 OSC 9;4 终端原生进度条
   ) ; end fields
 ) ; end struct console
+
+;; OSC 9;4 支持较好的终端自动开启；PI_OSC_PROGRESS=on|off 强制。
+(define (detect-osc-progress)
+  (define e (getenv "PI_OSC_PROGRESS"))
+  (cond
+    [(member e '("on" "1")) #t]
+    [(member e '("off" "0")) #f]
+    [else
+     (define tp (or (getenv "TERM_PROGRAM") ""))
+     (and (or (getenv "WT_SESSION") (regexp-match? #rx"(?i:ghostty|WezTerm)" tp)) #t)]
+  ) ; end cond
+) ; end define detect-osc-progress
 
 ;; 依终端能力选进度动画形式：truecolor/256 色 → 富进度条 'bar；否则 → 隔离条扫光 'sweep。
 ;; 环境变量 PI_PROGRESS=bar|sweep 可强制。
@@ -149,13 +165,15 @@
                       #:hint [hint (lambda (_t) '())]
                       #:complete [complete (lambda (_t) #f)]
                       #:progress-style [progress-style (detect-progress-style)]
+                      #:osc? [osc? (detect-osc-progress)]
                       #:cache-lines [cache-lines DEFAULT-CACHE-LINES])
   (console term (make-semaphore 1)
            (box (make-ledit #:history history))
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f) (box #f) complete (box #f) (box #f) progress-style)
+           (box #f) (box 0) (box #f) (box #f) complete (box #f) (box #f) progress-style
+           (box 0.0) (box 0) (box 0.0) osc?)
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -189,13 +207,26 @@
 
 ;; ------------------------------------------------------------ 绘制原语
 
-;; 底边隔离条：空闲时静态暗线；工作中按 tty 能力播放进度动画。
+;; 估计速率标签（右端显示 ~N tok/s，指征运算速率）
+(define (progress-label con)
+  (define r (inexact->exact (round (unbox (console-rate con)))))
+  (if (> r 0) f" {r} tok/s " "")
+) ; end define progress-label
+
+;; 底边隔离条：空闲时静态暗线；工作中按 tty 能力播放进度动画（右端附速率读数）。
 (define (separator-line con)
   (define W (max 1 (unbox (console-cols con))))
   (cond
     [(not (unbox (console-working con))) f"\e[2m{(make-string W (integer->char #x2500))}\e[0m"]
-    [(eq? (console-progress-style con) 'bar) (progress-bar-line W (unbox (console-spin con)))]
-    [else (progress-sweep-line W (unbox (console-spin con)))]
+    [else
+     (define lbl (progress-label con))
+     (define bw (max 1 (- W (string-length lbl))))
+     (define bar
+       (if (eq? (console-progress-style con) 'bar)
+           (progress-bar-line bw (unbox (console-spin con)))
+           (progress-sweep-line bw (unbox (console-spin con)))))
+     (string-append bar (if (> (string-length lbl) 0) f"\e[2m{lbl}\e[0m" ""))
+    ] ; end else
   ) ; end cond
 ) ; end define separator-line
 
@@ -560,12 +591,20 @@
 (define (console-set-idle! con v) (set-box! (console-idle con) v))
 
 ;; 工作动画：v = 标签串（显示转轮）或 #f（清除）。仅在变化时重绘。
-;; 整轮工作态：true 时底边隔离条播放进度动画。仅变化时重绘。
+;; OSC 9;4 终端原生进度条：state 3=不定进度，0=清除（BEL 收尾兼容性好）。
+(define (osc-progress con on?)
+  (when (console-osc? con)
+    (term-write (console-term con) (if on? "\e]9;4;3;0\a" "\e]9;4;0\a")))
+) ; end define osc-progress
+
+;; 整轮工作态：true 时底边隔离条播放进度动画 + OSC 原生进度条。仅变化时重绘。
 (define (console-set-working! con on?)
   (call-with-semaphore (console-lock con)
     (lambda ()
       (unless (eq? (unbox (console-working con)) (and on? #t))
         (set-box! (console-working con) (and on? #t))
+        (unless on? (reset-rate! con))               ; 轮末清速率
+        (osc-progress con on?)
         (redraw! con))))
 ) ; end define console-set-working!
 
@@ -647,6 +686,40 @@
         (redraw! con))))
 ) ; end define poll-resize!
 
+;; 输出速率估计：字符 → 粗略 token（÷2.5，混合中英）；EMA 平滑。
+(define CHARS-PER-TOK 2.5)
+(define (console-tick-tokens! con nchars)
+  (set-box! (console-rate-acc con) (+ (unbox (console-rate-acc con)) nchars))
+) ; end define console-tick-tokens!
+
+;; 由 animator 每帧采样：把累计字符数换算成 token/s 的 EMA。
+(define (sample-rate! con)
+  (define now (current-inexact-milliseconds))
+  (define t0 (unbox (console-rate-t con)))
+  (cond
+    [(<= t0 0.0) (set-box! (console-rate-t con) now)]  ; 首次：只记时刻
+    [else
+     (define dt (- now t0))
+     (when (>= dt 100.0)                                ; 至少 100ms 才采一次
+       (define chars (unbox (console-rate-acc con)))
+       (set-box! (console-rate-acc con) 0)
+       (set-box! (console-rate-t con) now)
+       (define inst (/ (/ chars CHARS-PER-TOK) (/ dt 1000.0)))   ; token/s 瞬时
+       (define ema (+ (* 0.4 inst) (* 0.6 (unbox (console-rate con)))))
+       (set-box! (console-rate con) ema))]
+  ) ; end cond
+) ; end define sample-rate!
+
+;; token/s → 4 档步长（越快扫得越快）
+(define (rate->step r)
+  (cond [(< r 10) 1] [(< r 30) 2] [(< r 60) 3] [else 4]))
+
+(define (reset-rate! con)
+  (set-box! (console-rate con) 0.0)
+  (set-box! (console-rate-acc con) 0)
+  (set-box! (console-rate-t con) 0.0)
+) ; end define reset-rate!
+
 (define (start-animator! con)
   (set-box! (console-animator con)
     (thread
@@ -654,13 +727,15 @@
        (let loop ([tick 0])
          (sleep 0.12)
          ;; 工作中（整轮）或等待首 token（status）时推进动画帧并重绘；
-         ;; 选框/选择器交互期不打扰。
+         ;; 选框/选择器交互期不打扰。步长依 token/s 速率分 4 档。
          (when (and (or (unbox (console-working con)) (unbox (console-status con)))
                     (not (unbox (console-choose con)))
                     (not (unbox (console-picker con))))
+           (sample-rate! con)
+           (define step (rate->step (unbox (console-rate con))))
            (call-with-semaphore (console-lock con)
              (lambda ()
-               (set-box! (console-spin con) (modulo (add1 (unbox (console-spin con))) 100000))
+               (set-box! (console-spin con) (modulo (+ (unbox (console-spin con)) step) 100000))
                (redraw! con))))
          (when (>= tick 8) (poll-resize! con))     ; ~每秒查一次尺寸
          (loop (if (>= tick 8) 0 (add1 tick))))))
@@ -682,6 +757,7 @@
 
 (define (console-stop! con)
   (when (unbox (console-animator con)) (kill-thread (unbox (console-animator con))))
+  (osc-progress con #f)                           ; 清 OSC 进度条（以防轮中退出）
   (call-with-semaphore (console-lock con)
     (lambda ()
       (term-write (console-term con)
@@ -702,6 +778,8 @@
  console-set-idle!
  console-set-status!
  console-set-working!
+ console-tick-tokens!
+ rate->step
  console-ask!
  console-pick!
  console-choose!

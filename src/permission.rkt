@@ -52,8 +52,9 @@
   ) ; end case mode
 ) ; end define matrix-decision
 
-;; 主入口：'allow | 'deny
-;; asker : (-> string (or/c 'yes 'no 'always)) — 阻塞式询问用户
+;; 主入口：返回 'allow | 'deny | (cons 'deny reason)
+;; asker : (-> string decision)，decision ∈ 'yes | 'always | 'no | (cons 'no reason-string)
+;;   —— 阻塞式询问用户。(cons 'no reason) 表示拒绝并附带给 agent 的理由。
 (define (permission-check policy t input asker)
   (define name (tool-name t))
   (define level (tool-permission-level t))
@@ -64,9 +65,9 @@
      (define answer
        (asker f"allow tool `{name}` ({level}) with input {input}?")
      ) ; end define answer
-     (case answer
-       [(yes) 'allow]
-       [(always)
+     (cond
+       [(eq? answer 'yes) 'allow]
+       [(eq? answer 'always)
         (hash-set! (permission-policy-always-set policy) name #t)
         (define sp (permission-policy-store-path policy))
         (when sp
@@ -76,8 +77,13 @@
         ) ; end when
         'allow
        ] ; end always case
-       [else 'deny]
-     ) ; end case
+       [else                                    ; 'no 或 (cons 'no reason)
+        (define reason (and (pair? answer) (cdr answer)))
+        (if (and (string? reason) (non-empty-string? (string-trim reason)))
+            (cons 'deny (string-trim reason))
+            'deny)
+       ] ; end deny case
+     ) ; end cond
     ] ; end else
   ) ; end cond
 ) ; end define permission-check

@@ -186,12 +186,37 @@
 ;; 供 main 装配进 deps；run-repl! 会在交互期 parameterize current-console。
 (define current-console (make-parameter #f))
 
+;; 交互式审批用选框（比 y/n/a 回显更清晰），末项支持填写拒绝理由回传给 agent。
+(define APPROVE-OPTIONS
+  '(("Yes — allow once"              . yes)
+    ("Yes — and don't ask again"     . always)
+    ("No — deny"                     . no)
+    ("No — and tell the agent why"   . reason)))
+
+(define (interactive-approve con prompt)
+  (define idx (console-pick! con (map car APPROVE-OPTIONS)
+                             #:title (sanitize-untrusted prompt)
+                             #:render-item (lambda (x) x)))
+  (cond
+    [(not idx) 'no]                              ; Esc = 拒绝
+    [else
+     (case (cdr (list-ref APPROVE-OPTIONS idx))
+       [(yes) 'yes]
+       [(always) 'always]
+       [(no) 'no]
+       [(reason)
+        (define r (console-ask! con (yellow "reason for the agent (Enter to skip): ")))
+        (if (and (string? r) (non-empty-string? (string-trim r)))
+            (cons 'no (string-trim r))
+            'no)]
+     ) ; end case
+    ] ; end else
+  ) ; end cond
+) ; end define interactive-approve
+
 (define (interactive-asker prompt)
   (define con (current-console))
-  (if con
-      (parse-answer (console-ask! con (yellow f"{prompt} [y/n/a(lways)] ")))
-      (tty-asker prompt)
-  ) ; end if
+  (if con (interactive-approve con prompt) (tty-asker prompt))
 ) ; end define interactive-asker
 
 ;; ---------------------------------------------------------------- 主循环

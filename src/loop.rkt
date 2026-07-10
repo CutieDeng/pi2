@@ -97,23 +97,33 @@
           (err-outcome f"tool `{name}` blocked by hook: {reason}")
         ) ; end lambda
     ] ; end hook-block case
-    [(eq? (permission-check (deps-policy d) t input (deps-asker d)) 'deny)
-     (err-outcome f"user denied permission for tool `{name}`")
-    ] ; end deny case
     [else
-     (with-handlers ([exn:fail?
-                      (lambda (e)
-                        (err-outcome f"tool `{name}` raised: {(exn-message e)}")
-                      ) ; end lambda
-                     ]) ; end handlers
-       (define cfg (current-loop-config))
-       (tool-run t input
-                 (tool-ctx (config-workdir cfg)
-                           (lambda (e) (bus-publish! (deps-bus d) e))
-                           cfg
-                 ) ; end tool-ctx
-       ) ; end tool-run
-     ) ; end with-handlers
+     (define perm (permission-check (deps-policy d) t input (deps-asker d)))
+     (cond
+       [(not (eq? perm 'allow))
+        ;; 拒绝：把用户理由（若有）回传给模型，强调不要重试、据此调整。
+        (define reason (and (pair? perm) (cdr perm)))
+        (err-outcome
+         (if reason
+             f"User denied permission for tool `{name}`. The user's reason: {reason}. Respect this — do not retry the same call; adjust your approach accordingly (or ask the user how to proceed)."
+             f"User denied permission for tool `{name}`. Do not retry the same call; consider a different approach or ask the user how to proceed."))
+       ] ; end deny case
+       [else
+        (with-handlers ([exn:fail?
+                         (lambda (e)
+                           (err-outcome f"tool `{name}` raised: {(exn-message e)}")
+                         ) ; end lambda
+                        ]) ; end handlers
+          (define cfg (current-loop-config))
+          (tool-run t input
+                    (tool-ctx (config-workdir cfg)
+                              (lambda (e) (bus-publish! (deps-bus d) e))
+                              cfg
+                    ) ; end tool-ctx
+          ) ; end tool-run
+        ) ; end with-handlers
+       ] ; end allow case
+     ) ; end cond
     ] ; end else
   ) ; end cond
 ) ; end define execute-one-call

@@ -137,19 +137,9 @@
   ) ; end cond
 ) ; end define detect-osc-progress
 
-;; 依终端能力选进度动画形式：truecolor/256 色 → 富进度条 'bar；否则 → 隔离条扫光 'sweep。
-;; 环境变量 PI_PROGRESS=bar|sweep 可强制。
+;; 进度动画形式：默认 'bar（已瘦身为细线，占位小）；PI_PROGRESS=sweep 改用无色扫光。
 (define (detect-progress-style)
-  (define forced (getenv "PI_PROGRESS"))
-  (define ct (getenv "COLORTERM"))
-  (define term (getenv "TERM"))
-  (cond
-    [(equal? forced "bar") 'bar]
-    [(equal? forced "sweep") 'sweep]
-    [(and ct (regexp-match? #rx"truecolor|24bit" ct)) 'bar]
-    [(and term (regexp-match? #rx"256color" term)) 'bar]
-    [else 'sweep]
-  ) ; end cond
+  (if (equal? (getenv "PI_PROGRESS") "sweep") 'sweep 'bar)
 ) ; end define detect-progress-style
 
 ;; 全屏选择器模式态（内嵌于 console，键由 reader 线程喂给 pick-step）
@@ -207,9 +197,9 @@
 
 ;; ------------------------------------------------------------ 绘制原语
 
-;; 估计速率标签（右端显示 ~N tok/s，指征运算速率）
+;; 估计速率标签（右端显示 ~N tok/s，量化到 5 以稳住读数）
 (define (progress-label con)
-  (define r (inexact->exact (round (unbox (console-rate con)))))
+  (define r (quantize-rate (unbox (console-rate con))))
   (if (> r 0) f" {r} tok/s " "")
 ) ; end define progress-label
 
@@ -230,7 +220,8 @@
   ) ; end cond
 ) ; end define separator-line
 
-;; 富进度条（256 色）：一段青色渐变块在暗线上左右横扫（不定进度）。
+;; 富色进度条（256 色）：一段青色渐变**细线**在暗线上左右横扫（乒乓、不定进度）。
+;; 用 ━（细线）而非 █（实心块），大幅减小颜色占位。
 (define BAR-GRAD #(23 30 37 44 51 44 37 30 23))
 (define (progress-bar-line W phase)
   (define seg (min W (max 6 (quotient W 6))))
@@ -242,7 +233,7 @@
           (for/list ([i (in-range W)])
             (define d (- i pos))
             (if (and (>= d 0) (< d seg))
-                f"\e[38;5;{(vector-ref BAR-GRAD (modulo d (vector-length BAR-GRAD)))}m█"
+                f"\e[38;5;{(vector-ref BAR-GRAD (modulo d (vector-length BAR-GRAD)))}m━"
                 "\e[38;5;236m─")))
    "\e[0m")
 ) ; end define progress-bar-line
@@ -603,7 +594,8 @@
     (lambda ()
       (unless (eq? (unbox (console-working con)) (and on? #t))
         (set-box! (console-working con) (and on? #t))
-        (unless on? (reset-rate! con))               ; 轮末清速率
+        (set-box! (console-spin con) 0)              ; 每轮重置动画相位起点（不续上一轮）
+        (reset-rate! con)                            ; 重置速率估计
         (osc-progress con on?)
         (redraw! con))))
 ) ; end define console-set-working!
@@ -686,13 +678,18 @@
         (redraw! con))))
 ) ; end define poll-resize!
 
-;; 输出速率估计：字符 → 粗略 token（÷2.5，混合中英）；EMA 平滑。
+;; 输出速率估计：字符 → 粗略 token（÷2.5，混合中英）。
+;; 抖动抑制：① 采样窗口拉到 500ms（避免 120ms 内 token 突发/空档造成剧烈起伏）；
+;;          ② 低 α EMA（0.15）重平滑；③ 显示量化到 5 的倍数。三者叠加使读数平稳。
 (define CHARS-PER-TOK 2.5)
+(define SAMPLE-MS 400.0)     ; 窗口拉长（原 100ms）：平掉 token 突发/空档的毛刺
+(define EMA-ALPHA 0.25)      ; 低通（原 0.4）：时间常数 ~1.6s，平稳又不至太滞后
+
 (define (console-tick-tokens! con nchars)
   (set-box! (console-rate-acc con) (+ (unbox (console-rate-acc con)) nchars))
 ) ; end define console-tick-tokens!
 
-;; 由 animator 每帧采样：把累计字符数换算成 token/s 的 EMA。
+;; 由 animator 每帧调用；仅每 SAMPLE-MS 结算一次，把窗口内字符数换算成 token/s 并低通滤波。
 (define (sample-rate! con)
   (define now (current-inexact-milliseconds))
   (define t0 (unbox (console-rate-t con)))
@@ -700,15 +697,18 @@
     [(<= t0 0.0) (set-box! (console-rate-t con) now)]  ; 首次：只记时刻
     [else
      (define dt (- now t0))
-     (when (>= dt 100.0)                                ; 至少 100ms 才采一次
+     (when (>= dt SAMPLE-MS)
        (define chars (unbox (console-rate-acc con)))
        (set-box! (console-rate-acc con) 0)
        (set-box! (console-rate-t con) now)
-       (define inst (/ (/ chars CHARS-PER-TOK) (/ dt 1000.0)))   ; token/s 瞬时
-       (define ema (+ (* 0.4 inst) (* 0.6 (unbox (console-rate con)))))
+       (define inst (/ (/ chars CHARS-PER-TOK) (/ dt 1000.0)))   ; 窗口平均 token/s
+       (define ema (+ (* EMA-ALPHA inst) (* (- 1.0 EMA-ALPHA) (unbox (console-rate con)))))
        (set-box! (console-rate con) ema))]
   ) ; end cond
 ) ; end define sample-rate!
+
+;; 量化到最近的 5，减少显示抖动
+(define (quantize-rate r) (* 5 (inexact->exact (round (/ r 5)))))
 
 ;; token/s → 4 档步长（越快扫得越快）
 (define (rate->step r)
@@ -780,6 +780,7 @@
  console-set-working!
  console-tick-tokens!
  rate->step
+ quantize-rate
  console-ask!
  console-pick!
  console-choose!

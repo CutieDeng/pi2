@@ -288,13 +288,14 @@
   (check-false (string-contains? f "█"))          ; sweep 不用块字符/颜色
 ) ; end test-case
 
-(test-case "working: bar style animates a 256-color block progress bar (capable tty)"
+(test-case "working: bar style is a thin 256-color line (not solid blocks)"
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term #:progress-style 'bar))
   (console-set-working! con #t)
   (define f (last-frame st))
-  (check-true (string-contains? f "█"))           ; 块
   (check-true (string-contains? f "\e[38;5;"))    ; 256 色
+  (check-true (string-contains? f "━"))           ; 细线
+  (check-false (string-contains? f "█"))          ; 已不再用实心块
 ) ; end test-case
 
 (test-case "separator reverts to a static dim line when work ends"
@@ -315,6 +316,23 @@
   (check-equal? (rate->step 20) 2)
   (check-equal? (rate->step 45) 3)
   (check-equal? (rate->step 120) 4)
+) ; end test-case
+
+(test-case "default progress style is bar (thin 256-color line)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))            ; 默认样式（未设 PI_PROGRESS=sweep）
+  (console-set-working! con #t)
+  (define f (last-frame st))
+  (check-true (string-contains? f "\e[38;5;"))    ; 默认即 bar（256 色）
+  (check-false (string-contains? f "█"))          ; 但为细线，非实心块
+) ; end test-case
+
+(test-case "rate readout quantizes to multiples of 5 (jitter suppression)"
+  (check-equal? (quantize-rate 2) 0)      ; <2.5 → 隐藏
+  (check-equal? (quantize-rate 3) 5)
+  (check-equal? (quantize-rate 22) 20)
+  (check-equal? (quantize-rate 23) 25)
+  (check-equal? (quantize-rate 48) 50)
 ) ; end test-case
 
 (test-case "OSC 9;4 progress emitted around working when enabled"

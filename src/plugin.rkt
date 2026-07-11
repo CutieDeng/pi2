@@ -126,14 +126,22 @@
    select-box   ; box of (title options -> (or/c #f string))：选框（repl 注入 console-choose!）
    confirm-box  ; box of (title -> boolean)：确认框
    provider-sel ; box of string：当前选用的 provider 名（/provider 运行时切换）
+   skills       ; box of (listof resource)：发现的技能（渐进披露进系统提示词）
+   prompts      ; box of (listof resource)：发现的提示词（/prompt 激活）
   ) ; end fields
 ) ; end struct plugin-host
 
 (define (make-plugin-host #:registry [reg (make-registry '())])
   (plugin-host reg (make-hash) (make-hash) (make-hash) (make-hash) (box '())
                (box (lambda (msg . _) (void))) (box #f)
-               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)) (box "openai"))
+               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)) (box "openai")
+               (box '()) (box '()))
 ) ; end define make-plugin-host
+
+(define (host-skills h) (unbox (plugin-host-skills h)))
+(define (host-prompts h) (unbox (plugin-host-prompts h)))
+(define (host-set-skills! h ss) (set-box! (plugin-host-skills h) ss))
+(define (host-set-prompts! h ps) (set-box! (plugin-host-prompts h) ps))
 
 (define (host-registry h) (plugin-host-registry h))
 (define (host-tools h) (registry-tools (plugin-host-registry h)))
@@ -428,6 +436,7 @@
  make-plugin-host host-registry host-tools host-lookup host-commands host-command
  host-shortcut host-hooks host-plugins host-provider host-provider-names
  host-available-providers host-current-provider host-set-provider! make-dispatch-provider
+ host-skills host-prompts host-set-skills! host-set-prompts!
  host-set-notify! host-set-session! host-set-select! host-set-confirm! make-ctx
  make-plugin-api
  ;; 钩子运行器（loop 用）

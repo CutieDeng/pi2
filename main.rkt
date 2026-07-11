@@ -24,6 +24,7 @@
  (file "src/subagent.rkt")
  (file "src/tools/builtin.rkt")
  (file "src/plugin.rkt")
+ (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
  (file "src/tui/picker.rkt")
 ) ; end require
@@ -162,7 +163,11 @@
       (and s (if (path? s) (path->string s) s))))
   (set-box! resume-path resolved)              ; 下游按已解析路径工作
 
-  ;; 组装 config：resume 时以存档 config 为基，命令行覆盖
+  ;; 技能/提示词资源发现（skills/ prompts/ 项目目录）。技能渐进披露进系统提示词。
+  (define skills (discover-resources (build-path project-root "skills")))
+  (define prompts (discover-resources (build-path project-root "prompts")))
+
+  ;; 组装 config：resume 时以存档 config 为基，命令行覆盖；追加技能清单到系统提示词。
   (define base-cfg
     (if (unbox resume-path)
         (agent-state-config (session-replay (unbox resume-path)))
@@ -178,6 +183,8 @@
                                       (string->symbol (unbox mode))
                                       (config-permission-mode base-cfg))]
                  [workdir (unbox workdir)]
+                 [system-prompt (string-append (or (config-system-prompt base-cfg) "")
+                                               (skills-addendum skills))]
     ) ; end struct-copy
   ) ; end define cfg
 
@@ -189,6 +196,8 @@
   ;; 可变 registry + 插件宿主（共享同一 registry，故插件工具直接可被模型调用）。
   (define registry (make-registry base-tools))
   (define host (make-plugin-host #:registry registry))
+  (host-set-skills! host skills)
+  (host-set-prompts! host prompts)
   ;; 能力授权：从 cache/plugin-grants.rktd 恢复已授予项；载入时按信任/能力门询问。
   (define grants (make-grants (build-path cache-dir "plugin-grants.rktd")))
   (define plugin-asker

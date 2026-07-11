@@ -221,7 +221,13 @@ pi 用 `jiti` 在运行时解释 TS——这是「宿主语言即插件语言」
   `make-dispatch-provider`——deps-provider 是分发器，每请求按 host `provider-sel` 选用名解析真实
   provider（惰性构建 + 缓存），委派 stream!/cancel!；`/provider [name]` 列出/切换（校验），
   `--provider` 设初始选用。故 `/model` 与 `/provider` 皆运行时即时生效。
-- **M5 `#lang pi/plugin` DSL + 技能/提示词** ⏳：声明式插件语言、`skills/`/`prompts/` 资源发现。
+- **M5 声明式 DSL + 技能/提示词** ✅：**`#lang pi/plugin`**（`src/pi-plugin-lang.rkt`）——自定义
+  `#%module-begin` 把主体包成 `plugin` 注册函数，`deftool`/`defcommand`/`on`/`defprovider`/`defshortcut`
+  宏在 `current-plugin-api` 参数化下展开;SDK 与 racket/base 已由语言导出,插件无样板、无 require;
+  用 `#lang s-exp "…/pi-plugin-lang.rkt"` 即可(与既有加载器**零改动**——仍是 provide plugin 的受信插件)。
+  **资源发现**（`src/resources.rkt`）:读带 YAML 前置元数据的 markdown;`skills/*.md` 名称/描述**渐进
+  披露**进系统提示词(模型按需 read_file 全文),`prompts/*.md` 经 `/prompt <name>` 激活(正文追加进
+  系统提示词);`/skills`、`/prompt` 列出。
 
 ---
 
@@ -250,4 +256,6 @@ provider 每轮读当前 model；`ctx.select`/`confirm` 经 host 注入正确路
 `/provider echollm` **运行时切换**后回复即由插件供应商产出；**Ctrl-G** 触发插件 `register-shortcut!`
 的处理器（notify 上屏）。
 
-M1–M4 均已落地并测试。后续按 §7 的 M5（`#lang pi/plugin` DSL、技能/提示词）推进。
+**M1–M5 全部落地并测试**。DSL 测试：`dsl-demo.rkt`（`#lang pi/plugin`）注册工具/命令/键位/钩子且
+工具可执行、捕获局部 define。资源测试：前置元数据解析、`read-resource`、`skills-addendum` 渐进披露。
+pty：`/skills` 列出 web-search、`/prompt reviewer` 激活、DSL 插件命令 `/dsl` 生效。

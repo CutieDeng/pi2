@@ -18,6 +18,7 @@
  (file "context.rkt")
  (file "session.rkt")
  (file "plugin.rkt")
+ (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
  (file "tui/sanitize.rkt")
@@ -44,6 +45,8 @@
     ("/history" ""     "message count and roles")
     ("/tail"    "[n]"  "show last n cached output lines (default 20)")
     ("/resume"  ""     "pick another session to resume")
+    ("/skills"  ""     "list discovered skills")
+    ("/prompt"  "[name]" "list or activate a discovered prompt")
     ("/provider" "[name]" "list or switch LLM provider")
     ("/model"   "<id>" "switch model")
    ) ; end list
@@ -559,6 +562,39 @@
        ] ; end else
      ) ; end cond
     ] ; end resume case
+    [("/skills")
+     (define ss (if host (host-skills host) '()))
+     (cond
+       [(null? ss) (say (dim "no skills discovered (put *.md in ./skills/)")) (values st #t)]
+       [else
+        (say (dim "skills (read the file for full instructions):"))
+        (for ([s (in-list ss)]) (say (dim f"  {(resource-name s)} — {(resource-description s)}")))
+        (values st #t)]
+     ) ; end cond
+    ] ; end skills case
+    [("/prompt")
+     (define ps (if host (host-prompts host) '()))
+     (cond
+       [(null? args)
+        (cond
+          [(null? ps) (say (dim "no prompts discovered (put *.md in ./prompts/)")) (values st #t)]
+          [else
+           (say (dim "prompts (activate with /prompt <name>):"))
+           (for ([p (in-list ps)]) (say (dim f"  {(resource-name p)} — {(resource-description p)}")))
+           (values st #t)])]
+       [else
+        (define p (findf (lambda (r) (string=? (resource-name r) (car args))) ps))
+        (cond
+          [(not p) (say (red f"unknown prompt: {(car args)}")) (values st #t)]
+          [else
+           ;; 激活：把提示词正文追加进当前 state 的系统提示词（后续轮生效）
+           (define c (agent-state-config st))
+           (define c* (struct-copy config c
+                       [system-prompt (string-append (or (config-system-prompt c) "") "\n\n" (resource-body p))]))
+           (say (dim f"activated prompt: {(resource-name p)}"))
+           (values (struct-copy agent-state st [config c*]) #t)])]
+     ) ; end cond
+    ] ; end prompt case
     [("/provider")
      (cond
        [(not host) (say (dim "no plugin host")) (values st #t)]

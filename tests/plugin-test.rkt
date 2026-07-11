@@ -293,5 +293,19 @@
   (check-true ((plugin-ctx-confirm ctx) "ok?"))
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 声明式 DSL（M5）
+
+(test-case "#lang pi/plugin DSL: deftool/defcommand/defshortcut/on register correctly"
+  (define host (make-plugin-host))
+  (load-plugin-trusted! host (plug "dsl-demo.rkt"))
+  (check-not-false (member "shout" (map tool-name (host-tools host))))
+  (check-not-false (host-command host "/dsl"))
+  (check-not-false (host-shortcut host (kchar #\j '(ctrl))))
+  (check-equal? (length (host-hooks host 'tool-start)) 1)
+  ;; 工具可执行，且捕获了局部 define（prefix="dsl"）
+  (check-equal? (tool-outcome-content (tool-run (host-lookup host "shout") (hasheq 'text "hi") DUMMY-CTX))
+                "dsl: HI!")
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "plugin-test: all passed")

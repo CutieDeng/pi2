@@ -235,5 +235,32 @@
   (check-true (tool? (host-lookup host "writer")))   ; 仍加载（能力被拒→沙箱限制）
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 多供应商（M4）
+
+(test-case "plugin registers an LLM provider, selectable at startup and usable in a turn"
+  (define host (make-plugin-host))
+  (load-plugin-trusted! host (plug "echo-provider.rkt"))
+  (define factory (host-provider host "echollm"))
+  (check-true (procedure? factory))
+  (check-not-false (member "echollm" (host-provider-names host)))
+  ;; 用该 provider 跑一轮：assistant 回复来自插件供应商（非内置 openai，无需联网）。
+  (define cfg (struct-copy config (default-config)
+                           [workdir (path->string tmpdir)] [permission-mode 'yolo]))
+  (define prov (factory cfg))
+  (define d (make-deps #:provider prov #:registry (host-registry host) #:bus (make-bus)
+                       #:policy (make-policy cfg) #:plugin-host host))
+  (define st (run-turn! (make-initial-state cfg) (text-msg 'user "ping") d))
+  (check-not-false (member "echo-llm reply: ping" (map message-text (state-history-list st))))
+) ; end test-case
+
+(test-case "ctx.select / ctx.confirm route through host-injected UI"
+  (define host (make-plugin-host))
+  (host-set-select! host (lambda (title opts) (car opts)))     ; 模拟：总选第一项
+  (host-set-confirm! host (lambda (title) #t))
+  (define ctx (make-ctx host))
+  (check-equal? ((plugin-ctx-select ctx) "pick" '("a" "b")) "a")
+  (check-true ((plugin-ctx-confirm ctx) "ok?"))
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "plugin-test: all passed")

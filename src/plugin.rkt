@@ -16,8 +16,10 @@
 (require
  racket/sandbox
  racket/path
+ racket/async-channel
  (file "model.rkt")
  (file "tool.rkt")
+ (file "provider.rkt")
  (file "rktd.rkt")
 ) ; end require
 
@@ -37,6 +39,25 @@
                           #:level [level 'read-only] #:params [params (hasheq)])
   (simple-tool name desc level params run)
 ) ; end define make-simple-tool
+
+;; 便捷：由 reply 函数构造一个 provider（供插件写自定义 LLM 供应商）。
+;; reply : (listof message) -> string。宿主自建通道/线程/事件：先 delta（供渲染显示），
+;; 再 message（入历史），再 turn-end。
+(define (make-simple-provider #:name name #:reply reply)
+  (provider
+   name
+   (lambda (msgs _tool-specs)
+     (define ch (make-async-channel))
+     (thread
+      (lambda ()
+        (with-handlers ([exn:fail? (lambda (e) (async-channel-put ch (evt:error (now-ms) e #f)))])
+          (define txt (reply msgs))
+          (async-channel-put ch (evt:delta (now-ms) 'text txt))                    ; 显示
+          (async-channel-put ch (evt:message (now-ms) (text-msg 'assistant txt)))  ; 入历史
+          (async-channel-put ch (evt:turn-end (now-ms) "stop" (usage 0 0))))))
+     ch)
+   void)
+) ; end define make-simple-provider
 
 ;; ------------------------------------------------------------ 能力授权（grants）
 
@@ -97,15 +118,19 @@
    commands     ; mutable hash name→command-spec
    shortcuts    ; mutable hash key→handler
    hooks        ; mutable hash event→(listof handler)（注册序）
+   providers    ; mutable hash name→factory (config→provider)
    plugins      ; box of (listof loaded-plugin)
    notify-box   ; box of (proc)：显示消息（console 就绪后由宿主注入）
    session-box  ; box of (or/c #f agent-state)：当前状态（loop 更新）
+   select-box   ; box of (title options -> (or/c #f string))：选框（repl 注入 console-choose!）
+   confirm-box  ; box of (title -> boolean)：确认框
   ) ; end fields
 ) ; end struct plugin-host
 
 (define (make-plugin-host #:registry [reg (make-registry '())])
-  (plugin-host reg (make-hash) (make-hash) (make-hash) (box '())
-               (box (lambda (msg . _) (void))) (box #f))
+  (plugin-host reg (make-hash) (make-hash) (make-hash) (make-hash) (box '())
+               (box (lambda (msg . _) (void))) (box #f)
+               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)))
 ) ; end define make-plugin-host
 
 (define (host-registry h) (plugin-host-registry h))
@@ -116,25 +141,33 @@
 (define (host-shortcut h key) (hash-ref (plugin-host-shortcuts h) key #f))
 (define (host-hooks h event) (reverse (hash-ref (plugin-host-hooks h) event '())))
 (define (host-plugins h) (unbox (plugin-host-plugins h)))
+;; provider 工厂：返回 (config→provider) 或 #f；"openai" 未注册时由宿主回退到内置。
+(define (host-provider h name) (hash-ref (plugin-host-providers h) name #f))
+(define (host-provider-names h) (hash-keys (plugin-host-providers h)))
 
-;; console/session 注入（供 ctx 使用）
+;; console/session UI 注入（供 ctx 使用；repl 就绪后接 console）
 (define (host-set-notify! h proc) (set-box! (plugin-host-notify-box h) proc))
 (define (host-set-session! h st) (set-box! (plugin-host-session-box h) st))
+(define (host-set-select! h proc) (set-box! (plugin-host-select-box h) proc))
+(define (host-set-confirm! h proc) (set-box! (plugin-host-confirm-box h) proc))
 
 ;; ------------------------------------------------------------ 插件上下文（传给命令/回调）
 
-(struct plugin-ctx (host notify session) #:transparent)
-;; notify : (-> string [sym] void)  ；session : (-> (or/c #f agent-state))
+(struct plugin-ctx (host notify session select confirm) #:transparent)
+;; notify:(-> string [sym] void)  session:(-> (or #f agent-state))
+;; select:(-> title options (or #f string))  confirm:(-> title boolean)
 
 (define (make-ctx host)
   (plugin-ctx host
               (lambda (msg . t) ((unbox (plugin-host-notify-box host)) msg (if (pair? t) (car t) 'info)))
-              (lambda () (unbox (plugin-host-session-box host))))
+              (lambda () (unbox (plugin-host-session-box host)))
+              (lambda (title options) ((unbox (plugin-host-select-box host)) title options))
+              (lambda (title) ((unbox (plugin-host-confirm-box host)) title)))
 ) ; end define make-ctx
 
 ;; ------------------------------------------------------------ 插件 API
 
-(struct plugin-api (register-tool! register-command! register-shortcut! on! ctx) #:transparent)
+(struct plugin-api (register-tool! register-command! register-shortcut! register-provider! on! ctx) #:transparent)
 
 (define (make-plugin-api host lp)
   (plugin-api
@@ -145,6 +178,7 @@
      (hash-set! (plugin-host-commands host) name spec)
      (set-loaded-plugin-cmds! lp (cons name (loaded-plugin-cmds lp))))
    (lambda (key handler) (hash-set! (plugin-host-shortcuts host) key handler))
+   (lambda (name factory) (hash-set! (plugin-host-providers host) name factory))
    (lambda (event handler)
      (hash-update! (plugin-host-hooks host) event (lambda (l) (cons handler l)) '()))
    (make-ctx host)
@@ -348,12 +382,14 @@
 (provide
  ;; SDK（供插件）
  make-simple-tool (struct-out simple-tool)
+ make-simple-provider
  (struct-out hook-block) (struct-out hook-replace)
  ok-outcome err-outcome input-ref input-str input-int
  ;; 宿主
  (struct-out plugin-host) (struct-out loaded-plugin) (struct-out plugin-api) (struct-out plugin-ctx)
  make-plugin-host host-registry host-tools host-lookup host-commands host-command
- host-shortcut host-hooks host-plugins host-set-notify! host-set-session! make-ctx
+ host-shortcut host-hooks host-plugins host-provider host-provider-names
+ host-set-notify! host-set-session! host-set-select! host-set-confirm! make-ctx
  make-plugin-api
  ;; 钩子运行器（loop 用）
  run-tool-call-hooks run-tool-result-hooks run-before-turn-hooks run-context-hooks

@@ -260,7 +260,13 @@
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
-  (when host (host-set-notify! host (lambda (msg . _) (say (dim msg)))))  ; 插件 ctx.notify
+  (when host                                            ; 插件 ctx UI 接 console
+    (host-set-notify! host (lambda (msg . _) (say (dim msg))))
+    (host-set-select! host (lambda (title opts)
+                             (define i (console-choose! con (sanitize-untrusted title) opts))
+                             (and i (list-ref opts i))))
+    (host-set-confirm! host (lambda (title)
+                              (equal? 0 (console-choose! con (sanitize-untrusted title) '("Yes" "No"))))))
   (define (statusf on?) (console-set-status! con (and on? STATUS-WORKING)))
   (define (tickf n) (console-tick-tokens! con n))
   (define unsub (bus-subscribe! bus (make-renderer emit statusf tickf)))

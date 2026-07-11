@@ -109,6 +109,7 @@
   (define rm-arg (box #f))
   (define plugin-dirs (box '()))
   (define trust-plugins? (box #f))
+  (define provider-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -120,6 +121,7 @@
                         (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
+   [("--provider") name "LLM provider (openai | a plugin-registered name)" (set-box! provider-arg name)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
    [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
@@ -183,13 +185,9 @@
   (define bus (make-bus))
   (make-directory* cache-dir)
   (define perm-store (build-path cache-dir "permissions.rktd"))
-  (define prov (make-openai-provider cfg))
   (define base-tools (builtin-tools cfg))
-  (define spawn-tool
-    (make-spawn-agent-tool #:provider prov #:sub-tools base-tools)
-  ) ; end define spawn-tool
-  ;; 插件宿主：与 deps 共享同一 registry，故插件工具直接可被模型调用。
-  (define registry (make-registry (append base-tools (list spawn-tool))))
+  ;; 可变 registry + 插件宿主（共享同一 registry，故插件工具直接可被模型调用）。
+  (define registry (make-registry base-tools))
   (define host (make-plugin-host #:registry registry))
   ;; 能力授权：从 cache/plugin-grants.rktd 恢复已授予项；载入时按信任/能力门询问。
   (define grants (make-grants (build-path cache-dir "plugin-grants.rktd")))
@@ -198,7 +196,7 @@
       [(unbox trust-plugins?) (lambda (_q) 'always)]        ; --trust-plugins：全授予并持久化
       [(terminal-port? (current-input-port)) tty-asker]     ; 交互：y/n/a 询问
       [else (lambda (_q) 'no)]))                            ; 非交互：默认拒绝（保守）
-  ;; 加载 plugins/（若存在）+ 命令行 --plugins 目录（按给定顺序）。
+  ;; 加载 plugins/（若存在）+ 命令行 --plugins 目录（先于解析 provider，供插件注册供应商）。
   (define default-plugins-dir (build-path project-root "plugins"))
   (define plugin-load-dirs
     (append (if (directory-exists? default-plugins-dir) (list default-plugins-dir) '())
@@ -208,6 +206,20 @@
                        #:grants grants #:asker plugin-asker
                        #:on-error (lambda (p e) (eprintf "plugin load failed (~a): ~a\n" p e))))
   (bus-subscribe! bus (make-host-observer host))   ; 观测型钩子分发
+  ;; 解析 provider：--provider 名 → 插件工厂，或内置 openai。
+  (define provider-name (or (unbox provider-arg) "openai"))
+  (define prov
+    (let ([factory (host-provider host provider-name)])
+      (cond
+        [factory (factory cfg)]
+        [(string=? provider-name "openai") (make-openai-provider cfg)]
+        [else (eprintf "unknown provider: ~a (available: openai~a)\n"
+                       provider-name
+                       (apply string-append (map (lambda (n) f" {n}") (host-provider-names host))))
+              (exit 1)])))
+  ;; spawn_agent 用解析后的 provider；加入 registry。
+  (define spawn-tool (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))
+  (registry-add! registry spawn-tool)
   (define d
     (make-deps #:provider prov
                #:registry registry

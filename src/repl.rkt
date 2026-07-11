@@ -257,7 +257,11 @@
     (make-console term #:prompt (green "› ")
                   #:interrupt (lambda () (break-thread main-th))  ; Ctrl-C → 取消当前轮
                   #:hint (lambda (t) (hint-lines-for (all-cmds) t))  ; '/' 预览（含插件命令）
-                  #:complete (lambda (t) (complete-for (all-cmds) t)))  ; Tab 补全（含插件命令）
+                  #:complete (lambda (t) (complete-for (all-cmds) t))  ; Tab 补全（含插件命令）
+                  #:shortcut (lambda (k)                              ; 插件快捷键 → 执行 thunk
+                               (and host
+                                    (let ([h (host-shortcut host k)])
+                                      (and h (lambda () (h (make-ctx host))))))))
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))

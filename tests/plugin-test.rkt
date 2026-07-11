@@ -272,6 +272,18 @@
   (check-not-false (member "echo-llm reply: ping" (map message-text (state-history-list st))))
 ) ; end test-case
 
+(test-case "register-shortcut! stores a kev handler; host-shortcut looks it up"
+  (define host (make-plugin-host))
+  (define api (make-plugin-api host (loaded-plugin "s" 'trusted (make-custodian) '() '())))
+  (define ran (box #f))
+  ((plugin-api-register-shortcut! api) (kchar #\g '(ctrl)) (lambda (_ctx) (set-box! ran #t)))
+  (define h (host-shortcut host (kchar #\g '(ctrl))))
+  (check-true (procedure? h))
+  (h (make-ctx host))
+  (check-true (unbox ran))
+  (check-false (host-shortcut host (kchar #\x '(ctrl))))   ; 未注册键 → #f
+) ; end test-case
+
 (test-case "ctx.select / ctx.confirm route through host-injected UI"
   (define host (make-plugin-host))
   (host-set-select! host (lambda (title opts) (car opts)))     ; 模拟：总选第一项

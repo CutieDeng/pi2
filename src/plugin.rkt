@@ -21,6 +21,7 @@
  (file "tool.rkt")
  (file "provider.rkt")
  (file "rktd.rkt")
+ (file "tui/keys.rkt")
 ) ; end require
 
 ;; ------------------------------------------------------------ 插件 SDK（供插件构造工具）
@@ -419,6 +420,7 @@
  ;; SDK（供插件）
  make-simple-tool (struct-out simple-tool)
  make-simple-provider
+ kchar knamed                          ; 构造快捷键 kev（供 register-shortcut!）
  (struct-out hook-block) (struct-out hook-replace)
  ok-outcome err-outcome input-ref input-str input-int
  ;; 宿主

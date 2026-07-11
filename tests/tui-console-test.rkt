@@ -352,4 +352,20 @@
   (check-false (string-contains? (scripted-output st) "\e]9;4"))
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 插件快捷键
+
+(test-case "a matching plugin shortcut runs its thunk and consumes the key"
+  (define fired (box #f))
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term
+                #:shortcut (lambda (k)
+                             (and (equal? k (kchar #\g '(ctrl)))
+                                  (lambda () (set-box! fired #t))))))
+  (feed! con (bytes 7))                          ; Ctrl-G → kchar #\g '(ctrl)
+  (check-true (unbox fired))
+  ;; 非命中键不被拦截，仍进编辑器
+  (feed! con "x\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "x")
+) ; end test-case
+
 (displayln "tui-console-test: all passed")

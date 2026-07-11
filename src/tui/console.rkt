@@ -115,6 +115,7 @@
    animator   ; box of (or/c #f thread)
    picker     ; box of (or/c #f pmode) — /resume 全屏选择器模式
    complete   ; (string -> (or/c #f string)) — Tab 补全（返回补全后的整行或 #f）
+   shortcut   ; (kev -> (or/c #f (-> void))) — 插件快捷键：命中返回要执行的 thunk
    choose     ; box of (or/c #f cmode) — 贴底内联小选框模式
    working    ; box of boolean — 整轮工作中（驱动底边隔离条进度动画）
    progress-style ; 'bar | 'sweep — 进度动画形式（依 tty 能力选择）
@@ -154,6 +155,7 @@
                       #:interrupt [interrupt void]
                       #:hint [hint (lambda (_t) '())]
                       #:complete [complete (lambda (_t) #f)]
+                      #:shortcut [shortcut (lambda (_k) #f)]
                       #:progress-style [progress-style (detect-progress-style)]
                       #:osc? [osc? (detect-osc-progress)]
                       #:cache-lines [cache-lines DEFAULT-CACHE-LINES])
@@ -162,7 +164,7 @@
            (box prompt) (box "") (make-ring cache-lines) (box 0) (box 0)
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
-           (box #f) (box 0) (box #f) (box #f) complete (box #f) (box #f) progress-style
+           (box #f) (box 0) (box #f) (box #f) complete shortcut (box #f) (box #f) progress-style
            (box 0.0) (box 0) (box 0.0) osc?)
 ) ; end define make-console
 
@@ -438,6 +440,10 @@
   (cond
     [(unbox (console-choose con)) (handle-choose-key! con k) 'continue]
     [(unbox (console-picker con)) (handle-picker-key! con k) 'continue]
+    [((console-shortcut con) k)                       ; 插件快捷键：命中即执行其 thunk
+     => (lambda (thunk)
+          (with-handlers ([exn:fail? (lambda (_e) (void))]) (thunk))
+          'continue)]
     [(scroll-key? k) (do-scroll! con k) 'continue]
     [(tab-key? k) (do-complete! con) 'continue]
     [else

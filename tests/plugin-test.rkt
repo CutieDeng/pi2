@@ -253,6 +253,25 @@
   (check-not-false (member "echo-llm reply: ping" (map message-text (state-history-list st))))
 ) ; end test-case
 
+(test-case "dispatch provider switches the active provider at runtime (/provider)"
+  (define host (make-plugin-host))
+  (load-plugin-trusted! host (plug "echo-provider.rkt"))       ; 注册 echollm
+  (check-not-false (member "echollm" (host-available-providers host)))
+  (check-equal? (host-current-provider host) "openai")         ; 默认
+  (check-false (host-set-provider! host "nope"))               ; 未知名 → 不改
+  (check-equal? (host-current-provider host) "openai")
+  (check-true (host-set-provider! host "echollm"))             ; 切换
+  (check-equal? (host-current-provider host) "echollm")
+  ;; 分发器按当前选用委派：跑一轮 → echollm 回复（离线）
+  (define cfg (struct-copy config (default-config)
+                           [workdir (path->string tmpdir)] [permission-mode 'yolo]))
+  (define disp (make-dispatch-provider host cfg))
+  (define d (make-deps #:provider disp #:registry (host-registry host) #:bus (make-bus)
+                       #:policy (make-policy cfg) #:plugin-host host))
+  (define st (run-turn! (make-initial-state cfg) (text-msg 'user "ping") d))
+  (check-not-false (member "echo-llm reply: ping" (map message-text (state-history-list st))))
+) ; end test-case
+
 (test-case "ctx.select / ctx.confirm route through host-injected UI"
   (define host (make-plugin-host))
   (host-set-select! host (lambda (title opts) (car opts)))     ; 模拟：总选第一项

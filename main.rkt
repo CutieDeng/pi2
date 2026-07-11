@@ -206,17 +206,13 @@
                        #:grants grants #:asker plugin-asker
                        #:on-error (lambda (p e) (eprintf "plugin load failed (~a): ~a\n" p e))))
   (bus-subscribe! bus (make-host-observer host))   ; 观测型钩子分发
-  ;; 解析 provider：--provider 名 → 插件工厂，或内置 openai。
+  ;; provider：--provider 名设为初始选用（校验），用分发器以支持 /provider 运行时切换。
   (define provider-name (or (unbox provider-arg) "openai"))
-  (define prov
-    (let ([factory (host-provider host provider-name)])
-      (cond
-        [factory (factory cfg)]
-        [(string=? provider-name "openai") (make-openai-provider cfg)]
-        [else (eprintf "unknown provider: ~a (available: openai~a)\n"
-                       provider-name
-                       (apply string-append (map (lambda (n) f" {n}") (host-provider-names host))))
-              (exit 1)])))
+  (unless (host-set-provider! host provider-name)
+    (eprintf "unknown provider: ~a (available: ~a)\n"
+             provider-name (string-join (host-available-providers host) " "))
+    (exit 1))
+  (define prov (make-dispatch-provider host cfg))
   ;; spawn_agent 用解析后的 provider；加入 registry。
   (define spawn-tool (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))
   (registry-add! registry spawn-tool)

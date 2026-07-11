@@ -44,6 +44,7 @@
     ("/history" ""     "message count and roles")
     ("/tail"    "[n]"  "show last n cached output lines (default 20)")
     ("/resume"  ""     "pick another session to resume")
+    ("/provider" "[name]" "list or switch LLM provider")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -554,6 +555,23 @@
        ] ; end else
      ) ; end cond
     ] ; end resume case
+    [("/provider")
+     (cond
+       [(not host) (say (dim "no plugin host")) (values st #t)]
+       [(null? args)
+        (define avail (string-join (host-available-providers host) "  "))
+        (say (dim f"providers: {avail}"))
+        (say (dim f"current: {(host-current-provider host)}"))
+        (values st #t)]
+       [(host-set-provider! host (car args))
+        (say (dim f"provider → {(car args)}"))
+        (values st #t)]
+       [else
+        (define avail (string-join (host-available-providers host) " "))
+        (say (red f"unknown provider: {(car args)} (available: {avail})"))
+        (values st #t)]
+     ) ; end cond
+    ] ; end provider case
     [("/model")
      (cond
        [(null? args) (say (red "usage: /model <id>")) (values st #t)]

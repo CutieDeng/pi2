@@ -124,13 +124,14 @@
    session-box  ; box of (or/c #f agent-state)：当前状态（loop 更新）
    select-box   ; box of (title options -> (or/c #f string))：选框（repl 注入 console-choose!）
    confirm-box  ; box of (title -> boolean)：确认框
+   provider-sel ; box of string：当前选用的 provider 名（/provider 运行时切换）
   ) ; end fields
 ) ; end struct plugin-host
 
 (define (make-plugin-host #:registry [reg (make-registry '())])
   (plugin-host reg (make-hash) (make-hash) (make-hash) (make-hash) (box '())
                (box (lambda (msg . _) (void))) (box #f)
-               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)))
+               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)) (box "openai"))
 ) ; end define make-plugin-host
 
 (define (host-registry h) (plugin-host-registry h))
@@ -144,6 +145,41 @@
 ;; provider 工厂：返回 (config→provider) 或 #f；"openai" 未注册时由宿主回退到内置。
 (define (host-provider h name) (hash-ref (plugin-host-providers h) name #f))
 (define (host-provider-names h) (hash-keys (plugin-host-providers h)))
+;; 可选 provider = 内置 openai + 插件注册的（去重）
+(define (host-available-providers h) (remove-duplicates (cons "openai" (host-provider-names h))))
+(define (host-current-provider h) (unbox (plugin-host-provider-sel h)))
+;; 校验并切换当前 provider；未知名返回 #f（不改）。
+(define (host-set-provider! h name)
+  (and (member name (host-available-providers h))
+       (begin (set-box! (plugin-host-provider-sel h) name) #t)))
+
+;; 分发 provider：每次请求按 host 当前选用名解析真实 provider（惰性构建 + 缓存），委派其
+;; stream!/cancel!。故 /provider 改选用名即运行时切换供应商。base-cfg 仅供工厂初始化
+;; （provider 运行时读 current-config 取 live 值）。未知名 → 该请求以 error 事件返回。
+(define (make-dispatch-provider host base-cfg)
+  (define cache (make-hash))
+  (define last (box #f))
+  (define (resolve name)
+    (hash-ref! cache name
+      (lambda ()
+        (define factory (host-provider host name))
+        (cond
+          [factory (factory base-cfg)]
+          [(string=? name "openai") (make-openai-provider base-cfg)]
+          [else (error 'provider "unknown provider: ~a" name)]))))
+  (provider
+   "dispatch"
+   (lambda (msgs tool-specs)
+     (with-handlers ([exn:fail?
+                      (lambda (e)
+                        (define ch (make-async-channel))
+                        (async-channel-put ch (evt:error (now-ms) e #f))
+                        ch)])
+       (define p (resolve (host-current-provider host)))
+       (set-box! last p)
+       (provider-stream! p msgs tool-specs)))
+   (lambda () (when (unbox last) (provider-cancel! (unbox last)))))
+) ; end define make-dispatch-provider
 
 ;; console/session UI 注入（供 ctx 使用；repl 就绪后接 console）
 (define (host-set-notify! h proc) (set-box! (plugin-host-notify-box h) proc))
@@ -389,6 +425,7 @@
  (struct-out plugin-host) (struct-out loaded-plugin) (struct-out plugin-api) (struct-out plugin-ctx)
  make-plugin-host host-registry host-tools host-lookup host-commands host-command
  host-shortcut host-hooks host-plugins host-provider host-provider-names
+ host-available-providers host-current-provider host-set-provider! make-dispatch-provider
  host-set-notify! host-set-session! host-set-select! host-set-confirm! make-ctx
  make-plugin-api
  ;; 钩子运行器（loop 用）

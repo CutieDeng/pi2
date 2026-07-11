@@ -18,6 +18,7 @@
  (file "context.rkt")
  (file "session.rkt")
  (file "plugin.rkt")
+ (file "providers.rkt")
  (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
@@ -604,8 +605,20 @@
         (say (dim f"current: {(host-current-provider host)}"))
         (values st #t)]
        [(host-set-provider! host (car args))
-        (say (dim f"provider → {(car args)}"))
-        (values st #t)]
+        (define name (car args))
+        (cond
+          ;; 内置云/本地档案：把 endpoint/key(从env)/model 写进当前 state 的 config
+          [(builtin-provider-name? name)
+           (define c* (apply-provider-profile (agent-state-config st) name))
+           (define keyenv (provider-profile-key-env-of name))
+           (say (dim f"provider → {name} (model {(config-model c*)})"))
+           (when (and keyenv (not (config-api-key c*)))
+             (say (red f"warning: env {keyenv} not set — {name} 请求将鉴权失败")))
+           (values (struct-copy agent-state st [config c*]) #t)]
+          ;; 插件注册的供应商：仅切换选用名
+          [else
+           (say (dim f"provider → {name}"))
+           (values st #t)])]
        [else
         (define avail (string-join (host-available-providers host) " "))
         (say (red f"unknown provider: {(car args)} (available: {avail})"))

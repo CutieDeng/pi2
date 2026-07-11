@@ -231,5 +231,77 @@
   (check-equal? (reverse (unbox seen)) (list "model-A" "model-B"))   ; 第二轮即用新 model
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 并行工具执行
+
+;; 睡眠工具：ms 毫秒后返回 tag。level 决定是否可并发（read-only 才并发）。
+(struct sleepy-tool (level ms)
+  #:methods gen:tool
+  [(define (tool-name _t) (if (eq? (sleepy-tool-level _t) 'read-only) "slow_read" "slow_write"))
+   (define (tool-permission-level t) (sleepy-tool-level t))
+   (define (tool-spec t)
+     (function-spec (tool-name t) "sleeps then echoes tag"
+                    (hasheq 'tag (hasheq 'type "string")) '())
+   ) ; end define tool-spec
+   (define (tool-run t input _ctx)
+     (sleep (/ (sleepy-tool-ms t) 1000.0))
+     (define tag (input-str input 'tag "?"))
+     (ok-outcome f"slept:{tag}")
+   ) ; end define tool-run
+  ] ; end methods
+) ; end struct sleepy-tool
+
+(define (make-parallel-deps reg script)
+  (define cfg
+    (struct-copy config (default-config)
+                 [workdir (path->string tmpdir)] [permission-mode 'yolo])
+  ) ; end define cfg
+  (values
+   (make-deps #:provider (make-mock-provider (box script))
+              #:registry reg #:bus (make-bus) #:policy (make-policy cfg))
+   cfg
+  ) ; end values
+) ; end define make-parallel-deps
+
+(test-case "all-read-only batch runs concurrently, results stay in call order"
+  (define reg (make-registry (list (sleepy-tool 'read-only 200))))
+  (define-values (d cfg)
+    (make-parallel-deps reg
+     (list
+      (message 'assistant
+               (list (tool-use-block "c1" "slow_read" (hasheq 'tag "a"))
+                     (tool-use-block "c2" "slow_read" (hasheq 'tag "b"))
+                     (tool-use-block "c3" "slow_read" (hasheq 'tag "c"))))
+      (text-msg 'assistant "done")))
+  ) ; end define-values
+  (define t0 (current-inexact-milliseconds))
+  (define st (run-turn! (make-initial-state cfg) (text-msg 'user "read three") d))
+  (define elapsed (- (current-inexact-milliseconds) t0))
+  ;; 三次各睡 200ms：串行需 ~600ms，并发 ~200ms。阈值 450ms 留足抖动余量。
+  (check-true (< elapsed 450)
+              (format "并发耗时 ~a ms 应 < 450（串行约 600）" elapsed))
+  ;; 结果按 c1/c2/c3 原始顺序归位。
+  (define tr-blocks (message-blocks (pvector-ref (agent-state-history st) 2)))
+  (check-equal? (map tool-result-block-tool-use-id tr-blocks) '("c1" "c2" "c3"))
+  (check-equal? (map tool-result-block-content tr-blocks)
+                '("slept:a" "slept:b" "slept:c"))
+) ; end test-case
+
+(test-case "batch with a mutating tool falls back to serial, order preserved"
+  (define reg (make-registry (list (sleepy-tool 'read-only 10)
+                                   (sleepy-tool 'mutating 10))))
+  (define-values (d cfg)
+    (make-parallel-deps reg
+     (list
+      (message 'assistant
+               (list (tool-use-block "w1" "slow_write" (hasheq 'tag "x"))
+                     (tool-use-block "r1" "slow_read" (hasheq 'tag "y"))))
+      (text-msg 'assistant "done")))
+  ) ; end define-values
+  (define st (run-turn! (make-initial-state cfg) (text-msg 'user "write then read") d))
+  (define tr-blocks (message-blocks (pvector-ref (agent-state-history st) 2)))
+  (check-equal? (map tool-result-block-tool-use-id tr-blocks) '("w1" "r1"))
+  (check-equal? (map tool-result-block-content tr-blocks) '("slept:x" "slept:y"))
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "loop-test: all passed")

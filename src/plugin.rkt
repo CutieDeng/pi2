@@ -134,7 +134,7 @@
 (define (make-plugin-host #:registry [reg (make-registry '())])
   (plugin-host reg (make-hash) (make-hash) (make-hash) (make-hash) (box '())
                (box (lambda (msg . _) (void))) (box #f)
-               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)) (box "openai")
+               (box (lambda (_t _o) #f)) (box (lambda (_t) #f)) (box "lmstudio")
                (box '()) (box '()))
 ) ; end define make-plugin-host
 
@@ -151,11 +151,11 @@
 (define (host-shortcut h key) (hash-ref (plugin-host-shortcuts h) key #f))
 (define (host-hooks h event) (reverse (hash-ref (plugin-host-hooks h) event '())))
 (define (host-plugins h) (unbox (plugin-host-plugins h)))
-;; provider 工厂：返回 (config→provider) 或 #f；"openai" 未注册时由宿主回退到内置。
+;; provider 工厂：返回 (config→provider) 或 #f；"lmstudio" 未注册时由宿主回退到内置 openai 兼容。
 (define (host-provider h name) (hash-ref (plugin-host-providers h) name #f))
 (define (host-provider-names h) (hash-keys (plugin-host-providers h)))
-;; 可选 provider = 内置 openai + 插件注册的（去重）
-(define (host-available-providers h) (remove-duplicates (cons "openai" (host-provider-names h))))
+;; 可选 provider = 默认本地 lmstudio + 注册的内置/插件供应商（去重）
+(define (host-available-providers h) (remove-duplicates (cons "lmstudio" (host-provider-names h))))
 (define (host-current-provider h) (unbox (plugin-host-provider-sel h)))
 ;; 校验并切换当前 provider；未知名返回 #f（不改）。
 (define (host-set-provider! h name)
@@ -174,7 +174,7 @@
         (define factory (host-provider host name))
         (cond
           [factory (factory base-cfg)]
-          [(string=? name "openai") (make-openai-provider base-cfg)]
+          [(string=? name "lmstudio") (make-openai-provider base-cfg)]
           [else (error 'provider "unknown provider: ~a" name)]))))
   (provider
    "dispatch"

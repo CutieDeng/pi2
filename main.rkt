@@ -24,6 +24,8 @@
  (file "src/subagent.rkt")
  (file "src/tools/builtin.rkt")
  (file "src/plugin.rkt")
+ (file "src/providers.rkt")
+ (file "src/rpc.rkt")
  (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
  (file "src/tui/picker.rkt")
@@ -111,6 +113,7 @@
   (define plugin-dirs (box '()))
   (define trust-plugins? (box #f))
   (define provider-arg (box #f))
+  (define rpc? (box #f))
 
   (command-line
    #:program "pi++"
@@ -122,7 +125,7 @@
                         (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
-   [("--provider") name "LLM provider (openai | a plugin-registered name)" (set-box! provider-arg name)]
+   [("--provider") name "LLM provider (lmstudio | openai | anthropic | gemini | grok | plugin name)" (set-box! provider-arg name)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
    [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
@@ -130,6 +133,7 @@
    [("--fork-at") n "fork the resumed session at message N (new branch)" (set-box! fork-at (string->number n))]
    [("--rm") arg "delete a session (list index or path) and exit" (set-box! rm-arg arg)]
    [("-p" "--prompt") p "one-shot prompt (non-interactive)" (set-box! prompt p)]
+   [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
    [("--mode") md "permission mode: yolo|normal|strict" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
   ) ; end command-line
@@ -198,6 +202,7 @@
   (define host (make-plugin-host #:registry registry))
   (host-set-skills! host skills)
   (host-set-prompts! host prompts)
+  (register-builtin-providers! host)     ; 注册内置档案：lmstudio/openai/anthropic/gemini/grok
   ;; 能力授权：从 cache/plugin-grants.rktd 恢复已授予项；载入时按信任/能力门询问。
   (define grants (make-grants (build-path cache-dir "plugin-grants.rktd")))
   (define plugin-asker
@@ -214,14 +219,26 @@
     (load-plugins-dir! host pd
                        #:grants grants #:asker plugin-asker
                        #:on-error (lambda (p e) (eprintf "plugin load failed (~a): ~a\n" p e))))
-  (bus-subscribe! bus (make-host-observer host))   ; 观测型钩子分发
+  (define observer-unsub (bus-subscribe! bus (make-host-observer host)))   ; 观测型钩子分发（绑定以免模块顶层打印返回值）
+  (void observer-unsub)
   ;; provider：--provider 名设为初始选用（校验），用分发器以支持 /provider 运行时切换。
-  (define provider-name (or (unbox provider-arg) "openai"))
+  (define provider-name (or (unbox provider-arg) "lmstudio"))
   (unless (host-set-provider! host provider-name)
     (eprintf "unknown provider: ~a (available: ~a)\n"
              provider-name (string-join (host-available-providers host) " "))
     (exit 1))
-  (define prov (make-dispatch-provider host cfg))
+  ;; 显式 --provider 选内置云档案时，把其 endpoint/key(从env)/model 写进 config；
+  ;; 默认 lmstudio 不覆盖（尊重用户的 --endpoint / --model）。
+  (define cfg*
+    (if (and (unbox provider-arg) (builtin-provider-name? provider-name))
+        (apply-provider-profile cfg provider-name)
+        cfg))
+  (when (and (unbox provider-arg) (builtin-provider-name? provider-name)
+             (provider-profile-key-env-of provider-name)
+             (not (config-api-key cfg*)))
+    (eprintf "warning: provider ~a needs env ~a (not set) — requests will fail auth\n"
+             provider-name (provider-profile-key-env-of provider-name)))
+  (define prov (make-dispatch-provider host cfg*))
   ;; spawn_agent 用解析后的 provider；加入 registry。
   (define spawn-tool (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))
   (registry-add! registry spawn-tool)
@@ -238,8 +255,8 @@
   ;; 初始状态：resume 恢复历史，否则空
   (define st0
     (if (unbox resume-path)
-        (session-replay (unbox resume-path) #:config cfg)
-        (make-initial-state cfg)
+        (session-replay (unbox resume-path) #:config cfg*)
+        (make-initial-state cfg*)
     ) ; end if
   ) ; end define st0
 
@@ -249,9 +266,13 @@
         (fresh-session-path data-dir)
     ) ; end or
   ) ; end define sess-path
-  (define sess (session-open! sess-path cfg))
+  (define sess (session-open! sess-path cfg*))
 
   (cond
+    ;; 无头 JSONL 模式（IDE/编排器）：复用内核，事件与响应走 stdout NDJSON。
+    [(unbox rpc?)
+     (run-rpc! d st0 sess #:plugin-host host)
+    ] ; end rpc case
     ;; 单次问答模式
     [(unbox prompt)
      (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))

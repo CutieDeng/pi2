@@ -257,9 +257,9 @@
   (define host (make-plugin-host))
   (load-plugin-trusted! host (plug "echo-provider.rkt"))       ; 注册 echollm
   (check-not-false (member "echollm" (host-available-providers host)))
-  (check-equal? (host-current-provider host) "openai")         ; 默认
+  (check-equal? (host-current-provider host) "lmstudio")       ; 默认（本地）
   (check-false (host-set-provider! host "nope"))               ; 未知名 → 不改
-  (check-equal? (host-current-provider host) "openai")
+  (check-equal? (host-current-provider host) "lmstudio")
   (check-true (host-set-provider! host "echollm"))             ; 切换
   (check-equal? (host-current-provider host) "echollm")
   ;; 分发器按当前选用委派：跑一轮 → echollm 回复（离线）

@@ -68,23 +68,16 @@
 
 ;; ------------------------------------------------------------ 工具执行
 
-;; 串行执行一条 assistant 消息中的全部工具调用，返回 tool-result-block 列表。
+;; 一条 assistant 消息里可能含多个工具调用。执行分两相：
+;;   预检（preflight）——串行，因权限询问是交互式的，多问并发会撞终端；
+;;   执行（run）——当整批都是 read-only（无副作用、无文件竞态）时并发跑，否则按序。
+;; 无论并发与否，结果都按原始下标归位，tool-start/tool-end 按序发布，输出确定。
 ;; 工具异常/未知工具/权限拒绝一律转为 error tool-result，loop 永不因工具崩溃中断。
-(define (execute-calls! calls d)
-  (define bus (deps-bus d))
-  (for/list ([call (in-list calls)])
-    (bus-publish! bus (evt:tool-start (now-ms) call))
-    (define t0 (now-ms))
-    (define result (execute-one-call call d))
-    (bus-publish! bus (evt:tool-end (now-ms) call result (- (now-ms) t0)))
-    (tool-result-block (tool-use-block-id call)
-                       (tool-outcome-content result)
-                       (tool-outcome-is-error? result)
-    ) ; end tool-result-block
-  ) ; end for/list
-) ; end define execute-calls!
 
-(define (execute-one-call call d)
+;; 预检一条调用（串行）。返回 plan：
+;;   (list 'done outcome)            — 已决议（未知/钩子拦截/插件拒/权限拒），无副作用
+;;   (list 'run t input* parallel?)  — 待执行；parallel? = 该工具 read-only 可并发
+(define (preflight-call call d)
   (define name (tool-use-block-name call))
   (define input (tool-use-block-input call))
   (define t (registry-lookup (deps-registry d) name))
@@ -93,11 +86,11 @@
      (define avail
        (string-join (map tool-name (registry-tools (deps-registry d))) ", ")
      ) ; end define avail
-     (err-outcome f"unknown tool: {name}. Available tools: {avail}")
+     (list 'done (err-outcome f"unknown tool: {name}. Available tools: {avail}"))
     ] ; end unknown case
     [((deps-pre-tool-hook d) call)
      => (lambda (reason)
-          (err-outcome f"tool `{name}` blocked by hook: {reason}")
+          (list 'done (err-outcome f"tool `{name}` blocked by hook: {reason}"))
         ) ; end lambda
     ] ; end hook-block case
     [else
@@ -107,43 +100,105 @@
        (if host (run-tool-call-hooks host name input) (values 'allow input)))
      (cond
        [(pair? decision)                          ; (cons 'deny reason) 插件拦截
-        (err-outcome f"tool `{name}` blocked by plugin: {(cdr decision)}")]
+        (list 'done (err-outcome f"tool `{name}` blocked by plugin: {(cdr decision)}"))]
        [else
         (define perm (permission-check (deps-policy d) t input* (deps-asker d)))
         (cond
           [(not (eq? perm 'allow))
            ;; 拒绝：把用户理由（若有）回传给模型，强调不要重试、据此调整。
            (define reason (and (pair? perm) (cdr perm)))
-           (err-outcome
-            (if reason
-                f"User denied permission for tool `{name}`. The user's reason: {reason}. Respect this — do not retry the same call; adjust your approach accordingly (or ask the user how to proceed)."
-                f"User denied permission for tool `{name}`. Do not retry the same call; consider a different approach or ask the user how to proceed."))
+           (list 'done
+             (err-outcome
+              (if reason
+                  f"User denied permission for tool `{name}`. The user's reason: {reason}. Respect this — do not retry the same call; adjust your approach accordingly (or ask the user how to proceed)."
+                  f"User denied permission for tool `{name}`. Do not retry the same call; consider a different approach or ask the user how to proceed.")))
           ] ; end deny case
           [else
-           (define outcome
-             (with-handlers ([exn:fail?
-                              (lambda (e)
-                                (err-outcome f"tool `{name}` raised: {(exn-message e)}")
-                              ) ; end lambda
-                             ]) ; end handlers
-               (define cfg (current-loop-config))
-               (tool-run t input*
-                         (tool-ctx (config-workdir cfg)
-                                   (lambda (e) (bus-publish! (deps-bus d) e))
-                                   cfg
-                         ) ; end tool-ctx
-               ) ; end tool-run
-             ) ; end with-handlers
-           ) ; end define outcome
-           ;; 插件 on-tool-result 钩子：可改写结果。
-           (if host (run-tool-result-hooks host name input* outcome) outcome)
+           (list 'run t input* (eq? (tool-permission-level t) 'read-only))
           ] ; end allow case
         ) ; end cond
        ] ; end not-blocked
      ) ; end cond
     ] ; end else
   ) ; end cond
-) ; end define execute-one-call
+) ; end define preflight-call
+
+;; 执行一个 'run plan（可能在 worker 线程里跑）。异常兜底为 error outcome。
+(define (run-plan t name input* d)
+  (define outcome
+    (with-handlers ([exn:fail?
+                     (lambda (e)
+                       (err-outcome f"tool `{name}` raised: {(exn-message e)}")
+                     ) ; end lambda
+                    ]) ; end handlers
+      (define cfg (current-loop-config))
+      (tool-run t input*
+                (tool-ctx (config-workdir cfg)
+                          (lambda (e) (bus-publish! (deps-bus d) e))
+                          cfg
+                ) ; end tool-ctx
+      ) ; end tool-run
+    ) ; end with-handlers
+  ) ; end define outcome
+  ;; 插件 on-tool-result 钩子：可改写结果。
+  (define host (deps-plugin-host d))
+  (if host (run-tool-result-hooks host name input* outcome) outcome)
+) ; end define run-plan
+
+;; plan 是否无副作用/可并发：已决议的 done，或 read-only 的 run。
+(define (plan-parallel-ok? p)
+  (or (eq? (car p) 'done)
+      (and (eq? (car p) 'run) (cadddr p))
+  ) ; end or
+) ; end define plan-parallel-ok?
+
+(define (execute-calls! calls d)
+  (define bus (deps-bus d))
+  ;; 阶段一：串行预检（交互式权限询问不可并发）。
+  (define plans (for/list ([call (in-list calls)]) (preflight-call call d)))
+  (define n (length calls))
+  (define outcomes (make-vector n #f))
+  (define times (make-vector n 0))
+  ;; 计算一个 plan 的 outcome（含计时），写回下标 i。
+  (define (exec! i call plan)
+    (define t0 (now-ms))
+    (define oc
+      (if (eq? (car plan) 'done)
+          (cadr plan)
+          (run-plan (cadr plan) (tool-use-block-name call) (caddr plan) d)
+      ) ; end if
+    ) ; end define oc
+    (vector-set! outcomes i oc)
+    (vector-set! times i (- (now-ms) t0))
+  ) ; end define exec!
+  ;; tool-start 按原始顺序发布（阶段二前）。
+  (for ([call (in-list calls)]) (bus-publish! bus (evt:tool-start (now-ms) call)))
+  ;; 阶段二：整批 read-only → 并发；否则按序（避免读/写文件竞态）。
+  (cond
+    [(and (> n 1) (andmap plan-parallel-ok? plans))
+     (define ts
+       (for/list ([call (in-list calls)] [plan (in-list plans)] [i (in-naturals)])
+         (thread (lambda () (exec! i call plan)))
+       ) ; end for/list
+     ) ; end define ts
+     (for-each thread-wait ts)
+    ] ; end parallel case
+    [else
+     (for ([call (in-list calls)] [plan (in-list plans)] [i (in-naturals)])
+       (exec! i call plan)
+     ) ; end for
+    ] ; end serial case
+  ) ; end cond
+  ;; 阶段三：按序发布 tool-end 并构造 result blocks。
+  (for/list ([call (in-list calls)] [i (in-naturals)])
+    (define oc (vector-ref outcomes i))
+    (bus-publish! bus (evt:tool-end (now-ms) call oc (vector-ref times i)))
+    (tool-result-block (tool-use-block-id call)
+                       (tool-outcome-content oc)
+                       (tool-outcome-is-error? oc)
+    ) ; end tool-result-block
+  ) ; end for/list
+) ; end define execute-calls!
 
 ;; 工具执行与 provider 都需 config；统一用 model.rkt 的 current-config parameter（run-turn! 每轮设置）。
 (define current-loop-config current-config)

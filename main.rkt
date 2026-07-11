@@ -23,6 +23,7 @@
  (file "src/repl.rkt")
  (file "src/subagent.rkt")
  (file "src/tools/builtin.rkt")
+ (file "src/plugin.rkt")
  (file "src/tui/terminal.rkt")
  (file "src/tui/picker.rkt")
 ) ; end require
@@ -106,9 +107,13 @@
   (define list? (box #f))
   (define fork-at (box #f))
   (define rm-arg (box #f))
+  (define plugin-dirs (box '()))
 
   (command-line
    #:program "pi++"
+   #:multi
+   [("--plugins") dir "load plugins from a directory (repeatable)"
+                  (set-box! plugin-dirs (cons dir (unbox plugin-dirs)))]
    #:once-each
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
@@ -180,12 +185,25 @@
   (define spawn-tool
     (make-spawn-agent-tool #:provider prov #:sub-tools base-tools)
   ) ; end define spawn-tool
+  ;; 插件宿主：与 deps 共享同一 registry，故插件工具直接可被模型调用。
+  (define registry (make-registry (append base-tools (list spawn-tool))))
+  (define host (make-plugin-host #:registry registry))
+  ;; 加载 plugins/（若存在）+ 命令行 --plugins 目录（按给定顺序）。
+  (define default-plugins-dir (build-path project-root "plugins"))
+  (define plugin-load-dirs
+    (append (if (directory-exists? default-plugins-dir) (list default-plugins-dir) '())
+            (reverse (unbox plugin-dirs))))
+  (for ([pd (in-list plugin-load-dirs)])
+    (load-plugins-dir! host pd
+                       #:on-error (lambda (p e) (eprintf "plugin load failed (~a): ~a\n" p e))))
+  (bus-subscribe! bus (make-host-observer host))   ; 观测型钩子分发
   (define d
     (make-deps #:provider prov
-               #:registry (make-registry (append base-tools (list spawn-tool)))
+               #:registry registry
                #:bus bus
                #:policy (make-policy cfg #:store-path perm-store)
                #:asker interactive-asker
+               #:plugin-host host
     ) ; end make-deps
   ) ; end define d
 
@@ -218,7 +236,8 @@
     [else
      (run-repl! d st0 sess
                 #:data-dir (path->string data-dir)
-                #:resumed? (and (unbox resume-path) #t))
+                #:resumed? (and (unbox resume-path) #t)
+                #:plugin-host host)
     ] ; end else
   ) ; end cond
 ) ; end module+ main

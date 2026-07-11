@@ -72,16 +72,14 @@
 ;; ---------------------------------------------------------------- 注册表
 
 (struct registry
-  (table   ; immutable hash: name -> tool
+  (table   ; mutable hash: name -> tool（插件可动态增/覆盖；读 API 不变）
   ) ; end fields
 ) ; end struct registry
 
 (define (make-registry tools)
-  (registry
-   (for/hash ([t (in-list tools)])
-     (values (tool-name t) t)
-   ) ; end for/hash
-  ) ; end registry
+  (define h (make-hash))
+  (for ([t (in-list tools)]) (hash-set! h (tool-name t) t))
+  (registry h)
 ) ; end define make-registry
 
 (define (registry-lookup reg name)
@@ -97,6 +95,10 @@
 (define (registry-tools reg)
   (hash-values (registry-table reg))
 ) ; end define registry-tools
+
+;; 动态增/删（插件注册工具；同名覆盖）
+(define (registry-add! reg t) (hash-set! (registry-table reg) (tool-name t) t))
+(define (registry-remove! reg name) (hash-remove! (registry-table reg) name))
 
 ;; ---------------------------------------------------------------- provide
 
@@ -120,4 +122,6 @@
  registry-lookup
  registry-specs
  registry-tools
+ registry-add!
+ registry-remove!
 ) ; end provide

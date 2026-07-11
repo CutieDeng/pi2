@@ -2,7 +2,7 @@
 ;; echo-tool.rkt — 受信（trusted）示例插件。
 ;; 经 dynamic-require 载入：provide 一个 `plugin` 注册函数，用 SDK 注册一个 gen:tool。
 
-(require (file "../src/plugin.rkt"))
+(require (file "../../src/plugin.rkt"))
 
 (provide plugin)
 

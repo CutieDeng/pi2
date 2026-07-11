@@ -17,6 +17,7 @@
  (file "loop.rkt")
  (file "context.rkt")
  (file "session.rkt")
+ (file "plugin.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
  (file "tui/sanitize.rkt")
@@ -58,9 +59,9 @@
   (if (null? strs) "" (for/fold ([p (car strs)]) ([s (in-list (cdr strs))]) (common-prefix p s)))
 ) ; end define longest-common-prefix
 
-;; Tab 补全：输入处于「/命令名」编辑中时，唯一匹配补全为「/name 」，多匹配补到最长公共前缀。
+;; Tab 补全（对给定命令表）：唯一匹配补全为「/name 」，多匹配补到最长公共前缀。
 ;; 已进入参数区（命令名后有空格）或非 '/' 起头 → 返回 #f（不补全）。
-(define (command-complete text)
+(define (complete-for cmds text)
   (cond
     [(and (positive? (string-length text)) (char=? (string-ref text 0) #\/))
      (define parts (string-split text))
@@ -68,7 +69,7 @@
      (cond
        [(> (string-length text) (string-length tok)) #f]   ; 命令名后已有空格/参数
        [else
-        (define matches (filter (lambda (c) (string-prefix? (car c) tok)) COMMANDS))
+        (define matches (filter (lambda (c) (string-prefix? (car c) tok)) cmds))
         (cond
           [(null? matches) #f]
           [(= (length matches) 1)
@@ -81,21 +82,33 @@
     ] ; end slash
     [else #f]
   ) ; end cond
-) ; end define command-complete
+) ; end define complete-for
+
+(define (command-complete text) (complete-for COMMANDS text))
 
 ;; 当前输入若以 '/' 起头，返回匹配命令的暗色预览行（供 console 实时渲染）。
-(define (command-hint-lines text)
+(define (hint-lines-for cmds text)
   (cond
     [(and (positive? (string-length text)) (char=? (string-ref text 0) #\/))
      (define parts (string-split text))
      (define tok (if (null? parts) "/" (car parts)))
-     (for/list ([c (in-list COMMANDS)] #:when (string-prefix? (car c) tok))
+     (for/list ([c (in-list cmds)] #:when (string-prefix? (car c) tok))
        (dim f"  {(car c)} {(cadr c)}  {(caddr c)}")
      ) ; end for/list
     ] ; end command case
     [else '()]
   ) ; end cond
-) ; end define command-hint-lines
+) ; end define hint-lines-for
+
+(define (command-hint-lines text) (hint-lines-for COMMANDS text))
+
+;; 从插件宿主提取命令表项 (name args desc)，与内置 COMMANDS 合并供 /help、预览、补全。
+(define (plugin-command-specs host)
+  (if host
+      (for/list ([(name spec) (in-hash (host-commands host))])
+        (list name (hash-ref spec 'args "") (hash-ref spec 'desc "(plugin command)")))
+      '())
+) ; end define plugin-command-specs
 
 ;; ---------------------------------------------------------------- 渲染订阅者
 
@@ -224,27 +237,30 @@
 ;; run-repl! : deps agent-state session -> void（返回时会话已持久化）
 ;; data-dir: 会话目录（/resume 选择器与列表用）；resumed?: 是否为恢复启动（渲染预览）
 (define (run-repl! d st0 sess #:banner? [banner? #t]
-                   #:data-dir [data-dir "data"] #:resumed? [resumed? #f])
+                   #:data-dir [data-dir "data"] #:resumed? [resumed? #f]
+                   #:plugin-host [host #f])
   (define bus (deps-bus d))
   (if (terminal-port? (current-input-port))
-      (run-repl/console! d st0 sess bus banner? data-dir resumed?)
-      (run-repl/plain! d st0 sess bus banner? data-dir resumed?)
+      (run-repl/console! d st0 sess bus banner? data-dir resumed? host)
+      (run-repl/plain! d st0 sess bus banner? data-dir resumed? host)
   ) ; end if
 ) ; end define run-repl!
 
 ;; -------- 交互式：异步实时控制台
 
-(define (run-repl/console! d st0 sess bus banner? data-dir resumed?)
+(define (run-repl/console! d st0 sess bus banner? data-dir resumed? host)
   (define term (make-real-terminal))
   (define main-th (current-thread))
+  (define (all-cmds) (append COMMANDS (plugin-command-specs host)))   ; 内置 + 插件命令
   (define con
     (make-console term #:prompt (green "› ")
                   #:interrupt (lambda () (break-thread main-th))  ; Ctrl-C → 取消当前轮
-                  #:hint command-hint-lines                       ; '/' 元命令实时预览
-                  #:complete command-complete)                    ; Tab 补全 '/' 命令
+                  #:hint (lambda (t) (hint-lines-for (all-cmds) t))  ; '/' 预览（含插件命令）
+                  #:complete (lambda (t) (complete-for (all-cmds) t)))  ; Tab 补全（含插件命令）
   ) ; end define con
   (define emit (lambda (s) (console-emit! con s)))
   (define (say s) (emit (string-append s "\n")))
+  (when host (host-set-notify! host (lambda (msg . _) (say (dim msg)))))  ; 插件 ctx.notify
   (define (statusf on?) (console-set-status! con (and on? STATUS-WORKING)))
   (define (tickf n) (console-tick-tokens! con n))
   (define unsub (bus-subscribe! bus (make-renderer emit statusf tickf)))
@@ -279,7 +295,7 @@
            [(string=? (string-trim line) "") (loop st)]
            [(string-prefix? (string-trim line) "/")
             (define-values (st* continue?)
-              (handle-command (string-trim line) st d sess-box say emit data-dir))
+              (handle-command (string-trim line) st d sess-box say emit data-dir host))
             (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
            ] ; end command case
            [else
@@ -322,11 +338,12 @@
 
 ;; -------- 非交互：纯 read-line（管道友好）
 
-(define (run-repl/plain! d st0 sess bus banner? data-dir resumed?)
+(define (run-repl/plain! d st0 sess bus banner? data-dir resumed? host)
   (define emit (lambda (s) (display s) (flush-output)))
   (define (say s) (emit (string-append s "\n")))
   (define unsub (bus-subscribe! bus (make-renderer emit)))
   (define sess-box (box sess))
+  (when host (host-set-notify! host (lambda (msg . _) (say msg))))
   (when banner?
     (say (bold "pi++ — Racket LLM agent"))
     (say (dim f"model: {(config-model (agent-state-config st0))}  |  /help for commands"))
@@ -339,7 +356,7 @@
       [(string=? (string-trim line) "") (loop st)]
       [(string-prefix? (string-trim line) "/")
        (define-values (st* continue?)
-         (handle-command (string-trim line) st d sess-box say emit data-dir))
+         (handle-command (string-trim line) st d sess-box say emit data-dir host))
        (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
       ] ; end command case
       [else
@@ -437,9 +454,9 @@
 
 ;; ---------------------------------------------------------------- 斜杠命令
 
-;; handle-command : cmd st d sess-box say emit data-dir -> (values new-state continue?)
-;; sess-box: box of 当前 session（/resume 可切换）；emit: 原样输出（预览用）
-(define (handle-command cmd st d sess-box say emit data-dir)
+;; handle-command : cmd st d sess-box say emit data-dir host -> (values new-state continue?)
+;; sess-box: box of 当前 session（/resume 可切换）；emit: 原样输出（预览用）；host: 插件宿主
+(define (handle-command cmd st d sess-box say emit data-dir host)
   (define parts (string-split cmd))
   (define name (car parts))
   (define args (cdr parts))
@@ -450,6 +467,8 @@
      (for ([c (in-list COMMANDS)])
        (say (dim f"  {(car c)} {(cadr c)}  {(caddr c)}"))
      ) ; end for
+     (for ([c (in-list (plugin-command-specs host))])   ; 插件命令
+       (say (dim f"  {(car c)} {(cadr c)}  {(caddr c)}")))
      (values st #t)
     ] ; end help case
     [("/clear")
@@ -540,8 +559,21 @@
      ) ; end cond
     ] ; end model case
     [else
-     (say (red f"unknown command: {name} (try /help)"))
-     (values st #t)
+     ;; 插件命令：宿主里查到则用其 handler 执行（传 plugin-ctx）。
+     (define spec (and host (host-command host name)))
+     (cond
+       [spec
+        (define handler (hash-ref spec 'handler #f))
+        (when (procedure? handler)
+          (with-handlers ([exn:fail? (lambda (e) (say (red f"plugin command failed: {(exn-message e)}")))])
+            (handler args (make-ctx host))))
+        (values st #t)
+       ] ; end plugin command
+       [else
+        (say (red f"unknown command: {name} (try /help)"))
+        (values st #t)
+       ] ; end unknown
+     ) ; end cond
     ] ; end else
   ) ; end case
 ) ; end define handle-command

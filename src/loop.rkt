@@ -11,6 +11,7 @@
  (file "tool.rkt")
  (file "permission.rkt")
  (file "context.rkt")
+ (file "plugin.rkt")
 ) ; end require
 
 ;; 依赖包：一次装配，处处传递
@@ -22,13 +23,15 @@
    asker        ; (-> string (or/c 'yes 'no 'always))
    est-cache    ; context 估算 memo
    pre-tool-hook ; (-> tool-use-block (or/c #f string)) — #f 放行，字符串=拦截原因
+   plugin-host  ; (or/c #f plugin-host) — 插件变换型钩子（tool-call/result/before-turn/context）
   ) ; end fields
 ) ; end struct deps
 
 (define (make-deps #:provider p #:registry reg #:bus bus
                    #:policy policy #:asker [asker (lambda (_q) 'no)]
-                   #:pre-tool-hook [pre-tool-hook (lambda (_b) #f)])
-  (deps p reg bus policy asker (make-estimate-cache) pre-tool-hook)
+                   #:pre-tool-hook [pre-tool-hook (lambda (_b) #f)]
+                   #:plugin-host [plugin-host #f])
+  (deps p reg bus policy asker (make-estimate-cache) pre-tool-hook plugin-host)
 ) ; end define make-deps
 
 ;; ------------------------------------------------- 流收集：单点消费双路分发
@@ -98,31 +101,45 @@
         ) ; end lambda
     ] ; end hook-block case
     [else
-     (define perm (permission-check (deps-policy d) t input (deps-asker d)))
+     ;; 插件 on-tool-call 钩子：可拦截或改写参数。
+     (define host (deps-plugin-host d))
+     (define-values (decision input*)
+       (if host (run-tool-call-hooks host name input) (values 'allow input)))
      (cond
-       [(not (eq? perm 'allow))
-        ;; 拒绝：把用户理由（若有）回传给模型，强调不要重试、据此调整。
-        (define reason (and (pair? perm) (cdr perm)))
-        (err-outcome
-         (if reason
-             f"User denied permission for tool `{name}`. The user's reason: {reason}. Respect this — do not retry the same call; adjust your approach accordingly (or ask the user how to proceed)."
-             f"User denied permission for tool `{name}`. Do not retry the same call; consider a different approach or ask the user how to proceed."))
-       ] ; end deny case
+       [(pair? decision)                          ; (cons 'deny reason) 插件拦截
+        (err-outcome f"tool `{name}` blocked by plugin: {(cdr decision)}")]
        [else
-        (with-handlers ([exn:fail?
-                         (lambda (e)
-                           (err-outcome f"tool `{name}` raised: {(exn-message e)}")
-                         ) ; end lambda
-                        ]) ; end handlers
-          (define cfg (current-loop-config))
-          (tool-run t input
-                    (tool-ctx (config-workdir cfg)
-                              (lambda (e) (bus-publish! (deps-bus d) e))
-                              cfg
-                    ) ; end tool-ctx
-          ) ; end tool-run
-        ) ; end with-handlers
-       ] ; end allow case
+        (define perm (permission-check (deps-policy d) t input* (deps-asker d)))
+        (cond
+          [(not (eq? perm 'allow))
+           ;; 拒绝：把用户理由（若有）回传给模型，强调不要重试、据此调整。
+           (define reason (and (pair? perm) (cdr perm)))
+           (err-outcome
+            (if reason
+                f"User denied permission for tool `{name}`. The user's reason: {reason}. Respect this — do not retry the same call; adjust your approach accordingly (or ask the user how to proceed)."
+                f"User denied permission for tool `{name}`. Do not retry the same call; consider a different approach or ask the user how to proceed."))
+          ] ; end deny case
+          [else
+           (define outcome
+             (with-handlers ([exn:fail?
+                              (lambda (e)
+                                (err-outcome f"tool `{name}` raised: {(exn-message e)}")
+                              ) ; end lambda
+                             ]) ; end handlers
+               (define cfg (current-loop-config))
+               (tool-run t input*
+                         (tool-ctx (config-workdir cfg)
+                                   (lambda (e) (bus-publish! (deps-bus d) e))
+                                   cfg
+                         ) ; end tool-ctx
+               ) ; end tool-run
+             ) ; end with-handlers
+           ) ; end define outcome
+           ;; 插件 on-tool-result 钩子：可改写结果。
+           (if host (run-tool-result-hooks host name input* outcome) outcome)
+          ] ; end allow case
+        ) ; end cond
+       ] ; end not-blocked
      ) ; end cond
     ] ; end else
   ) ; end cond
@@ -155,14 +172,24 @@
 ;; 返回新 agent-state。
 (define (run-turn! st user-msg d)
   (define cfg (agent-state-config st))
+  (define host (deps-plugin-host d))
+  (when host (host-set-session! host st))         ; 供插件 ctx.session 读取
   ;; 级别3：历史远超预算时先永久压缩（context-fit 只做透传/中段淘汰）
   (define st-c (maybe-compact st d))
+  ;; 插件 before-turn 钩子：在 user-msg 后注入上下文消息。
+  (define st-injected
+    (if host
+        (for/fold ([s (state-append st-c user-msg)]) ([m (in-list (run-before-turn-hooks host st-c))])
+          (state-append s m))
+        (state-append st-c user-msg)))
   (parameterize ([current-loop-config cfg])
-    (let step ([st (state-append st-c user-msg)] [ncalls 0])
-      (define window (context-fit (agent-state-history st) cfg
-                                  #:cache (deps-est-cache d)
-                     ) ; end context-fit
-      ) ; end define window
+    (let step ([st st-injected] [ncalls 0])
+      (define window0 (context-fit (agent-state-history st) cfg
+                                   #:cache (deps-est-cache d)
+                      ) ; end context-fit
+      ) ; end define window0
+      ;; 插件 on-context 钩子：改写发送窗口。
+      (define window (if host (run-context-hooks host window0) window0))
       (define-values (asst-msg _stop u) (stream-and-collect! d window))
       (define st*
         (state-add-usage (state-append st asst-msg) u)

@@ -199,11 +199,13 @@
      (define head (take msgs split))
      (define tail (drop msgs split))
      (define summary-text
-       (provider-complete-text p
-         (append head
-                 (list (text-msg 'user COMPACT-PROMPT))
-         ) ; end append
-       ) ; end provider-complete-text
+       (parameterize ([current-config (agent-state-config st)])   ; 用 st 的 config（model 等）
+         (provider-complete-text p
+           (append head
+                   (list (text-msg 'user COMPACT-PROMPT))
+           ) ; end append
+         ) ; end provider-complete-text
+       ) ; end parameterize
      ) ; end define summary-text
      (define summary-msg
        (text-msg 'user f"[compacted context summary]\n{summary-text}")

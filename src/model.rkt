@@ -95,6 +95,10 @@
   ) ; end config
 ) ; end define default-config
 
+;; 当前请求生效的 config：loop/compact 每次调用前 parameterize 之，provider 读取它取
+;; model/endpoint/key（而非创建时闭包的旧 cfg）——故 /model 等运行时切换即时生效。
+(define current-config (make-parameter #f))
+
 ;; ---------------------------------------------------------------- Agent 状态
 
 (struct agent-state
@@ -159,6 +163,7 @@
  usage-add
  (struct-out config)
  default-config
+ current-config
  (struct-out agent-state)
  make-initial-state
  state-append

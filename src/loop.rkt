@@ -145,10 +145,8 @@
   ) ; end cond
 ) ; end define execute-one-call
 
-;; 工具执行需要 config；由 run-turn! 经 parameter 提供，避免层层传参
-(define current-loop-config
-  (make-parameter #f)
-) ; end define current-loop-config
+;; 工具执行与 provider 都需 config；统一用 model.rkt 的 current-config parameter（run-turn! 每轮设置）。
+(define current-loop-config current-config)
 
 ;; 历史估算 > 1.5×预算时触发一次永久压缩，并把压缩事件报到 bus
 (define (maybe-compact st d)

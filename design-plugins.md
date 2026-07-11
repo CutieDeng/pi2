@@ -213,8 +213,10 @@ pi 用 `jiti` 在运行时解释 TS——这是「宿主语言即插件语言」
   `make-simple-provider` 让写供应商只需一个 reply 函数（自动发 delta/message/turn-end）。**`ctx.ui`**——
   `ctx.notify/select/confirm` 经 host 注入接 console（`console-choose!`/emit），`ctx.session` 读当前状态。
   `register-shortcut!` 已存储但**未接 console 键位分发**（需 kev 键谱匹配）——留待。
-  *已知限制*：`provider`/model 的**运行时**切换未生效（内置 provider 创建时闭包 cfg）——需「每请求传
-  cfg」改造，与插件正交，另行修。
+  **运行时切换已修**：新增 `current-config` parameter（`model.rkt`），`run-turn!`/`compact!` 每次调用前
+  `parameterize` 之，内置 provider 改读 `(or (current-config) cfg)`——故 `/model`（及 endpoint/key）
+  运行时切换即时生效（原先 provider 闭包创建 cfg，切换无效）。运行时切换**不同 provider**仍需
+  dispatcher（deps-provider 目前启动时定一次）——单列。
 - **M5 `#lang pi/plugin` DSL + 技能/提示词** ⏳：声明式插件语言、`skills/`/`prompts/` 资源发现。
 
 ---

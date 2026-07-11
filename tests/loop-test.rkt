@@ -205,5 +205,31 @@
   ) ; end check-exn
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 运行时 config 切换生效
+
+(test-case "provider reads the current config per turn (runtime /model switch takes effect)"
+  ;; 记录每轮 provider 看到的 (current-config) 的 model。
+  (define seen (box '()))
+  (define recorder
+    (provider "recorder"
+      (lambda (_msgs _tools)
+        (define ch (make-async-channel))
+        (set-box! seen (cons (config-model (current-config)) (unbox seen)))
+        (thread (lambda ()
+                  (async-channel-put ch (evt:message (now-ms) (text-msg 'assistant "ok")))
+                  (async-channel-put ch (evt:turn-end (now-ms) "stop" (usage 0 0)))))
+        ch)
+      void))
+  (define cfgA (struct-copy config (default-config)
+                            [model "model-A"] [workdir (path->string tmpdir)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider recorder #:registry (make-registry '())
+                       #:bus (make-bus) #:policy (make-policy cfgA)))
+  (define st1 (run-turn! (make-initial-state cfgA) (text-msg 'user "a") d))
+  ;; 切换模型（如 /model）：改 state 的 config
+  (define st1b (struct-copy agent-state st1 [config (struct-copy config cfgA [model "model-B"])]))
+  (define st2 (run-turn! st1b (text-msg 'user "b") d))
+  (check-equal? (reverse (unbox seen)) (list "model-A" "model-B"))   ; 第二轮即用新 model
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "loop-test: all passed")

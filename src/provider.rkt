@@ -227,6 +227,8 @@
    f"openai:{(config-model cfg)}"
    ;; stream!
    (lambda (msgs tool-specs)
+     ;; 每次请求取当前生效的 config（运行时 /model 等切换即时生效）；未设时回退创建 cfg。
+     (define ecfg (or (current-config) cfg))
      (define ch (make-async-channel))
      (define cust (make-custodian))
      (set-box! current-cust cust)
@@ -238,7 +240,7 @@
                              (async-channel-put ch (evt:error (now-ms) e #f))
                            ) ; end lambda
                           ]) ; end handlers
-            (stream-with-retry! cfg msgs tool-specs ch)
+            (stream-with-retry! ecfg msgs tool-specs ch)
           ) ; end with-handlers
         ) ; end lambda
        ) ; end thread

@@ -78,9 +78,48 @@
           'input_schema (jsref fn 'parameters (hasheq 'type "object" 'properties (hasheq))))
 ) ; end define openai-spec->anthropic-tool
 
+;; ------------------------------------------------------------ 提示词缓存（建议①）
+;; Anthropic prompt caching：在稳定前缀上打 cache_control ephemeral 断点，
+;; 命中后该前缀不再重新编码/计费（TTL ~5min）。三处断点（≤4 上限）：
+;;   system（静态）、tools 末块（缓存整段 tools+system）、最后一条消息末块（缓存对话前缀）。
+;; 短于模型最小缓存长度的块会被 API 忽略（不缓存亦不报错），故对小 prompt 安全无副作用。
+;; 因 SUB-SYSTEM + tools 在所有子 agent 间字节一致，同一前缀缓存跨兄弟子 agent 复用（建议④由此自动兑现）。
+(define EPHEMERAL (hasheq 'type "ephemeral"))
+
+;; system 作为带缓存的文本块数组
+(define (system->cached sys)
+  (list (hasheq 'type "text" 'text sys 'cache_control EPHEMERAL))
+) ; end define system->cached
+
+;; tools 末块打 cache_control（缓存 system+tools 静态前缀）
+(define (tools->cached specs)
+  (define tools (map openai-spec->anthropic-tool specs))
+  (if (null? tools)
+      tools
+      (append (drop-right tools 1)
+              (list (hash-set (last tools) 'cache_control EPHEMERAL))))
+) ; end define tools->cached
+
+;; 给消息列表最后一条的最后一个 content block 打 cache_control（缓存对话前缀，助多步复用）
+(define (mark-last-message-cache anth-msgs)
+  (cond
+    [(null? anth-msgs) anth-msgs]
+    [else
+     (define lastm (last anth-msgs))
+     (define content (hash-ref lastm 'content))
+     (define content*
+       (if (string? content)
+           (list (hasheq 'type "text" 'text content 'cache_control EPHEMERAL))
+           (append (drop-right content 1)
+                   (list (hash-set (last content) 'cache_control EPHEMERAL)))))
+     (append (drop-right anth-msgs 1)
+             (list (hash-set lastm 'content content*)))]
+  ) ; end cond
+) ; end define mark-last-message-cache
+
 (define (build-anthropic-body cfg msgs tool-specs)
   (define anth-msgs
-    (filter values (map message->anthropic msgs)))
+    (mark-last-message-cache (filter values (map message->anthropic msgs))))
   (define base
     (hasheq 'model (config-model cfg)
             'max_tokens (config-max-tokens cfg)
@@ -89,10 +128,10 @@
             'stream #t))
   (define with-sys
     (if (config-system-prompt cfg)
-        (hash-set base 'system (config-system-prompt cfg))
+        (hash-set base 'system (system->cached (config-system-prompt cfg)))
         base))
   (if (pair? tool-specs)
-      (hash-set with-sys 'tools (map openai-spec->anthropic-tool tool-specs))
+      (hash-set with-sys 'tools (tools->cached tool-specs))
       with-sys)
 ) ; end define build-anthropic-body
 

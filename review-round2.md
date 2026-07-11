@@ -151,7 +151,7 @@
 | 1 | ✅ **并行工具执行**(已实现) | 1.1 | 高(多工具轮吞吐) | 中 | 串行预检 + 整批 read-only 并发,结果按序归位;见 `loop.rkt` |
 | 2 | ✅ **RPC/JSON 模式**(已实现) | 1.7 | 高(可被编排/IDE 驱动) | 中 | `--rpc` NDJSON,复用 bus/`run-turn!`,零内核改动;见 `rpc.rkt` |
 | 3 | ✅ **多供应商 + 原生 Anthropic**(已实现) | 1.2 | 高 | 高 | lmstudio 默认 + openai/anthropic/gemini/grok 档案;见 `providers.rkt`/`provider-anthropic.rkt` |
-| 3b | thinking / prompt-cache 落地 | 1.2 | 高 | 中 | Anthropic 线路已通,再接 adaptive thinking + cache_control |
+| 3b | ✅ **prompt-cache**(已实现) / thinking(待办) | 1.2 | 高 | 中 | Anthropic `cache_control` 已打(system+tools+末消息断点)+ tools 前缀字节稳定;adaptive thinking 待接 |
 | 4 | **流式工具输出** | 1.5 | 中(长命令实时反馈) | 中(`tool-ctx` 已有 `publish!`,扩 `onUpdate`) | 复用现有 bus |
 | 5 | **会话树/分支导航** | 1.4 | 中(探索式工作流) | 高(`.rktd` 加 `parentId` + 导航 API) | 定位相关,谨慎 |
 | 6 | steering(运行中插话) | 1.1 | 中 | 中 | 需输入线程与 loop 解耦 |

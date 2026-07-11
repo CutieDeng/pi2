@@ -30,6 +30,8 @@
   (sub-provider
    sub-registry
    max-calls
+   sub-max-tokens       ; 子 agent 输出上限（收紧，建议③）
+   sub-context-budget   ; 子 agent 发送窗口预算（收紧，建议③）
   ) ; end fields
   #:methods gen:tool
   [(define (tool-name _t) "spawn_agent")
@@ -53,6 +55,11 @@
           (struct-copy config parent-cfg
                        [system-prompt SUB-SYSTEM]
                        [turn-max-calls (spawn-agent-tool-max-calls t)]
+                       ;; 收紧上下文（建议③）：取与父的较小值，绝不超过父。
+                       [max-tokens (min (config-max-tokens parent-cfg)
+                                        (spawn-agent-tool-sub-max-tokens t))]
+                       [context-budget (min (config-context-budget parent-cfg)
+                                            (spawn-agent-tool-sub-context-budget t))]
                        [permission-mode 'yolo]     ; 子 agent 在受限工具集内自主执行
           ) ; end struct-copy
         ) ; end define sub-cfg
@@ -100,12 +107,15 @@
 ) ; end struct spawn-agent-tool
 
 ;; 构造 spawn_agent 工具。sub-tools 是子 agent 可用的工具列表（会剔除任何 spawn_agent）。
+;; #:max-tokens / #:context-budget 收紧子 agent 上下文（建议③；对父取 min，不超父）。
 (define (make-spawn-agent-tool #:provider provider #:sub-tools sub-tools
-                               #:max-calls [max-calls 12])
+                               #:max-calls [max-calls 12]
+                               #:max-tokens [max-tokens 1024]
+                               #:context-budget [context-budget 4096])
   (define clean-tools
     (filter (lambda (t) (not (string=? (tool-name t) "spawn_agent"))) sub-tools)
   ) ; end define clean-tools
-  (spawn-agent-tool provider (make-registry clean-tools) max-calls)
+  (spawn-agent-tool provider (make-registry clean-tools) max-calls max-tokens context-budget)
 ) ; end define make-spawn-agent-tool
 
 (provide

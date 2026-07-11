@@ -59,6 +59,10 @@ racket main.rkt --rm 3                    # 删除某会话
 - 插件亦可 `register-provider!` 注册自定义供应商，与内置档案共存于同一分发器。
 - 供应商抽象在 `src/providers.rkt`（档案表）+ `src/provider-anthropic.rkt`（原生线路），
   **不侵入**内核 `provider.rkt`（OpenAI 兼容）。
+- **提示词缓存**：Anthropic 线路在 system / tools 末块 / 最后一条消息末块打 `cache_control` ephemeral
+  断点;`registry-specs` 按名排序令 tools 前缀**字节稳定**——多步 / 兄弟子 agent 复用同一缓存前缀，
+  显著降低重复编码与计费（OpenAI 兼容端亦被动受益于稳定前缀）。子 agent 另收紧 `max-tokens`/
+  `context-budget`（对父取 min），每步更省。
 
 ## IDE / 无头模式（RPC）
 

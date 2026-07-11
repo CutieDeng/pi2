@@ -105,11 +105,41 @@
                      (message 'assistant '())))                 ; 空 assistant 应被过滤
   (define spec (function-spec "bash" "run" (hasheq) '()))
   (define body (build-anthropic-body cfg msgs (list spec)))
-  (check-equal? (hash-ref body 'system) "you are helpful")
+  ;; system 现为带缓存断点的文本块数组（建议①）
+  (define sys (hash-ref body 'system))
+  (check-true (list? sys))
+  (check-equal? (hash-ref (car sys) 'text) "you are helpful")
+  (check-equal? (hash-ref (car sys) 'cache_control) (hasheq 'type "ephemeral"))
   (check-equal? (hash-ref body 'model) "claude-sonnet-5")
   (check-true (hash-ref body 'stream))
   (check-equal? (length (hash-ref body 'messages)) 1)          ; 仅 user，空 assistant 滤除
   (check-equal? (length (hash-ref body 'tools)) 1)
+) ; end test-case
+
+(test-case "prompt caching: cache_control on tools tail and last message block (建议①)"
+  (define cfg (struct-copy config (default-config) [system-prompt "sys"]))
+  (define specs (list (function-spec "a" "" (hasheq) '())
+                      (function-spec "b" "" (hasheq) '())))
+  (define body (build-anthropic-body cfg (list (text-msg 'user "hello")) specs))
+  ;; tools 末块打断点（缓存 system+tools 静态前缀）
+  (define tools (hash-ref body 'tools))
+  (check-equal? (hash-ref (last tools) 'cache_control) (hasheq 'type "ephemeral"))
+  (check-false (hash-ref (first tools) 'cache_control #f))     ; 只末块
+  ;; 最后一条消息的末 content block 打断点（缓存对话前缀，助多步复用）
+  (define lastm (last (hash-ref body 'messages)))
+  (define lastblk (last (hash-ref lastm 'content)))
+  (check-equal? (hash-ref lastblk 'text) "hello")
+  (check-equal? (hash-ref lastblk 'cache_control) (hasheq 'type "ephemeral"))
+) ; end test-case
+
+(test-case "registry-specs is name-sorted (byte-stable tools prefix, 建议②)"
+  (define reg (make-registry '()))
+  ;; 乱序插入，输出应按名称升序，稳定可缓存
+  (for ([nm (in-list '("zebra" "alpha" "mid"))])
+    (registry-add! reg (make-simple-tool #:name nm #:desc "" #:run (lambda (_in _ctx) (ok-outcome "x")))))
+  (define names (for/list ([s (in-list (registry-specs reg))])
+                  (hash-ref (hash-ref s 'function) 'name)))
+  (check-equal? names '("alpha" "mid" "zebra"))
 ) ; end test-case
 
 (displayln "providers-test: all passed")

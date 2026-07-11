@@ -86,8 +86,10 @@
   (hash-ref (registry-table reg) name #f)
 ) ; end define registry-lookup
 
+;; 按名称排序输出 specs：使 tools 前缀在每次请求间**字节稳定**（建议②），
+;; 令 Anthropic cache_control 断点与 OpenAI 兼容端的自动前缀缓存都能命中。
 (define (registry-specs reg)
-  (for/list ([t (in-hash-values (registry-table reg))])
+  (for/list ([t (in-list (sort (hash-values (registry-table reg)) string<? #:key tool-name))])
     (tool-spec t)
   ) ; end for/list
 ) ; end define registry-specs

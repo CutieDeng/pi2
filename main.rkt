@@ -108,6 +108,7 @@
   (define fork-at (box #f))
   (define rm-arg (box #f))
   (define plugin-dirs (box '()))
+  (define trust-plugins? (box #f))
 
   (command-line
    #:program "pi++"
@@ -115,6 +116,8 @@
    [("--plugins") dir "load plugins from a directory (repeatable)"
                   (set-box! plugin-dirs (cons dir (unbox plugin-dirs)))]
    #:once-each
+   [("--trust-plugins") "grant all plugin trust/capabilities without prompting (persists)"
+                        (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
@@ -188,6 +191,13 @@
   ;; 插件宿主：与 deps 共享同一 registry，故插件工具直接可被模型调用。
   (define registry (make-registry (append base-tools (list spawn-tool))))
   (define host (make-plugin-host #:registry registry))
+  ;; 能力授权：从 cache/plugin-grants.rktd 恢复已授予项；载入时按信任/能力门询问。
+  (define grants (make-grants (build-path cache-dir "plugin-grants.rktd")))
+  (define plugin-asker
+    (cond
+      [(unbox trust-plugins?) (lambda (_q) 'always)]        ; --trust-plugins：全授予并持久化
+      [(terminal-port? (current-input-port)) tty-asker]     ; 交互：y/n/a 询问
+      [else (lambda (_q) 'no)]))                            ; 非交互：默认拒绝（保守）
   ;; 加载 plugins/（若存在）+ 命令行 --plugins 目录（按给定顺序）。
   (define default-plugins-dir (build-path project-root "plugins"))
   (define plugin-load-dirs
@@ -195,6 +205,7 @@
             (reverse (unbox plugin-dirs))))
   (for ([pd (in-list plugin-load-dirs)])
     (load-plugins-dir! host pd
+                       #:grants grants #:asker plugin-asker
                        #:on-error (lambda (p e) (eprintf "plugin load failed (~a): ~a\n" p e))))
   (bus-subscribe! bus (make-host-observer host))   ; 观测型钩子分发
   (define d

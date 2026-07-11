@@ -174,5 +174,66 @@
   (check-not-false (member "[injected-ctx]" (map message-text (state-history-list st))))
 ) ; end test-case
 
+;; ---------------------------------------------------------------- 能力授权（M3+）
+
+(test-case "read-plugin-caps reads the sidecar .rktd"
+  (check-equal? (read-plugin-caps (plug "writer-sandbox.rkt")) '(fs-write))
+  (check-equal? (read-plugin-caps (plug "echo-tool.rkt")) '())    ; 无旁置清单
+) ; end test-case
+
+(test-case "sandbox fs-write is denied by default, allowed when the capability is granted"
+  (define wdir (make-temporary-file "pi2-caps-~a" 'directory))
+  (parameterize ([current-directory wdir])
+    (define target (path->string (build-path wdir "out.txt")))
+    ;; 未授予 fs-write：沙箱拒写
+    (define h1 (make-plugin-host))
+    (load-plugin-sandbox! h1 (plug "writer-sandbox.rkt"))          ; #:caps '()
+    (define o1 (tool-run (host-lookup h1 "writer") (hasheq 'path target 'text "x") DUMMY-CTX))
+    (check-true (tool-outcome-is-error? o1))
+    (check-false (file-exists? target))
+    ;; 授予 fs-write：可写
+    (define h2 (make-plugin-host))
+    (load-plugin-sandbox! h2 (plug "writer-sandbox.rkt") #:caps '(fs-write))
+    (define o2 (tool-run (host-lookup h2 "writer") (hasheq 'path target 'text "hi") DUMMY-CTX))
+    (check-false (tool-outcome-is-error? o2))
+    (check-true (file-exists? target)))
+  (delete-directory/files wdir)
+) ; end test-case
+
+(test-case "grants persist (always) and reload from the .rktd store"
+  (define store (make-temporary-file "pi2-grants-~a.rktd"))
+  (delete-file store)
+  (define g (make-grants store))
+  (check-false (grants-has? g "p" 'trust))
+  (grants-add! g "p" 'trust)                        ; 持久化
+  (grants-add! g "p" 'network #:persist? #f)        ; 仅本次
+  (define g2 (make-grants store))                   ; 重载
+  (check-true (grants-has? g2 "p" 'trust))          ; always 项恢复
+  (check-false (grants-has? g2 "p" 'network))       ; 一次性项不恢复
+  (delete-file store)
+) ; end test-case
+
+(test-case "trust gate: deny → not loaded; always → loaded and persisted"
+  (define host (make-plugin-host))
+  (define store (make-temporary-file "pi2-grants-~a.rktd"))
+  (delete-file store)
+  (define g (make-grants store))
+  (check-false (gated-load-trusted! host (plug "echo-tool.rkt") g (lambda (_q) 'no)))
+  (check-false (host-lookup host "echo"))           ; 拒绝 → 未加载
+  (gated-load-trusted! host (plug "echo-tool.rkt") g (lambda (_q) 'always))
+  (check-true (tool? (host-lookup host "echo")))
+  (check-true (grants-has? (make-grants store) "echo-tool" 'trust))   ; 已持久化
+  (delete-file store)
+) ; end test-case
+
+(test-case "gated-load-sandbox! prompts per declared capability"
+  (define asked (box '()))
+  (define host (make-plugin-host))
+  (gated-load-sandbox! host (plug "writer-sandbox.rkt") (make-grants)
+                       (lambda (q) (set-box! asked (cons q (unbox asked))) 'no))
+  (check-equal? (length (unbox asked)) 1)           ; 声明 1 项能力 → 询问 1 次
+  (check-true (tool? (host-lookup host "writer")))   ; 仍加载（能力被拒→沙箱限制）
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "plugin-test: all passed")

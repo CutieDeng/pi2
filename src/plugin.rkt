@@ -15,8 +15,10 @@
 
 (require
  racket/sandbox
+ racket/path
  (file "model.rkt")
  (file "tool.rkt")
+ (file "rktd.rkt")
 ) ; end require
 
 ;; ------------------------------------------------------------ 插件 SDK（供插件构造工具）
@@ -35,6 +37,51 @@
                           #:level [level 'read-only] #:params [params (hasheq)])
   (simple-tool name desc level params run)
 ) ; end define make-simple-tool
+
+;; ------------------------------------------------------------ 能力授权（grants）
+
+;; 持久化的能力授权集合。key = "name|cap"（cap: 'trust 或能力符号 fs-write/network/exec）。
+;; 复用 pi2 权限体系语义：yes=本次、always=持久、no=拒绝。
+(struct grants (set path) #:transparent)   ; set: mutable hash; path: .rktd store 或 #f
+
+(define (grant-key name cap) (format "~a|~a" name cap))
+
+(define (make-grants [path #f])
+  (define s (make-hash))
+  (when (and path (file-exists? path))
+    (with-handlers ([exn:fail? (lambda (_e) (void))])
+      (for ([d (in-datum-log path)]
+            #:when (and (pair? d) (eq? (car d) 'grant) (>= (length d) 3)))
+        (hash-set! s (grant-key (cadr d) (caddr d)) #t))))
+  (grants s path)
+) ; end define make-grants
+
+(define (grants-has? g name cap) (hash-ref (grants-set g) (grant-key name cap) #f))
+
+(define (grants-add! g name cap #:persist? [persist? #t])
+  (hash-set! (grants-set g) (grant-key name cap) #t)
+  (when (and persist? (grants-path g))
+    (define lg (datum-log-open! (grants-path g)))
+    (datum-log-append! lg (list 'grant name cap))
+    (datum-log-close! lg))
+) ; end define grants-add!
+
+;; 沙箱插件的声明式能力：旁置 <base>.rktd 内 (caps fs-write network …)。安全读取（不执行代码）。
+(define (read-plugin-caps path)
+  (define sidecar (path-replace-extension (string->path (path->string* path)) #".rktd"))
+  (if (file-exists? sidecar)
+      (with-handlers ([exn:fail? (lambda (_e) '())])
+        (define d (datum-log-first sidecar))
+        (if (and (pair? d) (eq? (car d) 'caps)) (cdr d) '()))
+      '())
+) ; end define read-plugin-caps
+
+;; 能力 → 沙箱 path-permissions。默认只读 cwd+插件目录；fs-write 加写 cwd；fs-read 加读根。
+(define (caps->path-permissions granted cwd pdir)
+  (append (list (list 'read cwd) (list 'read pdir))
+          (if (memq 'fs-write granted) (list (list 'write cwd)) '())
+          (if (memq 'fs-read granted) (list (list 'read (bytes->path #"/"))) '()))
+) ; end define caps->path-permissions
 
 ;; ------------------------------------------------------------ 钩子结果
 
@@ -182,7 +229,8 @@
 (define (load-plugin-sandbox! host path
                               #:name [name (path->plugin-name path)]
                               #:memory-mb [memory-mb 64]
-                              #:eval-limits [eval-limits (list 3 20)])
+                              #:eval-limits [eval-limits (list 3 20)]
+                              #:caps [caps '()])      ; 已授予的能力（放开对应沙箱权限）
   (define cust (make-custodian))
   (define lp (loaded-plugin name 'sandbox cust '() '()))
   (define abs (path->complete-path (string->path (path->string* path))))
@@ -191,8 +239,8 @@
     (parameterize ([current-custodian cust]
                    [sandbox-memory-limit memory-mb]
                    [sandbox-eval-limits eval-limits]
-                   [sandbox-path-permissions (list (list 'read (current-directory))
-                                                   (list 'read pdir))])
+                   ;; 默认仅可读工作区与插件目录；按授予能力放开写/读根（未授予者沙箱硬拒）。
+                   [sandbox-path-permissions (caps->path-permissions caps (current-directory) pdir)])
       (make-module-evaluator abs)))
   (define manifest (ev 'manifest))
   (define tname (cadr manifest))
@@ -241,13 +289,47 @@
   (if (regexp-match? #rx"-sandbox\\.rkt$" (path->string* path)) 'sandbox 'trusted)
 ) ; end define plugin-kind-of
 
-;; 载入一个目录下的全部插件，返回 host。载入失败的插件记录到 errors。
-(define (load-plugins-dir! host dir #:on-error [on-error void])
+;; 受信插件加载（带信任门）：已授予或无门 → 直载；否则经 asker 询问信任（yes/always/no）。
+;; asker : (-> string (or/c 'yes 'always 'no))。返回 lp 或 #f（被拒绝跳过）。
+(define (gated-load-trusted! host f g asker)
+  (define name (path->plugin-name f))
+  (cond
+    [(or (not g) (not asker)) (load-plugin-trusted! host f)]
+    [(grants-has? g name 'trust) (load-plugin-trusted! host f)]
+    [else
+     (case (asker f"Trust plugin `{name}` — it will run with FULL access?")
+       [(always) (grants-add! g name 'trust) (load-plugin-trusted! host f)]
+       [(yes) (load-plugin-trusted! host f)]
+       [else #f])]              ; 拒绝：不加载
+  ) ; end cond
+) ; end define gated-load-trusted!
+
+;; 沙箱插件加载（带能力门）：读声明能力，逐项授权，以已授予能力集载入。
+(define (gated-load-sandbox! host f g asker)
+  (define name (path->plugin-name f))
+  (define caps (read-plugin-caps f))
+  (define granted
+    (cond
+      [(null? caps) '()]                                  ; 无能力需求 → 默认安全加载
+      [(or (not g) (not asker)) caps]                     ; 无门 → 全给
+      [else
+       (filter (lambda (cap)
+                 (or (grants-has? g name cap)
+                     (case (asker f"Grant capability `{cap}` to sandbox plugin `{name}`?")
+                       [(always) (grants-add! g name cap) #t]
+                       [(yes) #t]
+                       [else #f])))
+               caps)]))
+  (load-plugin-sandbox! host f #:caps granted)
+) ; end define gated-load-sandbox!
+
+;; 载入一个目录下的全部插件，返回 host。给 #:grants + #:asker 则启用信任/能力授权门。
+(define (load-plugins-dir! host dir #:on-error [on-error void] #:grants [g #f] #:asker [asker #f])
   (for ([f (in-list (discover-plugin-files dir))])
     (with-handlers ([exn:fail? (lambda (e) (on-error (path->string f) (exn-message e)))])
       (case (plugin-kind-of f)
-        [(sandbox) (load-plugin-sandbox! host f)]
-        [else (load-plugin-trusted! host f)])))
+        [(sandbox) (gated-load-sandbox! host f g asker)]
+        [else (gated-load-trusted! host f g asker)])))
   host
 ) ; end define load-plugins-dir!
 
@@ -279,5 +361,9 @@
  ;; 加载
  load-plugin-trusted! load-plugin-sandbox! unload-plugin!
  discover-plugin-files plugin-kind-of load-plugins-dir!
+ gated-load-trusted! gated-load-sandbox!
  path->plugin-name
+ ;; 能力授权
+ (struct-out grants) make-grants grants-has? grants-add!
+ read-plugin-caps caps->path-permissions
 ) ; end provide

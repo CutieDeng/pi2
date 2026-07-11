@@ -203,8 +203,11 @@ pi 用 `jiti` 在运行时解释 TS——这是「宿主语言即插件语言」
 - **M3 发现 + 集成 + 命令** ✅：`load-plugins-dir!` 按文件名约定（`*-sandbox.rkt`→sandbox）发现载入；
   `main.rkt` 自动载入 `./plugins/` + `--plugins <dir>`（可重复），host 与 deps 共享 registry、订阅
   observer；插件命令并入 repl（`/help`、实时预览、Tab 补全、分派），`ctx.notify`/`ctx.session` 接通。
-- **M3+ 能力授权** ⏳（未做）：`capabilities` 清单 + 项目信任选框 + 能力授权（复用权限选框）+
-  `plugin-grants.rktd`；按授权放开 `sandbox-path-permissions`/网络守卫。沙箱**载入与限额**已具备。
+- **M3+ 能力授权** ✅：`grants`（`cache/plugin-grants.rktd` 持久化，语义同权限体系 yes/always/no）；
+  受信插件过**信任门**（`gated-load-trusted!`），沙箱插件按旁置 `<base>.rktd` 的 `(caps …)` 声明过
+  **能力门**（`gated-load-sandbox!`）；`--trust-plugins` 一键授予，非交互默认拒绝。已授予能力经
+  `caps->path-permissions` 放开沙箱权限——**`fs-write` 落地并强制**（未授予则沙箱硬拒写）。
+  网络/exec 能力已可声明/授权，其沙箱强制（自定义 security-guard）留待后续。
 - **M4 键位/UI 扩展 + 多供应商** ⏳：`register-shortcut!` 已存储（未接 console 键位）；`ctx.ui`
   富交互（select/widget）与 provider 抽象待做。
 - **M5 `#lang pi/plugin` DSL + 技能/提示词** ⏳：声明式插件语言、`skills/`/`prompts/` 资源发现。
@@ -221,7 +224,12 @@ pi 用 `jiti` 在运行时解释 TS——这是「宿主语言即插件语言」
 钩子运行器；**经 `run-turn!` 端到端**：插件工具被模型调用、`on-tool-call` 拦截/改参、`on-tool-result`
 改结果、`before-turn` 注入——全过。
 
-**真机（pty）验证**：`racket main.rkt --plugins examples/plugins` 下——`/help` 列出插件命令 `/hello`、
-`/hello` 经 `ctx.notify` 显示、模型成功调用插件 `echo` 工具（回显 `pluginworks`）。
+**能力授权测试**：`read-plugin-caps` 读旁置清单；**沙箱 `fs-write` 默认拒、授予后可写**；
+grants `always` 持久化并重载（一次性项不持久）；信任门拒→不加载、`always`→加载并持久；沙箱按声明
+能力逐项询问。
 
-后续按 §7 的 M3+/M4/M5 推进。
+**真机（pty）验证**：① `--plugins examples/plugins`——`/help` 列出 `/hello`、`/hello` 经 `ctx.notify`
+显示、模型成功调用插件 `echo`（回显 `pluginworks`）；② `--plugins … --trust-plugins`——插件静默加载
+（不卡信任提示）、沙箱 `writer`（授予 `fs-write`）经模型调用**真实写入**了文件。
+
+后续按 §7 的 M4/M5 推进（键位/富 UI、多供应商、`#lang pi/plugin` DSL、技能/提示词）。

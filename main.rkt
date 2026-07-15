@@ -33,11 +33,14 @@
  (file "src/tui/picker.rkt")
 ) ; end require
 
-;; 运行时目录锚定到项目根（main.rkt 所在处），与 agent 的目标工作目录无关。
-;; data/  存会话 transcript；cache/  存权限等跨会话缓存。
+;; 运行时目录：resources（skills/prompts/plugins）随包只读，锚定到项目根（main.rkt 所在处）。
+;; 会话/缓存**可写**：默认亦落项目根 data/ cache/，但可用 PI_DATA_HOME / PI_CACHE_HOME 覆盖——
+;; 这样 `racket -l pi2` 从只读安装位（catalog copy）运行时，把可写产物导到用户目录即可。
 (define-runtime-path project-root ".")
-(define data-dir (build-path project-root "data"))
-(define cache-dir (build-path project-root "cache"))
+(define (dir-or default env)
+  (let ([e (getenv env)]) (if (and e (> (string-length e) 0)) (string->path e) default)))
+(define data-dir (dir-or (build-path project-root "data") "PI_DATA_HOME"))
+(define cache-dir (dir-or (build-path project-root "cache") "PI_CACHE_HOME"))
 
 ;; 系统提示词：装配到每次请求的首条 system 消息（provider.rkt 读取 config-system-prompt）。
 ;; 命令行未指定时用此默认值；resume 会沿用存档 config 的 system-prompt。
@@ -200,6 +203,7 @@
     (exit 0))
 
   ;; ---- 解析会话选择：--list / --rm 即时退出；否则解析出待恢复路径（可能 #f=新建）
+  (make-directory* data-dir)                    ; 确保可写会话目录存在（尤其自定义 PI_DATA_HOME）
   (define infos (session-infos data-dir))
   (when (unbox list?) (print-session-table infos) (exit 0))
   (when (unbox rm-arg)

@@ -9,7 +9,32 @@
 - 一个 OpenAI 兼容的 LLM 端点。默认指向本地 LM Studio (`http://localhost:1234/v1`)，
   默认模型 `gemma-4-31b-it@6bit`。
 
-## 运行
+## 安装（raco pkg）
+
+本项目是**单集合包**（collection `pi2`）。在项目目录内安装后，即可从任意目录用 `racket -l pi2` 运行：
+
+```sh
+# 在项目根目录安装（--link 原地链接，改代码即时生效）
+raco pkg install --link
+
+# 运行（等价旧 `racket main.rkt`）；传参用 `--` 分隔 racket 与程序参数
+racket -l pi2                                   # 交互式
+racket -l pi2 -- -p "hello" --mode yolo         # 单次问答
+racket -l pi2 -- --provider deepseek --list-keys
+
+# 安装同时生成 `pi2` 可执行入口（在 racket 的 bin 目录），可直接：
+pi2 --provider deepseek                         # 无需 `--` 分隔
+pi2 -p "reply ok" --mode yolo
+
+# 卸载
+raco pkg remove pi2
+```
+
+- 依赖 `base` + `tstring`（`#lang tstring racket` 语言）；`net`/`racket/sandbox`/`pvector`/`intmap` 由本机增强版 racket 核心提供。
+- 资源（skills/prompts/plugins）随包只读读取；会话/缓存默认落项目根 `data/`、`cache/`，
+  从**只读安装位**运行时用 `PI_DATA_HOME` / `PI_CACHE_HOME`（配合 `PI_CONFIG_HOME`）导到用户可写目录。
+
+## 运行（源码目录内，免安装）
 
 ```sh
 # 交互式会话（当前目录为工作区）
@@ -292,7 +317,8 @@ raco test tests/tui-console-test.rkt   # 也可直接对单个文件跑
 
 ```
 pi2/
-├── main.rkt              入口装配（锚定 data/ 与 cache/）
+├── info.rkt              raco pkg 包定义（collection "pi2" + deps + 启动器）
+├── main.rkt              入口装配（module+ main；racket -l pi2 / pi2 启动）
 ├── run-tests.sh
 ├── src/                  全部源码
 │   ├── model.rkt         核心数据 (prefab)      loop.rkt      agent 主循环

@@ -13,6 +13,7 @@
  (file "provider.rkt")
  (file "provider-anthropic.rkt")
  (file "plugin.rkt")                    ; plugin-host-providers（struct-out 已导出）
+ (file "credentials.rkt")               ; resolve-key（env > 凭据文件）
 ) ; end require
 
 ;; kind: 'openai | 'anthropic（线路格式）
@@ -31,6 +32,10 @@
                      "gemini-2.0-flash" "GEMINI_API_KEY")
    (provider-profile "grok"      'openai    "https://api.x.ai/v1"
                      "grok-4" "XAI_API_KEY")
+   ;; DeepSeek 提供 Anthropic 兼容端点（/anthropic/v1/messages），故走原生 anthropic 线路，
+   ;; 复用 provider-anthropic.rkt 的 x-api-key 鉴权与 SSE 累加器，零新线路代码。
+   (provider-profile "deepseek"  'anthropic "https://api.deepseek.com/anthropic"
+                     "deepseek-chat" "DEEPSEEK_API_KEY")
   ) ; end list
 ) ; end define BUILTIN-PROFILES
 
@@ -65,7 +70,8 @@
   (if p
       (struct-copy config cfg
                    [endpoint (provider-profile-endpoint p)]
-                   [api-key (let ([e (provider-profile-key-env p)]) (and e (getenv e)))]
+                   ;; 密钥解析：env 优先，其次 {config-home}/credentials.rktd（见 credentials.rkt）。
+                   [api-key (let ([e (provider-profile-key-env p)]) (and e (resolve-key e)))]
                    [model (provider-profile-model p)])
       cfg)
 ) ; end define apply-provider-profile

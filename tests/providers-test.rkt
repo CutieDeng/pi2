@@ -20,13 +20,21 @@
 
 ;; ------------------------------------------------------------ 档案注册
 
-(test-case "register-builtin-providers! exposes all five profiles"
+(test-case "register-builtin-providers! exposes all six profiles"
   (define host (make-plugin-host))
   (register-builtin-providers! host)
   (define avail (host-available-providers host))
-  (for ([name (in-list '("lmstudio" "openai" "anthropic" "gemini" "grok"))])
+  (for ([name (in-list '("lmstudio" "openai" "anthropic" "deepseek" "gemini" "grok"))])
     (check-not-false (member name avail) (format "~a 应可选" name)))
   (check-equal? (host-current-provider host) "lmstudio")        ; 默认本地
+) ; end test-case
+
+(test-case "deepseek profile rides the anthropic wire at /anthropic endpoint"
+  (define p (profile-by-name "deepseek"))
+  (check-equal? (provider-profile-kind p) 'anthropic)
+  (check-equal? (provider-profile-endpoint p) "https://api.deepseek.com/anthropic")
+  (check-equal? (provider-profile-model p) "deepseek-chat")
+  (check-equal? (provider-profile-key-env-of "deepseek") "DEEPSEEK_API_KEY")
 ) ; end test-case
 
 (test-case "host-set-provider! switches among builtins; unknown rejected"

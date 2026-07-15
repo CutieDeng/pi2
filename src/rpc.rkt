@@ -36,6 +36,7 @@
  (file "session.rkt")
  (file "plugin.rkt")
  (file "providers.rkt")
+ (file "pricing.rkt")                   ; 记费：估算 token 开销
 ) ; end require
 
 ;; ---------------------------------------------------------------- 事件 → JSON
@@ -43,6 +44,12 @@
 (define (usage->jsexpr u)
   (hasheq 'input (usage-input-tokens u) 'output (usage-output-tokens u))
 ) ; end define usage->jsexpr
+
+;; 估算美元开销 → jsexpr（未知模型 → 'null，客户端据此显示 n/a）。
+(define (cost->jsexpr model u)
+  (define c (estimate-cost model u))
+  (if c c 'null)
+) ; end define cost->jsexpr
 
 (define (tool-use->jsexpr b)
   (hasheq 'id (tool-use-block-id b) 'name (tool-use-block-name b)
@@ -156,7 +163,9 @@
           (bus-drain! (deps-bus d))
           (persist! sess st st*)
           (emit! (hasheq 'type "turn_complete" 'turn (agent-state-turn-count st*)
-                         'usage (usage->jsexpr (agent-state-token-usage st*))))
+                         'usage (usage->jsexpr (agent-state-token-usage st*))
+                         'cost_usd (cost->jsexpr (config-model (agent-state-config st*))
+                                                 (agent-state-token-usage st*))))
           (loop st*)]
          [("set_model")
           (define m (jget req 'model))
@@ -195,7 +204,9 @@
                          'reasoning (symbol->string (current-reasoning-effort))
                          'turn (agent-state-turn-count st)
                          'messages (pvector-length (agent-state-history st))
-                         'usage (usage->jsexpr (agent-state-token-usage st))))
+                         'usage (usage->jsexpr (agent-state-token-usage st))
+                         'cost_usd (cost->jsexpr (config-model c)
+                                                 (agent-state-token-usage st))))
           (loop st)]
          [("history")
           (emit! (hasheq 'type "history" 'messages

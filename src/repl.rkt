@@ -19,6 +19,7 @@
  (file "session.rkt")
  (file "plugin.rkt")
  (file "providers.rkt")
+ (file "pricing.rkt")                         ; 记费：估算 token 开销
  (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
@@ -42,6 +43,7 @@
     ("/quit"    ""     "exit (session saved)")
     ("/clear"   ""     "clear conversation history")
     ("/usage"   ""     "token usage so far")
+    ("/cost"    ""     "estimated USD spend so far")
     ("/compact" ""     "summarize old history to save context")
     ("/history" ""     "message count and roles")
     ("/tail"    "[n]"  "show last n cached output lines (default 20)")
@@ -339,6 +341,7 @@
             (console-set-working! con #f)       ; 停底边进度动画
             (bus-drain! bus)
             (persist-turn! (unbox sess-box) st st*)
+            (let ([ft (turn-footer st st*)]) (when ft (say (dim ft))))
             (loop st*)
            ] ; end else
          ) ; end cond
@@ -386,6 +389,7 @@
        ) ; end define st*
        (bus-drain! bus)
        (persist-turn! (unbox sess-box) st st*)
+       (let ([ft (turn-footer st st*)]) (when ft (say (dim ft))))
        (loop st*)
       ] ; end else
     ) ; end cond
@@ -454,6 +458,23 @@
   ) ; end unless
 ) ; end define persist-turn!
 
+;; 每轮页脚：本轮新增 token 与估算开销（model 已知时）。空增量 → #f（不打印）。
+(define (turn-footer st-before st-after)
+  (define ub (agent-state-token-usage st-before))
+  (define ua (agent-state-token-usage st-after))
+  (define din (- (usage-input-tokens ua) (usage-input-tokens ub)))
+  (define dout (- (usage-output-tokens ua) (usage-output-tokens ub)))
+  (cond
+    [(and (= din 0) (= dout 0)) #f]
+    [else
+     (define model (config-model (agent-state-config st-after)))
+     (define c (estimate-cost model (usage din dout)))
+     (string-append
+      f"↑{(fmt-tok din)} ↓{(fmt-tok dout)} tok"
+      (if c f" · ~{(format-cost c)}" ""))]
+  ) ; end cond
+) ; end define turn-footer
+
 ;; 纯 read-line（\ 结尾续行）
 (define (read-input/plain)
   (let loop ([acc '()])
@@ -494,8 +515,14 @@
     [("/usage")
      (define u (agent-state-token-usage st))
      (say f"tokens — input: {(usage-input-tokens u)}, output: {(usage-output-tokens u)}, turns: {(agent-state-turn-count st)}")
+     (say (dim (cost-line (config-model (agent-state-config st)) u)))
      (values st #t)
     ] ; end usage case
+    [("/cost")
+     (define u (agent-state-token-usage st))
+     (say (cost-line (config-model (agent-state-config st)) u))
+     (values st #t)
+    ] ; end cost case
     [("/compact")
      (say (dim "compacting…"))
      (define st*

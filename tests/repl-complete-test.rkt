@@ -10,7 +10,8 @@
   (check-equal? (command-complete "/mo") "/model ")
   (check-equal? (command-complete "/q") "/quit ")
   (check-equal? (command-complete "/cl") "/clear ")
-  (check-equal? (command-complete "/co") "/compact ")
+  (check-equal? (command-complete "/com") "/compact ")   ; /co 现与 /cost 分歧
+  (check-equal? (command-complete "/cos") "/cost ")
   (check-equal? (command-complete "/he") "/help ")
   (check-equal? (command-complete "/hi") "/history ")
   (check-equal? (command-complete "/t") "/tail ")
@@ -22,7 +23,8 @@
   (check-equal? (command-complete "/r") "/re")   ; /resume、/reasoning 共享 "/re"
   (check-false (command-complete "/re"))    ; /resume vs /reasoning 在此分叉
   (check-false (command-complete "/h"))    ; /help、/history 仅共享 "/h"
-  (check-false (command-complete "/c"))    ; /clear、/compact 仅共享 "/c"
+  (check-false (command-complete "/c"))    ; /clear、/compact、/cost 仅共享 "/c"
+  (check-false (command-complete "/co"))   ; /compact vs /cost 在此分叉
 ) ; end test-case
 
 (test-case "already-complete / args-region / non-command → no completion"

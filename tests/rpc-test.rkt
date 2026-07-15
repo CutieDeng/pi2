@@ -81,6 +81,8 @@
   (check-equal? (hash-ref st 'provider) "lmstudio")
   (check-equal? (hash-ref st 'messages) 2)              ; user + assistant
   (check-equal? (hash-ref (hash-ref st 'usage) 'output) 2)
+  (check-true (real? (hash-ref st 'cost_usd)))          ; 本地 gemma → 0.0（记费字段在场）
+  (check-true (real? (hash-ref (find-type evs "turn_complete") 'cost_usd)))
 ) ; end test-case
 
 ;; ------------------------------------------------------------ 运行时切换

@@ -25,6 +25,7 @@
  (file "src/tools/builtin.rkt")
  (file "src/plugin.rkt")
  (file "src/providers.rkt")
+ (file "src/credentials.rkt")
  (file "src/rpc.rkt")
  (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
@@ -100,7 +101,10 @@
 (module+ main
   (define model (box #f))
   (define endpoint (box #f))
-  (define api-key (getenv "PI_API_KEY"))
+  (define api-key (resolve-key "PI_API_KEY"))     ; env > 凭据文件
+  (define set-key-arg (box #f))
+  (define list-keys? (box #f))
+  (define rm-key-arg (box #f))
   (define resume-path (box #f))
   (define prompt (box #f))
   (define mode (box #f))
@@ -126,7 +130,10 @@
                         (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
-   [("--provider") name "LLM provider (lmstudio | openai | anthropic | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--provider") name "LLM provider (lmstudio | openai | anthropic | deepseek | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--set-key") env-name "store an API key (env var name); value read from stdin, then exit" (set-box! set-key-arg env-name)]
+   [("--list-keys") "list configured provider keys (masked) and exit" (set-box! list-keys? #t)]
+   [("--rm-key") env-name "delete a stored API key and exit" (set-box! rm-key-arg env-name)]
    [("--reasoning") lvl "reasoning effort: off | low | medium | high (default off)" (set-box! reasoning-arg lvl)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
@@ -146,6 +153,36 @@
     (cond
       [(valid-reasoning-effort? lvl) (set-reasoning-effort! lvl)]
       [else (eprintf "invalid --reasoning: ~a (off|low|medium|high)\n" (unbox reasoning-arg)) (exit 1)]))
+
+  ;; ---- 凭据管理（--set-key / --list-keys / --rm-key）：即时执行并退出，不进会话
+  (when (unbox set-key-arg)
+    (define name (unbox set-key-arg))
+    (eprintf "paste value for ~a (input hidden not guaranteed; prefer piping): " name)
+    (define v (read-line))
+    (cond
+      [(or (eof-object? v) (= 0 (string-length (string-trim v))))
+       (eprintf "no value given; aborted\n") (exit 1)]
+      [else
+       (store-key! name (string-trim v))
+       (printf "stored ~a = ~a  (~a)\n" name (mask-key (string-trim v)) (credentials-path))
+       (exit 0)]))
+  (when (unbox rm-key-arg)
+    (if (delete-key! (unbox rm-key-arg))
+        (printf "removed ~a\n" (unbox rm-key-arg))
+        (eprintf "no stored key: ~a\n" (unbox rm-key-arg)))
+    (exit 0))
+  (when (unbox list-keys?)
+    (printf "credentials file: ~a\n" (credentials-path))
+    (for ([p (in-list (builtin-provider-names))])
+      (define env (provider-profile-key-env-of p))
+      (when env
+        (define src (key-source env))
+        (printf "  ~a\t~a\t~a\n" p env
+                (case src
+                  [(env)  "env"]
+                  [(file) (string-append "file " (mask-key (resolve-key env)))]
+                  [else   "— (unset)"]))))
+    (exit 0))
 
   ;; ---- 解析会话选择：--list / --rm 即时退出；否则解析出待恢复路径（可能 #f=新建）
   (define infos (session-infos data-dir))

@@ -101,9 +101,19 @@
         body
     ) ; end if
   ) ; end define body+u
+  ;; 推理强度：非 off 时加 reasoning_effort（OpenAI o 系/gpt-5、Gemini、Grok 均识别；
+  ;; LM Studio 等不识别的端点会忽略未知字段）。
+  (define body+r
+    (let ([eff (current-reasoning-effort)])
+      (if (eq? eff 'off)
+          body+u
+          (hash-set body+u 'reasoning_effort (symbol->string eff))
+      ) ; end if
+    ) ; end let
+  ) ; end define body+r
   (if (pair? tool-specs)
-      (hash-set body+u 'tools tool-specs)
-      body+u
+      (hash-set body+r 'tools tool-specs)
+      body+r
   ) ; end if
 ) ; end define build-request-body
 

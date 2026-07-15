@@ -11,6 +11,7 @@
 ;;       {"type":"prompt","text":"..."}          跑一个用户轮
 ;;       {"type":"set_model","model":"..."}       切模型
 ;;       {"type":"set_provider","name":"..."}     切供应商（内置档案会重写 endpoint/key/model）
+;;       {"type":"set_reasoning","level":"off|low|medium|high"}  设推理强度
 ;;       {"type":"state"}                          查询模型/供应商/轮次/用量
 ;;       {"type":"history"}                        导出当前历史（role/text）
 ;;       {"type":"permission","decision":"yes|no|always|no-reason","reason":"..."}
@@ -177,10 +178,21 @@
             [else
              (emit! (hasheq 'type "ok" 'for "set_provider" 'provider name))
              (loop st)])]
+         [("set_reasoning")
+          (define lvl (jget req 'level))
+          (cond
+            [(and (string? lvl) (valid-reasoning-effort? (string->symbol lvl)))
+             (set-reasoning-effort! (string->symbol lvl))
+             (emit! (hasheq 'type "ok" 'for "set_reasoning" 'level lvl))
+             (loop st)]
+            [else
+             (emit! (hasheq 'type "error" 'message "set_reasoning requires off|low|medium|high"))
+             (loop st)])]
          [("state")
           (define c (agent-state-config st))
           (emit! (hasheq 'type "state" 'model (config-model c)
                          'provider (host-current-provider host)
+                         'reasoning (symbol->string (current-reasoning-effort))
                          'turn (agent-state-turn-count st)
                          'messages (pvector-length (agent-state-history st))
                          'usage (usage->jsexpr (agent-state-token-usage st))))

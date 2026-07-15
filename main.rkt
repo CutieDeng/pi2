@@ -114,6 +114,7 @@
   (define trust-plugins? (box #f))
   (define provider-arg (box #f))
   (define rpc? (box #f))
+  (define reasoning-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -126,6 +127,7 @@
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
    [("--provider") name "LLM provider (lmstudio | openai | anthropic | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--reasoning") lvl "reasoning effort: off | low | medium | high (default off)" (set-box! reasoning-arg lvl)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
    [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
@@ -137,6 +139,13 @@
    [("--mode") md "permission mode: yolo|normal|strict" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
   ) ; end command-line
+
+  ;; ---- 推理强度（全局运行时 box，非 prefab config）：--reasoning 设初值
+  (when (unbox reasoning-arg)
+    (define lvl (string->symbol (unbox reasoning-arg)))
+    (cond
+      [(valid-reasoning-effort? lvl) (set-reasoning-effort! lvl)]
+      [else (eprintf "invalid --reasoning: ~a (off|low|medium|high)\n" (unbox reasoning-arg)) (exit 1)]))
 
   ;; ---- 解析会话选择：--list / --rm 即时退出；否则解析出待恢复路径（可能 #f=新建）
   (define infos (session-infos data-dir))

@@ -49,6 +49,7 @@
     ("/skills"  ""     "list discovered skills")
     ("/prompt"  "[name]" "list or activate a discovered prompt")
     ("/provider" "[name]" "list or switch LLM provider")
+    ("/reasoning" "[level]" "show/set reasoning effort (off|low|medium|high)")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -625,6 +626,20 @@
         (values st #t)]
      ) ; end cond
     ] ; end provider case
+    [("/reasoning")
+     (cond
+       [(null? args)
+        (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high)"))
+        (values st #t)]
+       [(valid-reasoning-effort? (string->symbol (car args)))
+        (set-reasoning-effort! (string->symbol (car args)))
+        (say (dim f"reasoning → {(car args)}"))
+        (values st #t)]
+       [else
+        (say (red f"invalid reasoning: {(car args)} (off|low|medium|high)"))
+        (values st #t)]
+     ) ; end cond
+    ] ; end reasoning case
     [("/model")
      (cond
        [(null? args) (say (red "usage: /model <id>")) (values st #t)]

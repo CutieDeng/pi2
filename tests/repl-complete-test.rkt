@@ -14,10 +14,13 @@
   (check-equal? (command-complete "/he") "/help ")
   (check-equal? (command-complete "/hi") "/history ")
   (check-equal? (command-complete "/t") "/tail ")
-  (check-equal? (command-complete "/r") "/resume ")
+  (check-equal? (command-complete "/res") "/resume ")
+  (check-equal? (command-complete "/rea") "/reasoning ")
 ) ; end test-case
 
-(test-case "ambiguous prefix with no further common prefix does nothing"
+(test-case "ambiguous prefix extends to common prefix, then stops"
+  (check-equal? (command-complete "/r") "/re")   ; /resume、/reasoning 共享 "/re"
+  (check-false (command-complete "/re"))    ; /resume vs /reasoning 在此分叉
   (check-false (command-complete "/h"))    ; /help、/history 仅共享 "/h"
   (check-false (command-complete "/c"))    ; /clear、/compact 仅共享 "/c"
 ) ; end test-case

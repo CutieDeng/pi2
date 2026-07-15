@@ -28,10 +28,18 @@
 
 ;; ---------------------------------------------- 内部 message → Anthropic json
 
-;; assistant：text 块 + tool_use 块。thinking 块发送时略去。
+;; assistant：thinking 块（须首位、带签名回传）+ text 块 + tool_use 块。
+;; 扩展思考 + 工具调用时，Anthropic 要求把带签名的 thinking 块原样回传，否则下一轮 400；
+;; 故只回传**有签名**的 thinking 块（无签名者跳过，避免 API 拒绝）。
 (define (assistant->content m)
   (define blocks (message-blocks m))
   (append
+   (for/list ([b (in-list blocks)] #:when (thinking-block? b)
+              #:when (and (thinking-block-signature b)
+                          (non-empty-string? (thinking-block-signature b))))
+     (hasheq 'type "thinking"
+             'thinking (thinking-block-text b)
+             'signature (thinking-block-signature b)))
    (for/list ([b (in-list blocks)] #:when (text-block? b)
               #:when (non-empty-string? (text-block-text b)))
      (hasheq 'type "text" 'text (text-block-text b)))
@@ -117,6 +125,11 @@
   ) ; end cond
 ) ; end define mark-last-message-cache
 
+;; 推理强度 → 扩展思考 token 预算（Anthropic 最小 1024）。
+(define (effort->budget eff)
+  (case eff [(low) 1024] [(medium) 4096] [(high) 12288] [else 1024])
+) ; end define effort->budget
+
 (define (build-anthropic-body cfg msgs tool-specs)
   (define anth-msgs
     (mark-last-message-cache (filter values (map message->anthropic msgs))))
@@ -126,10 +139,22 @@
             'temperature (config-temperature cfg)
             'messages anth-msgs
             'stream #t))
+  ;; 扩展思考（reasoning_effort → thinking）：需 temperature=1，且 max_tokens 要容纳思考+输出。
+  (define eff (current-reasoning-effort))
+  (define base*
+    (if (eq? eff 'off)
+        base
+        (let ([budget (effort->budget eff)])
+          (hash-set* base
+                     'thinking (hasheq 'type "enabled" 'budget_tokens budget)
+                     'temperature 1
+                     'max_tokens (+ budget (config-max-tokens cfg))))
+    ) ; end if
+  ) ; end define base*
   (define with-sys
     (if (config-system-prompt cfg)
-        (hash-set base 'system (system->cached (config-system-prompt cfg)))
-        base))
+        (hash-set base* 'system (system->cached (config-system-prompt cfg)))
+        base*))
   (if (pair? tool-specs)
       (hash-set with-sys 'tools (tools->cached tool-specs))
       with-sys)
@@ -177,7 +202,9 @@
 (struct au-slot (id name args) #:mutable)   ; args: output-string port
 
 (struct anth-acc
-  (content        ; output-string
+  (content        ; output-string — 正文
+   think          ; output-string — 扩展思考文本
+   sig            ; output-string — 思考块签名（回传用）
    slots          ; hash: index -> au-slot
    stop-reason     ; box
    in-tokens      ; box
@@ -186,7 +213,8 @@
 ) ; end struct anth-acc
 
 (define (make-anth-acc)
-  (anth-acc (open-output-string) (make-hash) (box #f) (box 0) (box 0))
+  (anth-acc (open-output-string) (open-output-string) (open-output-string)
+            (make-hash) (box #f) (box 0) (box 0))
 ) ; end define make-anth-acc
 
 ;; 喂一个 SSE 事件；返回 (listof evt:delta) 供转发渲染。
@@ -220,7 +248,11 @@
        [("thinking_delta")
         (define t (jsref delta 'thinking ""))
         (when (and (string? t) (non-empty-string? t))
+          (write-string t (anth-acc-think acc))            ; 存以回传
           (set! out (list (evt:delta (now-ms) 'thinking t))))]
+       [("signature_delta")
+        (define s (jsref delta 'signature ""))
+        (when (string? s) (write-string s (anth-acc-sig acc)))]   ; 无显示，仅存签名
        [else (void)])]
     [("message_delta")
      (define d (jsref data 'delta (hasheq)))
@@ -234,9 +266,11 @@
   out
 ) ; end define anth-feed!
 
-;; 收尾：拼装 assistant message。tool_use 的 args json 解析为 input。
+;; 收尾：拼装 assistant message。thinking 块（带签名）首位，再 text，再 tool_use。
 (define (anth-finish acc)
   (define text (get-output-string (anth-acc-content acc)))
+  (define think-text (get-output-string (anth-acc-think acc)))
+  (define sig (get-output-string (anth-acc-sig acc)))
   (define tcs
     (for/list ([idx (in-list (sort (hash-keys (anth-acc-slots acc)) <))])
       (define slot (hash-ref (anth-acc-slots acc) idx))
@@ -245,7 +279,12 @@
                       (with-handlers ([exn:fail? (lambda (_e) (hasheq))])
                         (if (string=? args-str "") (hasheq) (string->jsexpr args-str))))))
   (define blocks
-    (append (if (non-empty-string? text) (list (text-block text)) '()) tcs))
+    (append
+     (if (non-empty-string? think-text)
+         (list (thinking-block think-text (and (non-empty-string? sig) sig)))
+         '())
+     (if (non-empty-string? text) (list (text-block text)) '())
+     tcs))
   (values (message 'assistant (if (null? blocks) (list (text-block "")) blocks))
           (or (unbox (anth-acc-stop-reason acc)) "stop")
           (usage (unbox (anth-acc-in-tokens acc)) (unbox (anth-acc-out-tokens acc))))

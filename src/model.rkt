@@ -99,6 +99,15 @@
 ;; model/endpoint/key（而非创建时闭包的旧 cfg）——故 /model 等运行时切换即时生效。
 (define current-config (make-parameter #f))
 
+;; 运行时推理强度：'off | 'low | 'medium | 'high。
+;; **刻意不入 prefab config**（加字段会破坏旧 .rktd 重放，参照 provider 选用的做法），
+;; 用进程级 box——任意线程可读，`/reasoning`、`--reasoning`、RPC set_reasoning 均改它。
+;; provider 每次请求读取：OpenAI 兼容 → reasoning_effort；Anthropic → thinking budget。
+(define reasoning-effort-box (box 'off))
+(define (current-reasoning-effort) (unbox reasoning-effort-box))
+(define (set-reasoning-effort! level) (set-box! reasoning-effort-box level))
+(define (valid-reasoning-effort? v) (and (memq v '(off low medium high)) #t))
+
 ;; ---------------------------------------------------------------- Agent 状态
 
 (struct agent-state
@@ -164,6 +173,7 @@
  (struct-out config)
  default-config
  current-config
+ current-reasoning-effort set-reasoning-effort! valid-reasoning-effort?
  (struct-out agent-state)
  make-initial-state
  state-append

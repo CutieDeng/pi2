@@ -6,9 +6,17 @@
  (file "../src/model.rkt")
  (file "../src/tool.rkt")
  (file "../src/plugin.rkt")
+ (file "../src/provider.rkt")
  (file "../src/providers.rkt")
  (file "../src/provider-anthropic.rkt")
 ) ; end require
+
+;; 临时设推理强度跑 thunk，结束复位 off（全局 box 防跨用例污染）。
+(define (with-effort lvl thunk)
+  (dynamic-wind (lambda () (set-reasoning-effort! lvl))
+                thunk
+                (lambda () (set-reasoning-effort! 'off)))
+) ; end define with-effort
 
 ;; ------------------------------------------------------------ 档案注册
 
@@ -140,6 +148,60 @@
   (define names (for/list ([s (in-list (registry-specs reg))])
                   (hash-ref (hash-ref s 'function) 'name)))
   (check-equal? names '("alpha" "mid" "zebra"))
+) ; end test-case
+
+;; ------------------------------------------------------------ reasoning_effort
+
+(test-case "OpenAI wire: reasoning_effort present only when set"
+  (define cfg (default-config))
+  ;; off（默认）→ 无 reasoning_effort
+  (check-false (hash-ref (build-request-body cfg (list (text-msg 'user "hi")) '()) 'reasoning_effort #f))
+  ;; high → reasoning_effort "high"
+  (with-effort 'high
+    (lambda ()
+      (define body (build-request-body cfg (list (text-msg 'user "hi")) '()))
+      (check-equal? (hash-ref body 'reasoning_effort) "high")))
+  ;; 复位后再次无
+  (check-false (hash-ref (build-request-body cfg (list (text-msg 'user "hi")) '()) 'reasoning_effort #f))
+) ; end test-case
+
+(test-case "Anthropic wire: thinking budget + temperature 1 + bumped max_tokens when set"
+  (define cfg (struct-copy config (default-config) [max-tokens 4096] [temperature 0.7]))
+  ;; off → 无 thinking，temperature 原样
+  (define off-body (build-anthropic-body cfg (list (text-msg 'user "hi")) '()))
+  (check-false (hash-ref off-body 'thinking #f))
+  (check-equal? (hash-ref off-body 'temperature) 0.7)
+  ;; medium → thinking budget 4096，temperature=1，max_tokens=budget+4096
+  (with-effort 'medium
+    (lambda ()
+      (define body (build-anthropic-body cfg (list (text-msg 'user "hi")) '()))
+      (check-equal? (hash-ref (hash-ref body 'thinking) 'type) "enabled")
+      (check-equal? (hash-ref (hash-ref body 'thinking) 'budget_tokens) 4096)
+      (check-equal? (hash-ref body 'temperature) 1)
+      (check-equal? (hash-ref body 'max_tokens) (+ 4096 4096))))
+) ; end test-case
+
+(test-case "Anthropic thinking round-trip: signed thinking block sent first; unsigned skipped"
+  ;; 带签名 → 回传为 type:thinking，居首
+  (define signed (message 'assistant (list (thinking-block "let me think" "sig-abc")
+                                           (text-block "answer"))))
+  (define a (message->anthropic signed))
+  (define content (hash-ref a 'content))
+  (check-equal? (hash-ref (first content) 'type) "thinking")
+  (check-equal? (hash-ref (first content) 'signature) "sig-abc")
+  (check-equal? (hash-ref (second content) 'type) "text")
+  ;; 无签名 → 跳过（避免 Anthropic 400）
+  (define unsigned (message 'assistant (list (thinking-block "no sig" #f)
+                                             (text-block "answer"))))
+  (define b (message->anthropic unsigned))
+  (check-equal? (length (hash-ref b 'content)) 1)
+  (check-equal? (hash-ref (first (hash-ref b 'content)) 'type) "text")
+) ; end test-case
+
+(test-case "valid-reasoning-effort? guards levels"
+  (for ([v (in-list '(off low medium high))]) (check-true (valid-reasoning-effort? v)))
+  (check-false (valid-reasoning-effort? 'extreme))
+  (check-false (valid-reasoning-effort? "high"))       ; 需符号
 ) ; end test-case
 
 (displayln "providers-test: all passed")

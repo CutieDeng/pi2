@@ -157,5 +157,14 @@
   (check-false (hash-ref te 'is_error))                    ; echo 成功
 ) ; end test-case
 
+(test-case "set_reasoning updates global effort; state reflects it"
+  (define evs (drive (list (hasheq 'type "set_reasoning" 'level "high")
+                           (hasheq 'type "state")
+                           (hasheq 'type "shutdown"))))
+  (check-equal? (hash-ref (find-type evs "ok") 'for) "set_reasoning")
+  (check-equal? (hash-ref (find-type evs "state") 'reasoning) "high")
+  (set-reasoning-effort! 'off)                 ; 复位，防污染同文件其它用例
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "rpc-test: all passed")

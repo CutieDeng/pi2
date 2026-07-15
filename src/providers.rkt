@@ -47,6 +47,34 @@
 
 (define (builtin-provider-names) (map provider-profile-name BUILTIN-PROFILES))
 
+;; ---------------------------------------------------------------- 供应商实例
+;; 实例名形如 "deepseek[work]"：同一 provider 挂多套 token，视作不同实例。
+;; 无方括号 → 标签 "default"。base 决定线路/端点/默认模型；label 决定用哪套 token。
+
+;; "deepseek[work]" → (values "deepseek" "work")；"deepseek" → (values "deepseek" "default")
+(define (parse-instance name)
+  (define m (regexp-match #rx"^([^][]+)\\[([^][]*)\\]$" name))
+  (if m
+      (values (cadr m) (let ([l (caddr m)]) (if (string=? l "") "default" l)))
+      (values name "default"))
+) ; end define parse-instance
+
+(define (instance-base name) (let-values ([(b _l) (parse-instance name)]) b))
+
+;; 规范显示名：default 标签隐去 → "deepseek"；否则 "deepseek[work]"。
+(define (instance-display base label)
+  (if (string=? label "default") base (string-append base "[" label "]"))
+) ; end define instance-display
+
+;; base 是否内置档案名（实例名亦可，取其 base 判定）。
+(define (builtin-provider-instance? name) (builtin-provider-name? (instance-base name)))
+
+;; 解析某实例的 token：实例文件密钥优先；无则 default 标签回退 profile 的 env 变量；再无 → #f。
+(define (resolve-provider-token base label)
+  (or (resolve-instance-key base label)
+      (and (string=? label "default")
+           (let ([env (provider-profile-key-env-of base)]) (and env (resolve-key env))))))
+
 ;; profile → (config → provider)：线路格式按 kind 选，读 current-config 取 live 值。
 (define (profile->factory p)
   (case (provider-profile-kind p)
@@ -63,15 +91,16 @@
                (profile->factory p)))
 ) ; end define register-builtin-providers!
 
-;; 切到某内置档案：把 endpoint/api-key(从 env)/model 写进 cfg。未知名 → 原样返回。
-;; 密钥缺失时 api-key 为 #f（云端将 401；调用方可据 profile-key-env 提示）。
+;; 切到某内置档案/实例：把 endpoint/api-key/model 写进 cfg。未知名 → 原样返回。
+;; name 可为实例名（"deepseek[work]"）：base 定端点/模型，label 定用哪套 token。
+;; 密钥解析：实例文件密钥 > (default) env > #f（缺失时云端将 401；调用方可据 key-env 提示）。
 (define (apply-provider-profile cfg name)
-  (define p (profile-by-name name))
+  (define-values (base label) (parse-instance name))
+  (define p (profile-by-name base))
   (if p
       (struct-copy config cfg
                    [endpoint (provider-profile-endpoint p)]
-                   ;; 密钥解析：env 优先，其次 {config-home}/credentials.rktd（见 credentials.rkt）。
-                   [api-key (let ([e (provider-profile-key-env p)]) (and e (resolve-key e)))]
+                   [api-key (resolve-provider-token base label)]
                    [model (provider-profile-model p)])
       cfg)
 ) ; end define apply-provider-profile
@@ -91,4 +120,9 @@
  register-builtin-providers!
  apply-provider-profile
  provider-profile-key-env-of
+ parse-instance
+ instance-base
+ instance-display
+ builtin-provider-instance?
+ resolve-provider-token
 ) ; end provide

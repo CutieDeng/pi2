@@ -151,15 +151,21 @@
 (define (host-shortcut h key) (hash-ref (plugin-host-shortcuts h) key #f))
 (define (host-hooks h event) (reverse (hash-ref (plugin-host-hooks h) event '())))
 (define (host-plugins h) (unbox (plugin-host-plugins h)))
+;; 供应商实例名 "base[label]" → base（无方括号则原样）。供 provider 选用/分发按 base 解析工厂，
+;; 而 label 只影响用哪套 token（token 装进 config 由上层 apply-provider-profile 处理）。
+;; 此处仅做纯字符串剥离，避免依赖 providers.rkt（保持内核层次）。
+(define (provider-base-name name)
+  (define m (regexp-match #rx"^([^][]+)\\[" name))
+  (if m (cadr m) name))
 ;; provider 工厂：返回 (config→provider) 或 #f；"lmstudio" 未注册时由宿主回退到内置 openai 兼容。
-(define (host-provider h name) (hash-ref (plugin-host-providers h) name #f))
+(define (host-provider h name) (hash-ref (plugin-host-providers h) (provider-base-name name) #f))
 (define (host-provider-names h) (hash-keys (plugin-host-providers h)))
 ;; 可选 provider = 默认本地 lmstudio + 注册的内置/插件供应商（去重）
 (define (host-available-providers h) (remove-duplicates (cons "lmstudio" (host-provider-names h))))
 (define (host-current-provider h) (unbox (plugin-host-provider-sel h)))
-;; 校验并切换当前 provider；未知名返回 #f（不改）。
+;; 校验并切换当前 provider；未知名返回 #f（不改）。实例名按 base 校验。
 (define (host-set-provider! h name)
-  (and (member name (host-available-providers h))
+  (and (member (provider-base-name name) (host-available-providers h))
        (begin (set-box! (plugin-host-provider-sel h) name) #t)))
 
 ;; 分发 provider：每次请求按 host 当前选用名解析真实 provider（惰性构建 + 缓存），委派其
@@ -435,7 +441,7 @@
  (struct-out plugin-host) (struct-out loaded-plugin) (struct-out plugin-api) (struct-out plugin-ctx)
  make-plugin-host host-registry host-tools host-lookup host-commands host-command
  host-shortcut host-hooks host-plugins host-provider host-provider-names
- host-available-providers host-current-provider host-set-provider! make-dispatch-provider
+ host-available-providers host-current-provider host-set-provider! make-dispatch-provider provider-base-name
  host-skills host-prompts host-set-skills! host-set-prompts!
  host-set-notify! host-set-session! host-set-select! host-set-confirm! make-ctx
  make-plugin-api

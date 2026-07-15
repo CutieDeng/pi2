@@ -3,13 +3,18 @@
 
 (require
  rackunit
+ racket/file
  (file "../src/model.rkt")
  (file "../src/tool.rkt")
  (file "../src/plugin.rkt")
  (file "../src/provider.rkt")
  (file "../src/providers.rkt")
+ (file "../src/credentials.rkt")
  (file "../src/provider-anthropic.rkt")
 ) ; end require
+
+;; 隔离凭据目录，避免读到真实 ~/.config/pi++（保证 missing-key 用例确定）。
+(putenv "PI_CONFIG_HOME" (path->string (make-temporary-file "pi2-provtest-~a" 'directory)))
 
 ;; 临时设推理强度跑 thunk，结束复位 off（全局 box 防跨用例污染）。
 (define (with-effort lvl thunk)
@@ -71,6 +76,51 @@
   (check-false (builtin-provider-name? "echollm"))
   (check-false (provider-profile-key-env-of "lmstudio"))
   (check-equal? (provider-profile-key-env-of "anthropic") "ANTHROPIC_API_KEY")
+) ; end test-case
+
+;; ------------------------------------------------------------ 供应商实例（多 token）
+
+(test-case "parse-instance splits base[label]; default label"
+  (define-values (b1 l1) (parse-instance "deepseek[work]"))
+  (check-equal? b1 "deepseek") (check-equal? l1 "work")
+  (define-values (b2 l2) (parse-instance "deepseek"))
+  (check-equal? b2 "deepseek") (check-equal? l2 "default")
+  (define-values (b3 l3) (parse-instance "deepseek[]"))
+  (check-equal? l3 "default")                                  ; 空标签 → default
+  (check-equal? (instance-base "deepseek[x]") "deepseek")
+  (check-equal? (instance-display "deepseek" "default") "deepseek")
+  (check-equal? (instance-display "deepseek" "work") "deepseek[work]")
+  (check-true (builtin-provider-instance? "deepseek[work]"))
+  (check-false (builtin-provider-instance? "nope[x]"))
+) ; end test-case
+
+(test-case "instance tokens: store, resolve, and apply-provider-profile picks the label's token"
+  (define home (make-temporary-file "pi2-inst-~a" 'directory))
+  (putenv "PI_CONFIG_HOME" (path->string home))
+  (putenv "DEEPSEEK_API_KEY" "")                               ; 确保 default 无 env 干扰
+  (store-instance-key! "deepseek" "work" "sk-work-token")
+  (store-instance-key! "deepseek" "default" "sk-default-token")
+  (check-equal? (resolve-provider-token "deepseek" "work") "sk-work-token")
+  ;; apply-provider-profile 用实例名 → 该 label 的 token + deepseek 端点/模型
+  (define cw (apply-provider-profile (default-config) "deepseek[work]"))
+  (check-equal? (config-api-key cw) "sk-work-token")
+  (check-equal? (config-endpoint cw) "https://api.deepseek.com/anthropic")
+  (check-equal? (config-model cw) "deepseek-chat")
+  (define cd (apply-provider-profile (default-config) "deepseek"))
+  (check-equal? (config-api-key cd) "sk-default-token")        ; 默认标签
+  (check-equal? (map car (all-instances)) '("deepseek" "deepseek"))
+  (delete-directory/files home)
+) ; end test-case
+
+(test-case "default-label token falls back to env when no stored key"
+  (define home (make-temporary-file "pi2-inst2-~a" 'directory))
+  (putenv "PI_CONFIG_HOME" (path->string home))
+  (putenv "DEEPSEEK_API_KEY" "sk-from-env")
+  (check-equal? (resolve-provider-token "deepseek" "default") "sk-from-env")
+  ;; 非 default 标签无 env 回退
+  (check-false (resolve-provider-token "deepseek" "work"))
+  (putenv "DEEPSEEK_API_KEY" "")
+  (delete-directory/files home)
 ) ; end test-case
 
 ;; ------------------------------------------------------------ Anthropic 线路转换
@@ -206,10 +256,22 @@
   (check-equal? (hash-ref (first (hash-ref b 'content)) 'type) "text")
 ) ; end test-case
 
-(test-case "valid-reasoning-effort? guards levels"
-  (for ([v (in-list '(off low medium high))]) (check-true (valid-reasoning-effort? v)))
+(test-case "valid-reasoning-effort? guards levels (incl. max)"
+  (for ([v (in-list '(off low medium high max))]) (check-true (valid-reasoning-effort? v)))
   (check-false (valid-reasoning-effort? 'extreme))
   (check-false (valid-reasoning-effort? "high"))       ; 需符号
+) ; end test-case
+
+(test-case "reasoning max: OpenAI wire clamps to high; Anthropic gets largest budget"
+  (define cfg (struct-copy config (default-config) [max-tokens 4096]))
+  (with-effort 'max
+    (lambda ()
+      ;; OpenAI reasoning_effort 无 max → 钳到 "high"
+      (check-equal? (hash-ref (build-request-body cfg (list (text-msg 'user "hi")) '()) 'reasoning_effort) "high")
+      ;; Anthropic thinking budget: max 给最大预算（> high 的 12288）
+      (define body (build-anthropic-body cfg (list (text-msg 'user "hi")) '()))
+      (check-equal? (hash-ref (hash-ref body 'thinking) 'budget_tokens) 24576)
+      (check-equal? (hash-ref body 'temperature) 1)))
 ) ; end test-case
 
 (displayln "providers-test: all passed")

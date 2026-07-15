@@ -126,8 +126,9 @@
 ) ; end define mark-last-message-cache
 
 ;; 推理强度 → 扩展思考 token 预算（Anthropic 最小 1024）。
+;; 'max 给最大预算：供 DeepSeek 等「thinking 仅 high/max」场景把上限拉满。
 (define (effort->budget eff)
-  (case eff [(low) 1024] [(medium) 4096] [(high) 12288] [else 1024])
+  (case eff [(low) 1024] [(medium) 4096] [(high) 12288] [(max) 24576] [else 1024])
 ) ; end define effort->budget
 
 (define (build-anthropic-body cfg msgs tool-specs)

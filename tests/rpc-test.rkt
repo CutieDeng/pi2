@@ -17,11 +17,14 @@
  (file "../src/session.rkt")
  (file "../src/plugin.rkt")
  (file "../src/providers.rkt")
+ (file "../src/auto.rkt")
  (file "../src/rpc.rkt")
  (file "../src/tools/builtin.rkt")
 ) ; end require
 
 (define tmpdir (make-temporary-file "pi2-rpctest-~a" 'directory))
+;; 隔离凭据目录：add_key 等只写临时 store，绝不触碰真实 ~/.config/pi++。
+(putenv "PI_CONFIG_HOME" (path->string (make-temporary-file "pi2-rpccfg-~a" 'directory)))
 
 ;; mock provider：吐一段 text（delta + message + turn-end），无工具。
 (define (mock-text-provider text)
@@ -159,13 +162,34 @@
   (check-false (hash-ref te 'is_error))                    ; echo 成功
 ) ; end test-case
 
-(test-case "set_reasoning updates global effort; state reflects it"
-  (define evs (drive (list (hasheq 'type "set_reasoning" 'level "high")
+(test-case "set_reasoning updates global effort; state reflects it (max ok)"
+  (define evs (drive (list (hasheq 'type "set_reasoning" 'level "max")
                            (hasheq 'type "state")
                            (hasheq 'type "shutdown"))))
   (check-equal? (hash-ref (find-type evs "ok") 'for) "set_reasoning")
-  (check-equal? (hash-ref (find-type evs "state") 'reasoning) "high")
+  (check-equal? (hash-ref (find-type evs "state") 'reasoning) "max")
   (set-reasoning-effort! 'off)                 ; 复位，防污染同文件其它用例
+) ; end test-case
+
+(test-case "set_auto toggles; state carries auto flag"
+  (define evs (drive (list (hasheq 'type "set_auto" 'on #f)
+                           (hasheq 'type "state")
+                           (hasheq 'type "shutdown"))))
+  (check-equal? (hash-ref (find-type evs "ok") 'for) "set_auto")
+  (check-equal? (hash-ref (find-type evs "state") 'auto) #f)
+  (set-auto-mode! #t)                          ; 复位默认
+) ; end test-case
+
+(test-case "add_key stores instance token; set_provider then resolves it"
+  (define evs (drive (list (hasheq 'type "add_key" 'base "deepseek" 'label "work" 'token "sk-rpc-work")
+                           (hasheq 'type "set_provider" 'name "deepseek[work]")
+                           (hasheq 'type "state")
+                           (hasheq 'type "shutdown"))))
+  (define ok1 (findf (lambda (j) (and (equal? (hash-ref j 'type #f) "ok")
+                                      (equal? (hash-ref j 'for #f) "add_key"))) evs))
+  (check-equal? (hash-ref ok1 'provider) "deepseek[work]")
+  (check-equal? (hash-ref (find-type evs "state") 'provider) "deepseek[work]")
+  (check-equal? (hash-ref (find-type evs "state") 'model) "deepseek-chat")
 ) ; end test-case
 
 (delete-directory/files tmpdir)

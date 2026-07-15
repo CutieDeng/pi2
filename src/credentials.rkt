@@ -133,6 +133,52 @@
 ;; 凭据文件中已存的键名列表（不含 env-only 的）。
 (define (stored-key-names) (sort (hash-keys (load-credentials)) string<?))
 
+;; ---------------------------------------------------------------- 供应商实例密钥
+;; 同一 provider 允许多套 token，视作不同「实例」，用标签区分（默认 "default"）。
+;; 实例密钥独立于「env 名」存储，键形如 "provider:deepseek:work"，不与环境变量名冲突。
+
+(define INSTANCE-PREFIX "provider:")
+
+(define (instance-cred-key base label)
+  (string-append INSTANCE-PREFIX base ":" label)
+) ; end define instance-cred-key
+
+;; 读某实例的 token（仅查凭据文件；env 回退由上层 providers.rkt 结合 profile 的 key-env 处理）。
+(define (resolve-instance-key base label)
+  (hash-ref (load-credentials) (instance-cred-key base label) #f)
+) ; end define resolve-instance-key
+
+(define (store-instance-key! base label token)
+  (write-credentials! (hash-set (load-credentials) (instance-cred-key base label) token))
+) ; end define store-instance-key!
+
+(define (delete-instance-key! base label)
+  (define k (instance-cred-key base label))
+  (define h (load-credentials))
+  (cond
+    [(hash-has-key? h k) (write-credentials! (hash-remove h k)) #t]
+    [else #f]
+  ) ; end cond
+) ; end define delete-instance-key!
+
+;; 某 base 已配置的标签列表（升序）。
+(define (instance-labels-of base)
+  (define pre (string-append INSTANCE-PREFIX base ":"))
+  (sort
+   (for/list ([k (in-list (hash-keys (load-credentials)))] #:when (string-prefix? k pre))
+     (substring k (string-length pre)))
+   string<?)
+) ; end define instance-labels-of
+
+;; 全部实例 (base . label)，供 --list-keys / /provider 列出。
+(define (all-instances)
+  (for/list ([k (in-list (sort (hash-keys (load-credentials)) string<?))]
+             #:when (string-prefix? k INSTANCE-PREFIX))
+    (define rest (substring k (string-length INSTANCE-PREFIX)))
+    (define i (let ([m (regexp-match-positions #rx":" rest)]) (and m (caar m))))
+    (if i (cons (substring rest 0 i) (substring rest (add1 i))) (cons rest "default")))
+) ; end define all-instances
+
 (provide
  config-home
  credentials-path
@@ -143,4 +189,10 @@
  mask-key
  stored-key-names
  load-credentials
+ instance-cred-key
+ resolve-instance-key
+ store-instance-key!
+ delete-instance-key!
+ instance-labels-of
+ all-instances
 ) ; end provide

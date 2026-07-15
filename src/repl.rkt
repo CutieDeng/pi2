@@ -19,7 +19,9 @@
  (file "session.rkt")
  (file "plugin.rkt")
  (file "providers.rkt")
+ (file "credentials.rkt")                     ; 凭据：TUI 内录入/存储 token
  (file "pricing.rkt")                         ; 记费：估算 token 开销
+ (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
  (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
@@ -50,8 +52,9 @@
     ("/resume"  ""     "pick another session to resume")
     ("/skills"  ""     "list discovered skills")
     ("/prompt"  "[name]" "list or activate a discovered prompt")
-    ("/provider" "[name]" "list or switch LLM provider")
-    ("/reasoning" "[level]" "show/set reasoning effort (off|low|medium|high)")
+    ("/provider" "[name|add|key]" "list/switch provider; add|key sets an instance token")
+    ("/reasoning" "[level]" "show/set reasoning effort (off|low|medium|high|max)")
+    ("/auto"    "[on|off]" "auto model switching (DeepSeek: flash/pro by task)")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -318,6 +321,9 @@
            ] ; end command case
            [else
             (define user-msg (text-msg 'user line))
+            ;; Auto 模式（仅 DeepSeek 生效）：按任务改 model + 推理档，再跑本轮。
+            (define-values (st1 auto-dec) (maybe-apply-auto st line host))
+            (when auto-dec (say (dim f"auto → {(car auto-dec)} · thinking {(cdr auto-dec)}")))
             (console-set-working! con #t)       ; 整轮：底边隔离条进度动画
             (statusf #t)                        ; 首 token 前：转轮标签
             (define st*
@@ -328,20 +334,20 @@
                                  ;; 再单起一行，不与上文回显同块（也不回显 ^C）。
                                  (emit "\n")
                                  (say (yellow "⎯ interrupted ⎯"))
-                                 st
+                                 st1
                                ) ; end lambda
                               ]
                               [exn:fail?
-                               (lambda (e) (say (red f"[error] {(exn-message e)}")) st)
+                               (lambda (e) (say (red f"[error] {(exn-message e)}")) st1)
                               ]) ; end handlers
-                (parameterize-break #t (run-turn! st user-msg d))
+                (parameterize-break #t (run-turn! st1 user-msg d))
               ) ; end with-handlers
             ) ; end define st*
             (statusf #f)                        ; 收尾：确保停动画
             (console-set-working! con #f)       ; 停底边进度动画
             (bus-drain! bus)
-            (persist-turn! (unbox sess-box) st st*)
-            (let ([ft (turn-footer st st*)]) (when ft (say (dim ft))))
+            (persist-turn! (unbox sess-box) st1 st*)
+            (let ([ft (turn-footer st1 st*)]) (when ft (say (dim ft))))
             (loop st*)
            ] ; end else
          ) ; end cond
@@ -380,16 +386,18 @@
       ] ; end command case
       [else
        (define user-msg (text-msg 'user line))
+       (define-values (st1 auto-dec) (maybe-apply-auto st line host))
+       (when auto-dec (say (dim f"auto → {(car auto-dec)} · thinking {(cdr auto-dec)}")))
        (define st*
          (with-handlers ([exn:fail?
-                          (lambda (e) (say (red f"[error] {(exn-message e)}")) st)
+                          (lambda (e) (say (red f"[error] {(exn-message e)}")) st1)
                          ]) ; end handlers
-           (run-turn! st user-msg d)
+           (run-turn! st1 user-msg d)
          ) ; end with-handlers
        ) ; end define st*
        (bus-drain! bus)
-       (persist-turn! (unbox sess-box) st st*)
-       (let ([ft (turn-footer st st*)]) (when ft (say (dim ft))))
+       (persist-turn! (unbox sess-box) st1 st*)
+       (let ([ft (turn-footer st1 st*)]) (when ft (say (dim ft))))
        (loop st*)
       ] ; end else
     ) ; end cond
@@ -474,6 +482,49 @@
       (if c f" · ~{(format-cost c)}" ""))]
   ) ; end cond
 ) ; end define turn-footer
+
+;; /provider add|key：TUI 内录入 token → 存凭据文件（自动落缓存配置）；add 录入后并切到该实例。
+;; instance-arg 可为 "deepseek[work]" / "deepseek" / #f（缺则询问名字）。
+;; 交互式用 console-ask!（贴底提示行）；纯管道模式回退 read-line。
+(define (provider-add/key-command sub instance-arg st say host)
+  (define con (current-console))
+  (define (ask label)
+    (if (and con (console? con)) (console-ask! con label)
+        (begin (say (dim label)) (let ([l (read-line)]) (if (eof-object? l) #f l)))))
+  (define name (or instance-arg
+                   (let ([a (ask "provider instance (e.g. deepseek[work]): ")])
+                     (and (string? a) (non-empty-string? (string-trim a)) (string-trim a)))))
+  (cond
+    [(not name) (say (red "cancelled: no provider name")) (values st #t)]
+    [else
+     (define-values (base label) (parse-instance name))
+     (define disp (instance-display base label))
+     (cond
+       [(not (builtin-provider-name? base))
+        (say (red f"unknown provider base: {base} (builtin: {(string-join (builtin-provider-names) " ")})"))
+        (values st #t)]
+       [else
+        ;; token：终端回显无法可靠隐藏，明示「可见」；仅落 0600 凭据文件，不入日志/历史。
+        (define tok (let ([a (ask f"paste token for {disp} (visible in terminal): ")])
+                      (and (string? a) (string-trim a))))
+        (cond
+          [(or (not tok) (= 0 (string-length tok))) (say (red "cancelled: empty token")) (values st #t)]
+          [else
+           (store-instance-key! base label tok)
+           (say (green f"stored {disp} = {(mask-key tok)}  ({(credentials-path)})"))
+           (cond
+             [(string=? sub "add")
+              (host-set-provider! host disp)
+              (define c* (apply-provider-profile (agent-state-config st) disp))
+              (say (dim f"provider → {disp} (model {(config-model c*)})"))
+              (when (auto-active? host)
+                (say (dim f"auto on: 按任务在 {(light-model)}/{(pro-model)} 间切换（thinking max）")))
+              (values (struct-copy agent-state st [config c*]) #t)]
+             ;; key：若编辑的正是当前选用实例，刷新 config 的 api-key（下一轮生效）
+             [(string=? (host-current-provider host) disp)
+              (values (struct-copy agent-state st [config (apply-provider-profile (agent-state-config st) disp)]) #t)]
+             [else (values st #t)])])])])
+) ; end define provider-add/key-command
 
 ;; 纯 read-line（\ 结尾续行）
 (define (read-input/plain)
@@ -627,43 +678,62 @@
     [("/provider")
      (cond
        [(not host) (say (dim "no plugin host")) (values st #t)]
+       ;; 无参：列出可选 provider、已配置实例、当前选用。
        [(null? args)
-        (define avail (string-join (host-available-providers host) "  "))
-        (say (dim f"providers: {avail}"))
-        (say (dim f"current: {(host-current-provider host)}"))
+        (say (dim f"providers: {(string-join (host-available-providers host) "  ")}"))
+        (define insts (all-instances))
+        (unless (null? insts)
+          (say (dim f"instances: {(string-join (for/list ([bl (in-list insts)]) (instance-display (car bl) (cdr bl))) "  ")}")))
+        (say (dim f"current: {(host-current-provider host)}  |  auto: {(if (auto-mode-on?) "on" "off")}"))
+        (say (dim "add: /provider add <name[label]>   set token: /provider key <name[label]>"))
         (values st #t)]
+       ;; add / key：TUI 内录入 token 存入凭据文件；add 录入后并切换过去。
+       [(member (car args) '("add" "key"))
+        (provider-add/key-command (car args) (if (pair? (cdr args)) (cadr args) #f) st say host)]
+       ;; 切换（含实例名 base[label]）
        [(host-set-provider! host (car args))
         (define name (car args))
         (cond
-          ;; 内置云/本地档案：把 endpoint/key(从env)/model 写进当前 state 的 config
-          [(builtin-provider-name? name)
+          [(builtin-provider-instance? name)
            (define c* (apply-provider-profile (agent-state-config st) name))
-           (define keyenv (provider-profile-key-env-of name))
+           (define base (instance-base name))
+           (define keyenv (provider-profile-key-env-of base))
            (say (dim f"provider → {name} (model {(config-model c*)})"))
-           (when (and keyenv (not (config-api-key c*)))
-             (say (red f"warning: env {keyenv} not set — {name} 请求将鉴权失败")))
+           (when (not (config-api-key c*))
+             (say (red f"warning: {name} 无 token（env {keyenv} 未设、也无 /provider key）— 请求将鉴权失败")))
+           (when (auto-active? host)
+             (say (dim f"auto on: 按任务在 {(light-model)} / {(pro-model)} 间切换（thinking max）")))
            (values (struct-copy agent-state st [config c*]) #t)]
-          ;; 插件注册的供应商：仅切换选用名
           [else
            (say (dim f"provider → {name}"))
            (values st #t)])]
        [else
-        (define avail (string-join (host-available-providers host) " "))
-        (say (red f"unknown provider: {(car args)} (available: {avail})"))
+        (say (red f"unknown provider: {(car args)} (available: {(string-join (host-available-providers host) " ")})"))
         (values st #t)]
      ) ; end cond
     ] ; end provider case
+    [("/auto")
+     (cond
+       [(null? args)
+        (say (dim f"auto: {(if (auto-mode-on?) "on" "off")}  (DeepSeek 选中时按任务切 {(light-model)}/{(pro-model)})"))
+        (values st #t)]
+       [(member (car args) '("on" "off"))
+        (set-auto-mode! (string=? (car args) "on"))
+        (say (dim f"auto → {(car args)}"))
+        (values st #t)]
+       [else (say (red "usage: /auto [on|off]")) (values st #t)])
+    ] ; end auto case
     [("/reasoning")
      (cond
        [(null? args)
-        (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high)"))
+        (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high|max)"))
         (values st #t)]
        [(valid-reasoning-effort? (string->symbol (car args)))
         (set-reasoning-effort! (string->symbol (car args)))
         (say (dim f"reasoning → {(car args)}"))
         (values st #t)]
        [else
-        (say (red f"invalid reasoning: {(car args)} (off|low|medium|high)"))
+        (say (red f"invalid reasoning: {(car args)} (off|low|medium|high|max)"))
         (values st #t)]
      ) ; end cond
     ] ; end reasoning case

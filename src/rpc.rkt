@@ -10,8 +10,10 @@
 ;;   → 请求 (stdin)：
 ;;       {"type":"prompt","text":"..."}          跑一个用户轮
 ;;       {"type":"set_model","model":"..."}       切模型
-;;       {"type":"set_provider","name":"..."}     切供应商（内置档案会重写 endpoint/key/model）
-;;       {"type":"set_reasoning","level":"off|low|medium|high"}  设推理强度
+;;       {"type":"set_provider","name":"..."}     切供应商（含实例名 base[label]；重写 endpoint/key/model）
+;;       {"type":"set_reasoning","level":"off|low|medium|high|max"}  设推理强度
+;;       {"type":"set_auto","on":true|false}       开/关 Auto 模式（DeepSeek 按任务切 flash/pro）
+;;       {"type":"add_key","base":"deepseek","label":"work","token":"sk-..."}  存实例 token
 ;;       {"type":"state"}                          查询模型/供应商/轮次/用量
 ;;       {"type":"history"}                        导出当前历史（role/text）
 ;;       {"type":"permission","decision":"yes|no|always|no-reason","reason":"..."}
@@ -36,7 +38,9 @@
  (file "session.rkt")
  (file "plugin.rkt")
  (file "providers.rkt")
+ (file "credentials.rkt")               ; 实例 token 写入
  (file "pricing.rkt")                   ; 记费：估算 token 开销
+ (file "auto.rkt")                      ; Auto 模式
 ) ; end require
 
 ;; ---------------------------------------------------------------- 事件 → JSON
@@ -154,14 +158,18 @@
        (case type
          [("prompt")
           (define text (jget req 'text ""))
+          ;; Auto 模式（仅 DeepSeek 生效）：按任务改 model + 推理档。
+          (define-values (st1 auto-dec) (maybe-apply-auto st (if (string? text) text "") host))
+          (when auto-dec
+            (emit! (hasheq 'type "auto" 'model (car auto-dec) 'reasoning (symbol->string (cdr auto-dec)))))
           (define st*
             (with-handlers ([exn:fail?
                              (lambda (e)
                                (emit! (hasheq 'type "error" 'message (exn-message e)))
-                               st)])
-              (run-turn! st (text-msg 'user (if (string? text) text "")) d*)))
+                               st1)])
+              (run-turn! st1 (text-msg 'user (if (string? text) text "")) d*)))
           (bus-drain! (deps-bus d))
-          (persist! sess st st*)
+          (persist! sess st1 st*)
           (emit! (hasheq 'type "turn_complete" 'turn (agent-state-turn-count st*)
                          'usage (usage->jsexpr (agent-state-token-usage st*))
                          'cost_usd (cost->jsexpr (config-model (agent-state-config st*))
@@ -180,13 +188,35 @@
           (cond
             [(not (and (string? name) (host-set-provider! host name)))
              (emit! (hasheq 'type "error" 'message f"unknown provider: {name}")) (loop st)]
-            [(builtin-provider-name? name)
+            [(builtin-provider-instance? name)
              (define c* (apply-provider-profile (agent-state-config st) name))
              (emit! (hasheq 'type "ok" 'for "set_provider" 'provider name 'model (config-model c*)))
              (loop (struct-copy agent-state st [config c*]))]
             [else
              (emit! (hasheq 'type "ok" 'for "set_provider" 'provider name))
              (loop st)])]
+         [("set_auto")
+          (define on? (jget req 'on))
+          (cond
+            [(boolean? on?)
+             (set-auto-mode! on?)
+             (emit! (hasheq 'type "ok" 'for "set_auto" 'auto on?)) (loop st)]
+            [else (emit! (hasheq 'type "error" 'message "set_auto requires boolean 'on")) (loop st)])]
+         [("add_key")
+          ;; 存一条实例 token：{base, label?, token}。若为当前实例则刷新 config 的 api-key。
+          (define base (jget req 'base))
+          (define label (let ([l (jget req 'label)]) (if (string? l) l "default")))
+          (define tok (jget req 'token))
+          (cond
+            [(not (and (string? base) (builtin-provider-name? base) (string? tok) (> (string-length tok) 0)))
+             (emit! (hasheq 'type "error" 'message "add_key requires builtin base + non-empty token")) (loop st)]
+            [else
+             (store-instance-key! base label tok)
+             (define disp (instance-display base label))
+             (emit! (hasheq 'type "ok" 'for "add_key" 'provider disp))
+             (if (string=? (host-current-provider host) disp)
+                 (loop (struct-copy agent-state st [config (apply-provider-profile (agent-state-config st) disp)]))
+                 (loop st))])]
          [("set_reasoning")
           (define lvl (jget req 'level))
           (cond
@@ -202,6 +232,7 @@
           (emit! (hasheq 'type "state" 'model (config-model c)
                          'provider (host-current-provider host)
                          'reasoning (symbol->string (current-reasoning-effort))
+                         'auto (auto-mode-on?)
                          'turn (agent-state-turn-count st)
                          'messages (pvector-length (agent-state-history st))
                          'usage (usage->jsexpr (agent-state-token-usage st))

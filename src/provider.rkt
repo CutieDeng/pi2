@@ -107,7 +107,8 @@
     (let ([eff (current-reasoning-effort)])
       (if (eq? eff 'off)
           body+u
-          (hash-set body+u 'reasoning_effort (symbol->string eff))
+          ;; OpenAI reasoning_effort 仅 low|medium|high；'max 无对应 → 钳到 "high"。
+          (hash-set body+u 'reasoning_effort (symbol->string (if (eq? eff 'max) 'high eff)))
       ) ; end if
     ) ; end let
   ) ; end define body+r

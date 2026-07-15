@@ -26,9 +26,12 @@
    ;; 本地：免费
    "gemma"                (model-price 0.0    0.0)
    "lmstudio"             (model-price 0.0    0.0)
-   ;; DeepSeek（Anthropic 兼容线路）
+   ;; DeepSeek（Anthropic 兼容线路）。v4-pro/flash 为占位估算，请按实际账单在 pricing.rktd 覆盖。
+   "deepseek-v4-flash"    (model-price 0.14   0.28)
+   "deepseek-v4-pro"      (model-price 0.55   2.19)
    "deepseek-chat"        (model-price 0.28   0.42)
    "deepseek-reasoner"    (model-price 0.28   0.42)
+   "deepseek"             (model-price 0.28   0.42)   ; 其它 deepseek-* 变体的前缀兜底
    ;; Anthropic
    "claude-haiku"         (model-price 1.0    5.0)
    "claude-sonnet"        (model-price 3.0    15.0)

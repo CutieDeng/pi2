@@ -26,6 +26,7 @@
  (file "src/plugin.rkt")
  (file "src/providers.rkt")
  (file "src/credentials.rkt")
+ (file "src/auto.rkt")
  (file "src/rpc.rkt")
  (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
@@ -119,6 +120,7 @@
   (define provider-arg (box #f))
   (define rpc? (box #f))
   (define reasoning-arg (box #f))
+  (define auto-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -134,7 +136,8 @@
    [("--set-key") env-name "store an API key (env var name); value read from stdin, then exit" (set-box! set-key-arg env-name)]
    [("--list-keys") "list configured provider keys (masked) and exit" (set-box! list-keys? #t)]
    [("--rm-key") env-name "delete a stored API key and exit" (set-box! rm-key-arg env-name)]
-   [("--reasoning") lvl "reasoning effort: off | low | medium | high (default off)" (set-box! reasoning-arg lvl)]
+   [("--reasoning") lvl "reasoning effort: off | low | medium | high | max (default off)" (set-box! reasoning-arg lvl)]
+   [("--auto") onoff "auto model switching on|off (DeepSeek: flash/pro by task; default on)" (set-box! auto-arg onoff)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
    [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
@@ -152,7 +155,13 @@
     (define lvl (string->symbol (unbox reasoning-arg)))
     (cond
       [(valid-reasoning-effort? lvl) (set-reasoning-effort! lvl)]
-      [else (eprintf "invalid --reasoning: ~a (off|low|medium|high)\n" (unbox reasoning-arg)) (exit 1)]))
+      [else (eprintf "invalid --reasoning: ~a (off|low|medium|high|max)\n" (unbox reasoning-arg)) (exit 1)]))
+
+  ;; ---- Auto 模式：--auto on|off（默认 on，仅 DeepSeek 生效）
+  (when (unbox auto-arg)
+    (cond
+      [(member (unbox auto-arg) '("on" "off")) (set-auto-mode! (string=? (unbox auto-arg) "on"))]
+      [else (eprintf "invalid --auto: ~a (on|off)\n" (unbox auto-arg)) (exit 1)]))
 
   ;; ---- 凭据管理（--set-key / --list-keys / --rm-key）：即时执行并退出，不进会话
   (when (unbox set-key-arg)
@@ -182,6 +191,12 @@
                   [(env)  "env"]
                   [(file) (string-append "file " (mask-key (resolve-key env)))]
                   [else   "— (unset)"]))))
+    (define insts (all-instances))
+    (unless (null? insts)
+      (printf "instances:\n")
+      (for ([bl (in-list insts)])
+        (printf "  ~a\tfile ~a\n" (instance-display (car bl) (cdr bl))
+                (mask-key (resolve-instance-key (car bl) (cdr bl))))))
     (exit 0))
 
   ;; ---- 解析会话选择：--list / --rm 即时退出；否则解析出待恢复路径（可能 #f=新建）
@@ -276,14 +291,13 @@
   ;; 显式 --provider 选内置云档案时，把其 endpoint/key(从env)/model 写进 config；
   ;; 默认 lmstudio 不覆盖（尊重用户的 --endpoint / --model）。
   (define cfg*
-    (if (and (unbox provider-arg) (builtin-provider-name? provider-name))
+    (if (and (unbox provider-arg) (builtin-provider-instance? provider-name))
         (apply-provider-profile cfg provider-name)
         cfg))
-  (when (and (unbox provider-arg) (builtin-provider-name? provider-name)
-             (provider-profile-key-env-of provider-name)
+  (when (and (unbox provider-arg) (builtin-provider-instance? provider-name)
              (not (config-api-key cfg*)))
-    (eprintf "warning: provider ~a needs env ~a (not set) — requests will fail auth\n"
-             provider-name (provider-profile-key-env-of provider-name)))
+    (eprintf "warning: provider ~a has no token (env ~a unset & no stored key) — requests will fail auth\n"
+             provider-name (or (provider-profile-key-env-of (instance-base provider-name)) "—")))
   (define prov (make-dispatch-provider host cfg*))
   ;; spawn_agent 用解析后的 provider；加入 registry。
   (define spawn-tool (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))
@@ -322,9 +336,11 @@
     ;; 单次问答模式
     [(unbox prompt)
      (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
-     (define st* (run-turn! st0 (text-msg 'user (unbox prompt)) d))
+     (define-values (st0* auto-dec) (maybe-apply-auto st0 (unbox prompt) host))
+     (when auto-dec (eprintf "auto → ~a (thinking ~a)\n" (car auto-dec) (cdr auto-dec)))
+     (define st* (run-turn! st0* (text-msg 'user (unbox prompt)) d))
      (bus-drain! bus)
-     (persist-turn! sess st0 st*)
+     (persist-turn! sess st0* st*)
      (unsub) (session-close! sess)
     ] ; end one-shot case
     ;; 交互式

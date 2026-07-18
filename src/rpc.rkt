@@ -16,6 +16,8 @@
 ;;       {"type":"set_escalate","on":true|false}    开/关失败驱动模型升级（DeepSeek: flash→pro→max）
 ;;       {"type":"add_key","base":"deepseek","label":"work","token":"sk-..."}  存实例 token
 ;;       {"type":"set_fallback","chain":["anthropic","deepseek-v4-flash"]}     设 on-error 回退链（[] 清空）
+;;       {"type":"goal","goal":"...","until":["python3 -m unittest"],"max_turns":20,"budget":0.5}  headless Goal 模式
+;;         → 流式 goal_start / (turn 事件) / goal_status / goal_end
 ;;       {"type":"state"}                          查询模型/供应商/轮次/用量
 ;;       {"type":"history"}                        导出当前历史（role/text）
 ;;       {"type":"permission","decision":"yes|no|always|no-reason","reason":"..."}
@@ -45,6 +47,7 @@
  (file "auto.rkt")                      ; Auto 模式
  (file "escalate.rkt")                  ; 自适应：失败驱动模型升级梯
  (file "retry.rkt")                     ; 增强式回退：回退链读写
+ (file "goal.rkt")                      ; Goal 模式：headless 驱动
 ) ; end require
 
 ;; ---------------------------------------------------------------- 事件 → JSON
@@ -179,6 +182,33 @@
                          'cost_usd (cost->jsexpr (config-model (agent-state-config st*))
                                                  (agent-state-token-usage st*))))
           (loop st*)]
+         [("goal")
+          ;; headless Goal 模式:自主多轮直到 until 全过/轮数耗尽/预算耗尽。turn 流式事件仍走 bus,
+          ;; 另加 goal_start / goal_status(驱动状态行) / goal_end。
+          (define goal (jget req 'goal))
+          (define until (jget req 'until))
+          (define mt (jget req 'max_turns 20))
+          (define budget (jget req 'budget))
+          (cond
+            [(not (and (string? goal) (list? until) (pair? until) (andmap string? until)))
+             (emit! (hasheq 'type "error" 'message "goal requires string 'goal and non-empty string list 'until"))
+             (loop st)]
+            [else
+             (define max-turns (if (exact-positive-integer? mt) mt 20))
+             (emit! (hasheq 'type "goal_start" 'goal goal 'until until 'max_turns max-turns))
+             (define (strip s) (regexp-replace* #rx"\e\\[[0-9;]*m" s ""))
+             (define st*
+               (with-handlers ([exn:fail? (lambda (e) (emit! (hasheq 'type "error" 'message (exn-message e))) st)])
+                 (run-goal! d* st sess goal until max-turns host
+                            #:budget (and (real? budget) (> budget 0) budget)
+                            #:emit (lambda (s) (emit! (hasheq 'type "goal_status" 'text (strip s)))))))
+             (emit! (hasheq 'type "goal_end"
+                            'model (config-model (agent-state-config st*))
+                            'turn (agent-state-turn-count st*)
+                            'usage (usage->jsexpr (agent-state-token-usage st*))
+                            'cost_usd (cost->jsexpr (config-model (agent-state-config st*))
+                                                    (agent-state-token-usage st*))))
+             (loop st*)])]
          [("set_model")
           (define m (jget req 'model))
           (cond

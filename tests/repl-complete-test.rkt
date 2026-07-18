@@ -20,6 +20,7 @@
   (check-equal? (command-complete "/f") "/fallback ")     ; 唯一以 /f 起头
   (check-equal? (command-complete "/au") "/auto ")
   (check-equal? (command-complete "/e") "/escalate ")     ; 唯一以 /e 起头
+  (check-equal? (command-complete "/g") "/goal ")         ; 唯一以 /g 起头
 ) ; end test-case
 
 (test-case "ambiguous prefix extends to common prefix, then stops"

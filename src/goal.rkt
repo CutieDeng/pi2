@@ -19,6 +19,7 @@
  (file "session.rkt")
  (file "escalate.rkt")
  (file "pricing.rkt")
+ (file "worktree.rkt")                  ; P4.1：git worktree 隔离原语
  (file "plugin.rkt")
 ) ; end require
 
@@ -71,20 +72,80 @@
 
 ;; ---------------------------------------------------------------- 持久 plan（PLAN.md，模型维护）
 
-;; 解析 workdir/PLAN.md 的 markdown 复选框 → (values done total active-desc)。
-;;   条目行形如 `- [ ] 任务` / `- [x] 已完成`。active = 首个未勾条目的描述（#f 若无）。
-(define (read-plan workdir)
-  (define f (build-path workdir "PLAN.md"))
+;; PLAN.md 条目建模成 DAG 任务（P4.0）。行形如：
+;;   - [ ] {id} 描述 (needs: id1, id2) (files: a.py, b.py)
+;; {id}/needs/files 都可选：无注解 → 退化为 P2 线性 checklist（deps 空 → 就绪=未完成，文档序）。
+(struct plan-task (id desc deps files done?) #:prefab)
+
+(define (extract-list s key)
+  (define m (regexp-match (pregexp (string-append "\\(" key ":\\s*([^)]*)\\)")) s))
+  (if m (filter non-empty-string? (map string-trim (regexp-split #px"[,\\s]+" (cadr m)))) '()))
+
+;; 单行 → plan-task 或 #f（非条目行）。
+(define (parse-task-line line)
+  (define m (regexp-match #px"^\\s*[-*]\\s*\\[([ xX])\\]\\s*(.*)$" line))
   (cond
-    [(not (file-exists? f)) (values 0 0 #f)]
+    [(not m) #f]
     [else
-     (define items (filter (lambda (l) (regexp-match? #px"^\\s*[-*]\\s*\\[[ xX]\\]" l)) (file->lines f)))
-     (define done (filter (lambda (l) (regexp-match? #px"^\\s*[-*]\\s*\\[[xX]\\]" l)) items))
-     (define active (findf (lambda (l) (regexp-match? #px"^\\s*[-*]\\s*\\[ \\]" l)) items))
-     (values (length done) (length items)
-             (and active (string-trim (regexp-replace #px"^\\s*[-*]\\s*\\[ \\]\\s*" active ""))))]
+     (define done? (not (string=? (cadr m) " ")))
+     (define rest (caddr m))
+     (define idm (regexp-match #px"^\\{([^}]+)\\}\\s*(.*)$" rest))
+     (define id (and idm (string-trim (cadr idm))))
+     (define rest2 (if idm (caddr idm) rest))
+     (define deps (extract-list rest2 "needs"))
+     (define files (extract-list rest2 "files"))
+     (define desc (string-trim (regexp-replace* #px"\\((?:needs|files):[^)]*\\)" rest2 "")))
+     (plan-task id desc deps files done?)]
   ) ; end cond
-) ; end define read-plan
+) ; end define parse-task-line
+
+(define (parse-dag workdir)
+  (define f (build-path workdir "PLAN.md"))
+  (if (file-exists? f) (filter values (map parse-task-line (file->lines f))) '()))
+
+(define (task-done-by-id? tasks id)
+  (for/or ([t (in-list tasks)]) (and (equal? (plan-task-id t) id) (plan-task-done? t))))
+(define (known-id? tasks id) (for/or ([t (in-list tasks)]) (equal? (plan-task-id t) id)))
+
+;; 就绪 = 未完成 且 所有 deps 都是「已完成的已知任务」。
+(define (task-ready? tasks t)
+  (and (not (plan-task-done? t))
+       (for/and ([d (in-list (plan-task-deps t))]) (task-done-by-id? tasks d))))
+(define (dag-ready tasks) (filter (lambda (t) (task-ready? tasks t)) tasks))
+
+;; 当前 active = 首个就绪任务的描述（依赖已满足者优先；无则 #f）。
+(define (dag-active tasks) (let ([r (dag-ready tasks)]) (and (pair? r) (plan-task-desc (car r)))))
+(define (dag-counts tasks) (values (length (filter plan-task-done? tasks)) (length tasks)))
+
+;; 依赖图是否有环（DFS，仅对已知 id 的边）。
+(define (dag-has-cycle? tasks)
+  (define id->deps (make-hash))
+  (for ([t (in-list tasks)] #:when (plan-task-id t))
+    (hash-set! id->deps (plan-task-id t) (filter (lambda (d) (known-id? tasks d)) (plan-task-deps t))))
+  (define visiting (make-hash)) (define visited (make-hash))
+  (define (dfs id)
+    (cond
+      [(hash-ref visited id #f) #f]
+      [(hash-ref visiting id #f) #t]              ; 回边 → 环
+      [else
+       (hash-set! visiting id #t)
+       (define c (for/or ([d (in-list (hash-ref id->deps id '()))]) (dfs d)))
+       (hash-set! visiting id #f) (hash-set! visited id #t) c]))
+  (for/or ([id (in-hash-keys id->deps)]) (dfs id)))
+
+;; DAG 健康问题（喂回模型修）：未知依赖 id、依赖环。空 = 无问题。
+(define (dag-issues tasks)
+  (append
+   (for*/list ([t (in-list tasks)] #:unless (plan-task-done? t)
+               [d (in-list (plan-task-deps t))] #:unless (known-id? tasks d))
+     f"task \"{(plan-task-desc t)}\" depends on unknown id: {d}")
+   (if (dag-has-cycle? tasks) (list "PLAN.md has a dependency cycle among tasks — break it") '())))
+
+;; 兼容旧签名：(values done total active-desc)。基于 DAG（无 deps 时同 P2 行为）。
+(define (read-plan workdir)
+  (define tasks (parse-dag workdir))
+  (define-values (d t) (dag-counts tasks))
+  (values d t (dag-active tasks)))
 
 ;; workdir 若是 git 仓库，返回当前短 HEAD（否则 #f）。用于记录“最接近通过”的 checkpoint。
 (define (git-head workdir)
@@ -101,16 +162,23 @@
 
 ;; ---------------------------------------------------------------- 每轮提示词
 
-(define (goal-prompt goal until-cmds last-report first? pdone ptotal pactive replan? regr? best-commit)
+(define (goal-prompt goal until-cmds last-report first? pdone ptotal pactive issues replan? regr? best-commit)
   (string-append
    f"You are working autonomously toward a goal across multiple turns.\n\nGOAL: {goal}\n\n"
    "ACCEPTANCE — the goal is DONE only when ALL of these shell commands exit 0:\n"
    (string-join (for/list ([c (in-list until-cmds)]) f"  $ {c}") "\n")
    "\n\n"
-   ;; 持久 plan：有则报进度+当前任务；无则要求建 PLAN.md checklist。
+   ;; 持久 plan：有则报进度+当前任务；无则要求建 PLAN.md checklist（可选 DAG 注解）。
    (if (> ptotal 0)
        f"PLAN.md progress: {pdone}/{ptotal} done. Current task: {(or pactive "(all items checked — confirm acceptance)")}. Keep PLAN.md updated (check off `- [x]` as you finish each item).\n\n"
-       "Maintain a PLAN.md checklist in the working directory: decompose the goal into `- [ ]` items and check them off (`- [x]`) as you complete them. Create it now if absent.\n\n")
+       (string-append
+        "Maintain a PLAN.md checklist in the working directory: decompose the goal into `- [ ]` items and check them off (`- [x]`) as you complete them. Create it now if absent. "
+        "You MAY annotate a task with `{id}`, dependencies `(needs: id1, id2)`, and file ownership `(files: a.py, b.py)`; the driver works dependency-ready tasks first.\n\n"))
+   ;; DAG 健康问题（未知依赖/环）→ 让模型修 PLAN.md。
+   (if (pair? issues)
+       (string-append "PLAN.md has structural issues to fix:\n"
+                      (string-join (for/list ([i (in-list issues)]) f"  - {i}") "\n") "\n\n")
+       "")
    ;; replan：困住时逼它换策略。
    (if replan?
        "You appear STUCK — acceptance still fails after escalating the model. STOP repeating the same approach: step back, REWRITE PLAN.md with a different strategy, and try a genuinely different tack this turn.\n\n"
@@ -171,10 +239,14 @@
       [(and budget (>= spent budget))
        (emit (goal-summary f"BUDGET reached (~{(format-cost spent)} ≥ {(format-cost budget)}), not done" st turn spent)) st]
       [else
-       (define-values (pdone ptotal pactive) (read-plan workdir))
+       (define tasks (parse-dag workdir))
+       (define-values (pdone ptotal) (dag-counts tasks))
+       (define pactive (dag-active tasks))
+       (define issues (dag-issues tasks))
        (emit (dim (string-append
                    f"\n── goal turn {(add1 turn)}/{max-turns} · model {(config-model (agent-state-config st))}"
                    (if (> ptotal 0) f" · plan {pdone}/{ptotal}" "")
+                   (if (pair? issues) f" · ⚠ {(length issues)} plan issue(s)" "")
                    (if budget f" · spent ~{(format-cost spent)}/{(format-cost budget)}" "")
                    " ──")))
        ;; 1) 跑一轮。turn 内异常不致命：记错，当无进展。
@@ -182,7 +254,7 @@
          (with-handlers ([exn:fail? (lambda (e) (emit f"[turn error] {(exn-message e)}") st)])
            (run-turn! st (text-msg 'user
                           (goal-prompt goal until-cmds last-report (zero? turn)
-                                       pdone ptotal pactive replan? regressed? best-commit)) d)))
+                                       pdone ptotal pactive issues replan? regressed? best-commit)) d)))
        (bus-drain! bus)
        (persist-goal-turn! sess st st1)
        (define spent* (+ spent (turn-cost st st1)))
@@ -219,8 +291,68 @@
   ) ; end let loop
 ) ; end define run-goal!
 
+;; ------------------------------------------------ P4.1：单 worker 在 worktree 里跑（隔离链验证）
+
+(define (reset-workdir st dir)
+  (struct-copy agent-state st [config (struct-copy config (agent-state-config st) [workdir dir])]))
+
+;; 在隔离 worktree 里让一个 worker 朝 task-until 干活 → auto-commit → merge 回 main → 全局再验收 → 清理。
+;; N=1，无并发（并行是 P4.2），用来验证「隔离 + merge + 再验收」这条链正确。
+;; 返回 (values status st*)：'no-repo | 'worker-failed | 'conflict | 'global-fail | 'done。
+;; st* 的 workdir 复位回 repo-dir（worker 内部用的是 worktree workdir）。
+(define (run-task-in-worktree! d st sess host repo-dir task-id task-desc task-until global-until
+                               #:worker-turns [worker-turns 4] #:emit [emit displayln])
+  (cond
+    [(not (git-repo? repo-dir)) (emit "worktree: not a git repo — cannot isolate") (values 'no-repo st)]
+    [else
+     (define safe-id (regexp-replace* #rx"[^a-zA-Z0-9_-]" task-id "-"))
+     (define branch f"pi/{safe-id}")
+     (define wt-path (make-temporary-file "pi-wt-~a" 'directory))
+     (delete-directory wt-path)                       ; git worktree add 要求路径尚不存在
+     (define wt-dir (path->string wt-path))
+     (cond
+       [(not (worktree-create! repo-dir branch wt-dir "HEAD"))
+        (emit f"worktree {task-id}: create failed") (values 'worker-failed st)]
+       [else
+        (dynamic-wind
+         void
+         (lambda ()
+           (emit f"worktree {task-id}: worker in isolated copy")
+           ;; worker：在 worktree 里跑 bounded run-goal!(workdir=worktree, 验收=task-until)。
+           (define st-worker (reset-workdir st wt-dir))
+           (define st-w (run-goal! d st-worker sess task-desc (list task-until) worker-turns host #:emit emit))
+           (define-values (task-ok? _s _r) (run-oracle (list task-until) wt-dir))
+           (cond
+             [(not task-ok?)
+              (emit f"worktree {task-id}: worker did not satisfy task acceptance")
+              (values 'worker-failed (reset-workdir st-w repo-dir))]
+             [else
+              (git-commit-all! wt-dir f"goal worker: {safe-id}")   ; 确保有可 merge 的 commit
+              (define mres (worktree-merge! repo-dir branch f"merge worker {safe-id}"))
+              (cond
+                [(not (eq? mres 'ok))
+                 (emit f"worktree {task-id}: merge {mres} (would sequentialize on main in P4.2)")
+                 (values 'conflict (reset-workdir st-w repo-dir))]
+                [else
+                 ;; merge 后跑全局验收：破坏则 revert 该 merge。
+                 (define-values (gok? _gs _gr) (run-oracle global-until repo-dir))
+                 (cond
+                   [gok? (emit f"worktree {task-id}: merged ✓ global acceptance holds")
+                         (values 'done (reset-workdir st-w repo-dir))]
+                   [else (revert-last-merge! repo-dir)
+                         (emit f"worktree {task-id}: merged but GLOBAL acceptance broke → reverted")
+                         (values 'global-fail (reset-workdir st-w repo-dir))])])]))
+         (lambda () (worktree-remove! repo-dir wt-dir branch)))])]
+  ) ; end cond
+) ; end define run-task-in-worktree!
+
 (provide
  run-goal!
  run-oracle failure-count run-verify read-plan turn-cost
  goal-prompt
+ ;; P4.0 DAG
+ (struct-out plan-task)
+ parse-task-line parse-dag dag-ready dag-active dag-counts dag-issues dag-has-cycle?
+ ;; P4.1 worktree worker
+ run-task-in-worktree!
 ) ; end provide

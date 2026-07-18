@@ -214,5 +214,20 @@
   (void (drive (list (hasheq 'type "set_fallback" 'chain '()) (hasheq 'type "shutdown"))))
 ) ; end test-case
 
+(test-case "goal request: acceptance passes immediately → goal_start/goal_end + status DONE"
+  (define evs (drive (list (hasheq 'type "goal" 'goal "trivial" 'until (list "true") 'max_turns 3)
+                           (hasheq 'type "shutdown"))))
+  (check-true (and (find-type evs "goal_start") #t))
+  (check-true (and (find-type evs "goal_end") #t))
+  (check-true (for/or ([e (in-list evs)])
+                (and (equal? (hash-ref e 'type #f) "goal_status")
+                     (string-contains? (hash-ref e 'text "") "DONE"))))
+) ; end test-case
+
+(test-case "goal request: missing until → error"
+  (define evs (drive (list (hasheq 'type "goal" 'goal "x") (hasheq 'type "shutdown"))))
+  (check-true (string-contains? (hash-ref (find-type evs "error") 'message) "goal requires"))
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "rpc-test: all passed")

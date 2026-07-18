@@ -24,6 +24,7 @@
  (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
  (file "escalate.rkt")                        ; 自适应：失败驱动模型升级梯（/escalate）
  (file "retry.rkt")                           ; 增强式回退：回退链读写（/fallback）
+ (file "goal.rkt")                            ; Goal 模式：自主多轮（/goal）
  (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
@@ -59,6 +60,7 @@
     ("/auto"    "[on|off]" "auto model switching (DeepSeek: flash/pro by task)")
     ("/escalate" "[on|off]" "failure-driven model escalation (DeepSeek: climb flash→pro→max)")
     ("/fallback" "[targets|clear]" "on-error fallback chain (provider[label]|model …)")
+    ("/goal"    "<desc>" "autonomous goal mode: pursue <desc> until an acceptance cmd passes (Ctrl-C stops)")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -801,6 +803,33 @@
         (say (dim f"fallback → {(string-join (fallback-chain) " → ")}"))
         (values st #t)])
     ] ; end fallback case
+    [("/goal")
+     ;; 交互式启动 Goal 模式:问一条验收命令,run-goal! 自主多轮推进(Ctrl-C 打断回 REPL)。
+     (cond
+       [(not host) (say (dim "no plugin host")) (values st #t)]
+       [(null? args) (say (red "usage: /goal <description>")) (values st #t)]
+       [else
+        (define con (current-console))
+        (define goal (string-join args " "))
+        (define until
+          (cond
+            [(and con (console? con)) (console-ask! con (yellow "acceptance command (--until, exit 0 = done): "))]
+            [else (say (dim "acceptance command (--until): ")) (let ([l (read-line)]) (if (eof-object? l) #f l))]))
+        (cond
+          [(or (not until) (not (non-empty-string? (string-trim until))))
+           (say (red "cancelled: no acceptance command")) (values st #t)]
+          [else
+           (say (dim f"goal: {goal}  ·  until: {(string-trim until)}  ·  Ctrl-C to stop"))
+           (define st*
+             (with-handlers
+               ([exn:break? (lambda (_e) (provider-cancel! (deps-provider d))
+                                         (say (yellow "⎯ goal interrupted ⎯")) st)]
+                [exn:fail? (lambda (e) (say (red f"[goal error] {(exn-message e)}")) st)])
+               (parameterize-break #t
+                 (run-goal! d st (unbox sess-box) goal (list (string-trim until)) 20 host
+                            #:emit (lambda (s) (say s))))))
+           (values st* #t)])])
+    ] ; end goal case
     [("/reasoning")
      (cond
        ;; 无参 + console：贴底选择器挑档；无 console 回退显示当前值。

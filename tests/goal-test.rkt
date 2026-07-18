@@ -14,6 +14,8 @@
  (file "../src/plugin.rkt")
  (file "../src/loop.rkt")
  (file "../src/session.rkt")
+ (file "../src/worktree.rkt")
+ (file "../src/tools/file.rkt")
  (file "../src/goal.rkt")
 ) ; end require
 
@@ -160,6 +162,119 @@
   (define log (string-join (dump) "\n"))
   (check-true (string-contains? log "replan"))              ; 先尝试换策略
   (check-true (string-contains? log "STUCK"))               ; 用尽后停
+) ; end test-case
+
+;; ---------------------------------------------------------------- P4.0：DAG
+
+(test-case "parse-task-line：解析 {id}/needs/files/done，非条目行→#f"
+  (define t (parse-task-line "- [ ] {acct} Build accounting (needs: engine, orders) (files: account.py, lot.py)"))
+  (check-equal? (plan-task-id t) "acct")
+  (check-equal? (plan-task-desc t) "Build accounting")
+  (check-equal? (plan-task-deps t) '("engine" "orders"))
+  (check-equal? (plan-task-files t) '("account.py" "lot.py"))
+  (check-false (plan-task-done? t))
+  (define d (parse-task-line "- [x] {engine} Matching engine"))
+  (check-true (plan-task-done? d))
+  (check-equal? (plan-task-id d) "engine")
+  (check-false (parse-task-line "not a task line"))
+  ;; 无注解 → 退化：id=#f，deps/files 空
+  (define p (parse-task-line "- [ ] plain task"))
+  (check-false (plan-task-id p))
+  (check-equal? (plan-task-desc p) "plain task")
+  (check-equal? (plan-task-deps p) '())
+) ; end test-case
+
+(test-case "dag-active：跳过依赖未满足的任务，选就绪者（拓扑而非文档序）"
+  (define d (make-temporary-file "pi2-dag-~a" 'directory))
+  (call-with-output-file (build-path d "PLAN.md")
+    (lambda (o) (write-string (string-join
+      (list "- [x] {a} task A"
+            "- [ ] {c} task C (needs: b)"      ; b 未完成 → C 不就绪（尽管文档序在前）
+            "- [ ] {b} task B (needs: a)")     ; a 完成 → B 就绪
+      "\n") o)))
+  (define tasks (parse-dag d))
+  (check-equal? (dag-active tasks) "task B")
+  (define-values (done total) (dag-counts tasks))
+  (check-equal? (list done total) (list 1 3))
+  (delete-directory/files d)
+) ; end test-case
+
+(test-case "dag-issues / dag-has-cycle?：未知依赖 + 环检测"
+  (define d (make-temporary-file "pi2-dag2-~a" 'directory))
+  (call-with-output-file (build-path d "PLAN.md")
+    (lambda (o) (write-string "- [ ] {x} X (needs: nope)\n" o)))
+  (check-true (ormap (lambda (s) (string-contains? s "unknown id: nope")) (dag-issues (parse-dag d))))
+  (check-false (dag-has-cycle? (parse-dag d)))
+  (call-with-output-file (build-path d "PLAN.md") #:exists 'replace
+    (lambda (o) (write-string "- [ ] {a} A (needs: b)\n- [ ] {b} B (needs: a)\n" o)))
+  (check-true (dag-has-cycle? (parse-dag d)))
+  (check-true (ormap (lambda (s) (string-contains? s "cycle")) (dag-issues (parse-dag d))))
+  (delete-directory/files d)
+) ; end test-case
+
+;; ---------------------------------------------------------------- P4.1：单 worker 在 worktree
+
+;; provider：第 1 次调用吐一个 write_file 工具调用,之后吐终止文本。
+(define (make-write-provider fname content)
+  (define n (box 0))
+  (provider "wf"
+    (lambda (_m _t)
+      (define ch (make-async-channel))
+      (define i (unbox n)) (set-box! n (add1 i))
+      (thread (lambda ()
+                (cond
+                  [(= i 0)
+                   (async-channel-put ch (evt:message (now-ms)
+                     (message 'assistant (list (tool-use-block "c" "write_file" (hasheq 'path fname 'content content))))))
+                   (async-channel-put ch (evt:turn-end (now-ms) "tool_calls" (usage 1 1)))]
+                  [else
+                   (async-channel-put ch (evt:message (now-ms) (text-msg 'assistant "done")))
+                   (async-channel-put ch (evt:turn-end (now-ms) "stop" (usage 1 1)))])))
+      ch)
+    void))
+
+(define (git! dir . args) (define-values (c o) (apply run-git-in dir args)) (void))
+
+(test-case "run-task-in-worktree!：worker 隔离写文件 → merge 回 main → 全局验收过 → 'done"
+  (define repo (make-temporary-file "pi2-wtint-~a" 'directory))
+  (git! repo "init" "-q") (git! repo "config" "user.email" "t@e.com") (git! repo "config" "user.name" "t")
+  (call-with-output-file (build-path repo "seed.txt") (lambda (o) (write-string "seed" o)))
+  (git! repo "add" "-A") (git! repo "commit" "-m" "init")
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config) [workdir (path->string repo)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider (make-write-provider "task.txt" "worker output")
+                       #:registry (make-registry (list (make-write-file-tool)))
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define sess (session-open! (build-path repo "s.rktd") cfg))
+  (define-values (emit dump) (collect-emit))
+  (define-values (status st*)
+    (run-task-in-worktree! d (make-initial-state cfg) sess host (path->string repo)
+                           "t1" "create task.txt with the write_file tool" "test -f task.txt" (list "test -f task.txt")
+                           #:worker-turns 3 #:emit emit))
+  (session-close! sess)
+  (check-eq? status 'done)
+  (check-true (file-exists? (build-path repo "task.txt")))                     ; 已 merge 回主树
+  (check-equal? (config-workdir (agent-state-config st*)) (path->string repo)) ; workdir 复位
+  ;; worktree 已清理:.pi/worktrees 下无残留、git worktree list 只剩主树
+  (define-values (_c wl) (run-git-in repo "worktree" "list"))
+  (check-equal? (length (string-split wl "\n")) 1)
+  (delete-directory/files repo)
+) ; end test-case
+
+(test-case "run-task-in-worktree!：非 git 仓库 → 'no-repo"
+  (define nod (make-temporary-file "pi2-norepo-~a" 'directory))
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config) [workdir (path->string nod)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider (noop-provider) #:registry (make-registry '())
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define sess (session-open! (build-path nod "s.rktd") cfg))
+  (define-values (emit _dump) (collect-emit))
+  (define-values (status _st)
+    (run-task-in-worktree! d (make-initial-state cfg) sess host (path->string nod)
+                           "t" "x" "true" (list "true") #:emit emit))
+  (session-close! sess)
+  (check-eq? status 'no-repo)
+  (delete-directory/files nod)
 ) ; end test-case
 
 (delete-directory/files tmpdir)

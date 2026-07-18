@@ -201,7 +201,10 @@ racket -l pi2 -- -C <proj> --mode auto --provider deepseek \
   (驱动不做破坏性 git 手术,尊重权限模型)。
 - **`--budget <USD>`**（P2）：按 `pricing.rkt` 估算累计成本,超预算即停(困住多花钱的总闸)。
 - **复合**：与 retry/escalate/auto/cost/`--mode auto`/AGENTS.md/`--max-calls`/session 全部复合,内核不改。
-- 现为 P1+P2。P3 待做:DAG plan 并行(解 `spawn_agent` 深度 1)+ TUI `/goal` 可视化 + RPC goal 事件流。
+- **三面启动**：CLI(`--goal/--until/--max-turns/--budget`)· **TUI `/goal <desc>`**(问验收命令,Ctrl-C 停) ·
+  **RPC `{"type":"goal",…}`**(headless 可编程,流式 `goal_start`/turn 事件/`goal_status`/`goal_end`,含 cost_usd)。
+- 现为 P1+P2+P3 surfaces。**DAG plan 并行**刻意推迟到 P4:并行写文件的子 agent 共享 workdir 会竞态/冲突,
+  安全并行须 **git worktree 隔离**(每 worker 一副本再 merge),是独立大工程——不在共享 workdir 上硬塞不安全并行。
 
 ## 记费（`src/pricing.rkt`）
 

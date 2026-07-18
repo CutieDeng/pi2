@@ -17,6 +17,8 @@
   (check-equal? (command-complete "/t") "/tail ")
   (check-equal? (command-complete "/res") "/resume ")
   (check-equal? (command-complete "/rea") "/reasoning ")
+  (check-equal? (command-complete "/f") "/fallback ")     ; 唯一以 /f 起头
+  (check-equal? (command-complete "/au") "/auto ")
 ) ; end test-case
 
 (test-case "ambiguous prefix extends to common prefix, then stops"

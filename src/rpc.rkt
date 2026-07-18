@@ -14,6 +14,7 @@
 ;;       {"type":"set_reasoning","level":"off|low|medium|high|max"}  设推理强度
 ;;       {"type":"set_auto","on":true|false}       开/关 Auto 模式（DeepSeek 按任务切 flash/pro）
 ;;       {"type":"add_key","base":"deepseek","label":"work","token":"sk-..."}  存实例 token
+;;       {"type":"set_fallback","chain":["anthropic","deepseek-v4-flash"]}     设 on-error 回退链（[] 清空）
 ;;       {"type":"state"}                          查询模型/供应商/轮次/用量
 ;;       {"type":"history"}                        导出当前历史（role/text）
 ;;       {"type":"permission","decision":"yes|no|always|no-reason","reason":"..."}
@@ -41,6 +42,7 @@
  (file "credentials.rkt")               ; 实例 token 写入
  (file "pricing.rkt")                   ; 记费：估算 token 开销
  (file "auto.rkt")                      ; Auto 模式
+ (file "retry.rkt")                     ; 增强式回退：回退链读写
 ) ; end require
 
 ;; ---------------------------------------------------------------- 事件 → JSON
@@ -227,12 +229,24 @@
             [else
              (emit! (hasheq 'type "error" 'message "set_reasoning requires off|low|medium|high"))
              (loop st)])]
+         [("set_fallback")
+          ;; {"type":"set_fallback","chain":["anthropic","deepseek-v4-flash"]}；[] 清空。
+          (define ch (jget req 'chain))
+          (cond
+            [(and (list? ch) (andmap string? ch))
+             (set-fallback-chain! ch)
+             (emit! (hasheq 'type "ok" 'for "set_fallback" 'chain (fallback-chain)))
+             (loop st)]
+            [else
+             (emit! (hasheq 'type "error" 'message "set_fallback requires string list 'chain"))
+             (loop st)])]
          [("state")
           (define c (agent-state-config st))
           (emit! (hasheq 'type "state" 'model (config-model c)
                          'provider (host-current-provider host)
                          'reasoning (symbol->string (current-reasoning-effort))
                          'auto (auto-mode-on?)
+                         'fallback (fallback-chain)
                          'turn (agent-state-turn-count st)
                          'messages (pvector-length (agent-state-history st))
                          'usage (usage->jsexpr (agent-state-token-usage st))

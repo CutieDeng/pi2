@@ -22,6 +22,7 @@
  (file "credentials.rkt")                     ; 凭据：TUI 内录入/存储 token
  (file "pricing.rkt")                         ; 记费：估算 token 开销
  (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
+ (file "retry.rkt")                           ; 增强式回退：回退链读写（/fallback）
  (file "resources.rkt")
  (file "tui/terminal.rkt")
  (file "tui/console.rkt")
@@ -53,8 +54,9 @@
     ("/skills"  ""     "list discovered skills")
     ("/prompt"  "[name]" "list or activate a discovered prompt")
     ("/provider" "[name|add|key]" "list/switch provider; add|key sets an instance token")
-    ("/reasoning" "[level]" "show/set reasoning effort (off|low|medium|high|max)")
+    ("/reasoning" "[level]" "show/pick reasoning effort (off|low|medium|high|max)")
     ("/auto"    "[on|off]" "auto model switching (DeepSeek: flash/pro by task)")
+    ("/fallback" "[targets|clear]" "on-error fallback chain (provider[label]|model …)")
     ("/model"   "<id>" "switch model")
    ) ; end list
 ) ; end define COMMANDS
@@ -526,6 +528,60 @@
              [else (values st #t)])])])])
 ) ; end define provider-add/key-command
 
+;; 切换到 provider/实例 name：校验→写档案进 config→缺 token 告警→auto 提示。返回 (values st* #t)。
+;; 供 /provider <name> 与交互选择器共用（避免两处逻辑分叉）。
+(define (switch-provider! name st say host)
+  (cond
+    [(not (host-set-provider! host name))
+     (say (red f"unknown provider: {name} (available: {(string-join (host-available-providers host) " ")})"))
+     (values st #t)]
+    [(builtin-provider-instance? name)
+     (define c* (apply-provider-profile (agent-state-config st) name))
+     (define base (instance-base name))
+     (define keyenv (provider-profile-key-env-of base))
+     (say (dim f"provider → {name} (model {(config-model c*)})"))
+     (unless (config-api-key c*)
+       (say (red f"warning: {name} 无 token（env {keyenv} 未设、也无 /provider key）— 请求将鉴权失败")))
+     (when (auto-active? host)
+       (say (dim f"auto on: 按任务在 {(light-model)} / {(pro-model)} 间切换（thinking max）")))
+     (values (struct-copy agent-state st [config c*]) #t)]
+    [else
+     (say (dim f"provider → {name}"))
+     (values st #t)]
+  ) ; end cond
+) ; end define switch-provider!
+
+;; 交互式 provider 快速切换选择器（/provider 无参且有 console 时）。方向键选中即切换，
+;; 末项为 auto 开关切换。当前选用打 ●，Esc 取消。
+(define (provider-picker! con st say host)
+  (define cur (host-current-provider host))
+  (define targets                                  ; 可选目标 = 可用 provider ∪ 已配置实例
+    (remove-duplicates
+     (append (host-available-providers host)
+             (for/list ([bl (in-list (all-instances))]) (instance-display (car bl) (cdr bl))))))
+  (define entries (append (map (lambda (t) (list 'switch t)) targets) (list (list 'auto))))
+  (define (render e)
+    (case (car e)
+      [(switch) (let ([n (cadr e)]) (string-append (if (equal? n cur) "● " "  ") n))]
+      [(auto)   f"  auto ▸ {(if (auto-mode-on?) "on" "off")} (toggle)"]))
+  (define idx
+    (console-pick! con entries
+                   #:title f"Provider — current {cur} · auto {(if (auto-mode-on?) "on" "off")} · Enter=switch Esc=cancel"
+                   #:render-item render))
+  (cond
+    [(not idx) (values st #t)]
+    [else
+     (define e (list-ref entries idx))
+     (case (car e)
+       [(switch) (switch-provider! (cadr e) st say host)]
+       [(auto) (set-auto-mode! (not (auto-mode-on?)))
+               (say (dim f"auto → {(if (auto-mode-on?) "on" "off")}"))
+               (values st #t)])]
+  ) ; end cond
+) ; end define provider-picker!
+
+(define REASONING-LEVELS '("off" "low" "medium" "high" "max"))
+
 ;; 纯 read-line（\ 结尾续行）
 (define (read-input/plain)
   (let loop ([acc '()])
@@ -678,38 +734,24 @@
     [("/provider")
      (cond
        [(not host) (say (dim "no plugin host")) (values st #t)]
-       ;; 无参：列出可选 provider、已配置实例、当前选用。
+       ;; 无参：交互式选择器（有 console）快速切换；否则回退文本列表。
        [(null? args)
-        (say (dim f"providers: {(string-join (host-available-providers host) "  ")}"))
-        (define insts (all-instances))
-        (unless (null? insts)
-          (say (dim f"instances: {(string-join (for/list ([bl (in-list insts)]) (instance-display (car bl) (cdr bl))) "  ")}")))
-        (say (dim f"current: {(host-current-provider host)}  |  auto: {(if (auto-mode-on?) "on" "off")}"))
-        (say (dim "add: /provider add <name[label]>   set token: /provider key <name[label]>"))
-        (values st #t)]
+        (define con (current-console))
+        (cond
+          [(and con (console? con)) (provider-picker! con st say host)]
+          [else
+           (say (dim f"providers: {(string-join (host-available-providers host) "  ")}"))
+           (define insts (all-instances))
+           (unless (null? insts)
+             (say (dim f"instances: {(string-join (for/list ([bl (in-list insts)]) (instance-display (car bl) (cdr bl))) "  ")}")))
+           (say (dim f"current: {(host-current-provider host)}  |  auto: {(if (auto-mode-on?) "on" "off")}"))
+           (say (dim "add: /provider add <name[label]>   set token: /provider key <name[label]>"))
+           (values st #t)])]
        ;; add / key：TUI 内录入 token 存入凭据文件；add 录入后并切换过去。
        [(member (car args) '("add" "key"))
         (provider-add/key-command (car args) (if (pair? (cdr args)) (cadr args) #f) st say host)]
        ;; 切换（含实例名 base[label]）
-       [(host-set-provider! host (car args))
-        (define name (car args))
-        (cond
-          [(builtin-provider-instance? name)
-           (define c* (apply-provider-profile (agent-state-config st) name))
-           (define base (instance-base name))
-           (define keyenv (provider-profile-key-env-of base))
-           (say (dim f"provider → {name} (model {(config-model c*)})"))
-           (when (not (config-api-key c*))
-             (say (red f"warning: {name} 无 token（env {keyenv} 未设、也无 /provider key）— 请求将鉴权失败")))
-           (when (auto-active? host)
-             (say (dim f"auto on: 按任务在 {(light-model)} / {(pro-model)} 间切换（thinking max）")))
-           (values (struct-copy agent-state st [config c*]) #t)]
-          [else
-           (say (dim f"provider → {name}"))
-           (values st #t)])]
-       [else
-        (say (red f"unknown provider: {(car args)} (available: {(string-join (host-available-providers host) " ")})"))
-        (values st #t)]
+       [else (switch-provider! (car args) st say host)]
      ) ; end cond
     ] ; end provider case
     [("/auto")
@@ -723,11 +765,46 @@
         (values st #t)]
        [else (say (red "usage: /auto [on|off]")) (values st #t)])
     ] ; end auto case
-    [("/reasoning")
+    [("/fallback")
+     ;; on-error 回退链：鉴权/额度失败时按序降级到备用 provider/模型（见 retry.rkt）。
      (cond
        [(null? args)
-        (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high|max)"))
+        (define ch (fallback-chain))
+        (say (dim (if (null? ch)
+                      "fallback chain: (empty)"
+                      f"fallback chain: {(string-join ch " → ")}")))
+        (say (dim "target = provider[label] 或 model；鉴权/额度失败按序降级。set: /fallback <a> <b> …  clear: /fallback clear"))
         (values st #t)]
+       [(string=? (car args) "clear")
+        (set-fallback-chain! '())
+        (say (dim "fallback chain cleared"))
+        (values st #t)]
+       [else
+        (set-fallback-chain! args)
+        (say (dim f"fallback → {(string-join (fallback-chain) " → ")}"))
+        (values st #t)])
+    ] ; end fallback case
+    [("/reasoning")
+     (cond
+       ;; 无参 + console：贴底选择器挑档；无 console 回退显示当前值。
+       [(null? args)
+        (define con (current-console))
+        (cond
+          [(and con (console? con))
+           (define cur (symbol->string (current-reasoning-effort)))
+           (define opts (for/list ([l (in-list REASONING-LEVELS)])
+                          (if (string=? l cur) (string-append "● " l) (string-append "  " l))))
+           (define idx (console-choose! con f"reasoning effort (current: {cur})" opts))
+           (cond
+             [(not idx) (values st #t)]
+             [else
+              (define lvl (list-ref REASONING-LEVELS idx))
+              (set-reasoning-effort! (string->symbol lvl))
+              (say (dim f"reasoning → {lvl}"))
+              (values st #t)])]
+          [else
+           (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high|max)"))
+           (values st #t)])]
        [(valid-reasoning-effort? (string->symbol (car args)))
         (set-reasoning-effort! (string->symbol (car args)))
         (say (dim f"reasoning → {(car args)}"))

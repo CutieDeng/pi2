@@ -27,6 +27,7 @@
  (file "src/providers.rkt")
  (file "src/credentials.rkt")
  (file "src/auto.rkt")
+ (file "src/retry.rkt")
  (file "src/rpc.rkt")
  (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
@@ -124,6 +125,7 @@
   (define rpc? (box #f))
   (define reasoning-arg (box #f))
   (define auto-arg (box #f))
+  (define fallback-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -141,6 +143,7 @@
    [("--rm-key") env-name "delete a stored API key and exit" (set-box! rm-key-arg env-name)]
    [("--reasoning") lvl "reasoning effort: off | low | medium | high | max (default off)" (set-box! reasoning-arg lvl)]
    [("--auto") onoff "auto model switching on|off (DeepSeek: flash/pro by task; default on)" (set-box! auto-arg onoff)]
+   [("--fallback") chain "on-error fallback chain, comma-separated (provider[label]|model,…); overrides PI_FALLBACK" (set-box! fallback-arg chain)]
    [("--resume") arg "resume a session by list index or .rktd path" (set-box! resume-path arg)]
    [("-c" "--continue") "resume the most recent session" (set-box! continue? #t)]
    [("-i" "--pick") "pick a session to resume interactively" (set-box! pick? #t)]
@@ -165,6 +168,10 @@
     (cond
       [(member (unbox auto-arg) '("on" "off")) (set-auto-mode! (string=? (unbox auto-arg) "on"))]
       [else (eprintf "invalid --auto: ~a (on|off)\n" (unbox auto-arg)) (exit 1)]))
+
+  ;; ---- on-error 回退链：--fallback a,b,c（覆盖 env PI_FALLBACK；进程级 box，非 config）
+  (when (unbox fallback-arg)
+    (set-fallback-chain! (string-split (unbox fallback-arg) ",")))
 
   ;; ---- 凭据管理（--set-key / --list-keys / --rm-key）：即时执行并退出，不进会话
   (when (unbox set-key-arg)

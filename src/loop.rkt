@@ -12,6 +12,7 @@
  (file "permission.rkt")
  (file "context.rkt")
  (file "plugin.rkt")
+ (file "retry.rkt")                      ; 增强式回退：失败分类/决策/回退目标应用
 ) ; end require
 
 ;; 依赖包：一次装配，处处传递
@@ -219,12 +220,62 @@
   ) ; end cond
 ) ; end define maybe-compact
 
+;; ------------------------------------------------ 增强式回退：带恢复的流收集
+
+;; 环绕 stream-and-collect! 的重试外壳（策略见 retry.rkt）。一次流失败时按决策动态重算：
+;;   compact  —— compact! 压缩历史后重发（超限）
+;;   retry    —— 指数退避后原样重发（瞬时/限流）
+;;   fallback —— 切到回退链的下一个 provider/模型后重发（鉴权/额度）
+;;   fail     —— 放弃，抛原异常（沿用旧行为，向用户报错）
+;; 每次尝试都按「当时的 st」重算发送窗口（压缩/降级会改 history/config），并以 live config
+;; parameterize provider 读取的 current-config，故降级换模型即时生效。
+;; extra-msgs：仅用于构造发送窗口的追加消息（budget 收尾的 notice），不并入返回 st。
+;; 返回 (values asst-msg stop-reason usage st*)；st* 为「成功那次尝试所用的 st」（可能已压缩/降级）。
+(define (stream-with-recovery! st0 d host #:extra [extra-msgs '()])
+  (define bus (deps-bus d))
+  (define (note s) (bus-publish! bus (evt:delta (now-ms) 'text f"\n[{s}]\n")))
+  (let retry ([st st0] [attempt 0] [fb-idx 0] [compacted? #f])
+    (define cfg (agent-state-config st))
+    (define hist
+      (if (null? extra-msgs)
+          (agent-state-history st)
+          (agent-state-history (for/fold ([s st]) ([m (in-list extra-msgs)]) (state-append s m)))))
+    (define window0 (context-fit hist cfg #:cache (deps-est-cache d)))
+    (define window (if host (run-context-hooks host window0) window0))
+    (define result
+      (with-handlers ([exn:fail? (lambda (e) (list 'err e))])
+        (parameterize ([current-config cfg])
+          (call-with-values (lambda () (stream-and-collect! d window))
+                            (lambda vs (cons 'ok vs))))))
+    (cond
+      [(eq? (car result) 'ok) (apply values (append (cdr result) (list st)))]
+      [else
+       (define e (cadr result))
+       (define dec (decide-recovery host e attempt compacted? fb-idx))
+       (case (recovery-action dec)
+         [(compact)
+          (note f"recover: context overflow → compacting & retrying")
+          (retry (with-handlers ([exn:fail? (lambda (_e) st)]) (compact! st (deps-provider d)))
+                 (add1 attempt) fb-idx #t)]
+         [(retry)
+          (define ms (backoff-delay attempt))
+          (note f"recover: {(err-category e)} → retry #{(add1 attempt)} after {ms}ms")
+          (when (> ms 0) (sleep (/ ms 1000.0)))
+          (retry st (add1 attempt) fb-idx compacted?)]
+         [(fallback)
+          (define tgt (recovery-target dec))
+          (note f"recover: {(err-category e)} → fallback to {(fallback-target-desc tgt)}")
+          (retry (apply-fallback-target st host tgt) (add1 attempt) (add1 fb-idx) compacted?)]
+         [else (raise e)])]
+    ) ; end cond
+  ) ; end let retry
+) ; end define stream-with-recovery!
+
 ;; ------------------------------------------------------------- 主循环
 
 ;; 驱动一个完整「用户轮」：user-msg 进 → 模型/工具交替 → 终止性回答。
 ;; 返回新 agent-state。
 (define (run-turn! st user-msg d)
-  (define cfg (agent-state-config st))
   (define host (deps-plugin-host d))
   (when host (host-set-session! host st))         ; 供插件 ctx.session 读取
   ;; 级别3：历史远超预算时先永久压缩（context-fit 只做透传/中段淘汰）
@@ -235,63 +286,53 @@
         (for/fold ([s (state-append st-c user-msg)]) ([m (in-list (run-before-turn-hooks host st-c))])
           (state-append s m))
         (state-append st-c user-msg)))
-  (parameterize ([current-loop-config cfg])
-    (let step ([st st-injected] [ncalls 0])
-      (define window0 (context-fit (agent-state-history st) cfg
-                                   #:cache (deps-est-cache d)
-                      ) ; end context-fit
-      ) ; end define window0
-      ;; 插件 on-context 钩子：改写发送窗口。
-      (define window (if host (run-context-hooks host window0) window0))
-      (define-values (asst-msg _stop u) (stream-and-collect! d window))
-      (define st*
-        (state-add-usage (state-append st asst-msg) u)
-      ) ; end define st*
-      (define calls (message-tool-uses asst-msg))
-      (cond
-        [(null? calls)
-         (struct-copy agent-state st*
-                      [turn-count (add1 (agent-state-turn-count st*))]
-         ) ; end struct-copy
-        ] ; end terminal case
-        [(> (+ ncalls (length calls)) (config-turn-max-calls cfg))
-         ;; 预算超限：注入提示让模型收尾，而非硬掐断
-         (define notice
-           (message 'user
-                    (append
-                     (for/list ([c (in-list calls)])
-                       (tool-result-block (tool-use-block-id c)
-                                          "tool budget for this turn exhausted; do not call more tools"
-                                          #t
-                       ) ; end tool-result-block
-                     ) ; end for/list
-                     (list (text-block "Tool budget exhausted. Summarize and answer now without more tool calls."))
-                    ) ; end append
-           ) ; end message
-         ) ; end define notice
-         (define-values (final-msg _s u2)
-           (stream-and-collect! d
-                                (context-fit (agent-state-history (state-append st* notice)) cfg
-                                             #:cache (deps-est-cache d)
-                                ) ; end context-fit
-           ) ; end stream-and-collect!
-         ) ; end define-values
-         (define st**
-           (state-add-usage (state-append (state-append st* notice) final-msg) u2)
-         ) ; end define st**
-         (struct-copy agent-state st**
-                      [turn-count (add1 (agent-state-turn-count st**))]
-         ) ; end struct-copy
-        ] ; end budget case
-        [else
-         (define results (execute-calls! calls d))
-         (step (state-append st* (message 'user results))
-               (+ ncalls (length calls))
-         ) ; end step
-        ] ; end tool case
-      ) ; end cond
-    ) ; end let step
-  ) ; end parameterize
+  (let step ([st st-injected] [ncalls 0])
+    ;; 带恢复地取一段 assistant 输出；st1 = 成功那次所用状态（可能被压缩/降级过）。
+    (define-values (asst-msg _stop u st1) (stream-with-recovery! st d host))
+    (define cfg* (agent-state-config st1))          ; live config（回退可能已改）
+    (define st*
+      (state-add-usage (state-append st1 asst-msg) u)
+    ) ; end define st*
+    (define calls (message-tool-uses asst-msg))
+    (cond
+      [(null? calls)
+       (struct-copy agent-state st*
+                    [turn-count (add1 (agent-state-turn-count st*))]
+       ) ; end struct-copy
+      ] ; end terminal case
+      [(> (+ ncalls (length calls)) (config-turn-max-calls cfg*))
+       ;; 预算超限：注入提示让模型收尾，而非硬掐断（收尾流同样带恢复）。
+       (define notice
+         (message 'user
+                  (append
+                   (for/list ([c (in-list calls)])
+                     (tool-result-block (tool-use-block-id c)
+                                        "tool budget for this turn exhausted; do not call more tools"
+                                        #t
+                     ) ; end tool-result-block
+                   ) ; end for/list
+                   (list (text-block "Tool budget exhausted. Summarize and answer now without more tool calls."))
+                  ) ; end append
+         ) ; end message
+       ) ; end define notice
+       (define-values (final-msg _s u2 st2)
+         (stream-with-recovery! st* d host #:extra (list notice))
+       ) ; end define-values
+       (define st**
+         (state-add-usage (state-append (state-append st2 notice) final-msg) u2)
+       ) ; end define st**
+       (struct-copy agent-state st**
+                    [turn-count (add1 (agent-state-turn-count st**))]
+       ) ; end struct-copy
+      ] ; end budget case
+      [else
+       (define results (parameterize ([current-loop-config cfg*]) (execute-calls! calls d)))
+       (step (state-append st* (message 'user results))
+             (+ ncalls (length calls))
+       ) ; end step
+      ] ; end tool case
+    ) ; end cond
+  ) ; end let step
 ) ; end define run-turn!
 
 ;; ---------------------------------------------------------------- provide

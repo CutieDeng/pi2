@@ -192,5 +192,18 @@
   (check-equal? (hash-ref (find-type evs "state") 'model) "deepseek-chat")
 ) ; end test-case
 
+(test-case "set_fallback sets the on-error chain; state carries it; [] clears"
+  (define evs (drive (list (hasheq 'type "set_fallback" 'chain (list "anthropic" "deepseek-v4-flash"))
+                           (hasheq 'type "state")
+                           (hasheq 'type "shutdown"))))
+  (check-equal? (hash-ref (find-type evs "ok") 'for) "set_fallback")
+  (check-equal? (hash-ref (find-type evs "state") 'fallback) (list "anthropic" "deepseek-v4-flash"))
+  ;; 非法 chain → error；清空复位
+  (define evs2 (drive (list (hasheq 'type "set_fallback" 'chain "not-a-list")
+                            (hasheq 'type "shutdown"))))
+  (check-true (string-contains? (hash-ref (find-type evs2 "error") 'message) "set_fallback"))
+  (void (drive (list (hasheq 'type "set_fallback" 'chain '()) (hasheq 'type "shutdown"))))
+) ; end test-case
+
 (delete-directory/files tmpdir)
 (displayln "rpc-test: all passed")

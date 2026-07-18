@@ -273,6 +273,20 @@
     (if (hook-replace? r) (hook-replace-value r) window))
 ) ; end define run-context-hooks
 
+;; error: handler (-> category message attempt result)；用于「增强式回退/动态重算」。
+;;   category : symbol（overflow|rate|transient|auth|quota|other，见 retry.rkt 分类）
+;;   message  : string（exn-message）
+;;   attempt  : exact（第几次重试，0 起）
+;;   result   : #f（放行给内置默认策略）
+;;            | 'retry | 'compact | 'fallback | 'fail   （覆盖内置决策）
+;;            | (cons 'fallback "provider[label]|model") （回退到指定目标）
+;; 首个非 #f 的返回即生效（注册序）；插件异常按 #f（不干预）处理，绝不打断主循环。
+(define (run-error-hooks host category message attempt)
+  (for/or ([h (in-list (host-hooks host 'error-recover))])
+    (with-handlers ([exn:fail? (lambda (_e) #f)])
+      (h category message attempt)))
+) ; end define run-error-hooks
+
 ;; ------------------------------------------------------------ 观测型钩子（bus 分发）
 
 (define (evt->hook-symbol e)
@@ -447,6 +461,7 @@
  make-plugin-api
  ;; 钩子运行器（loop 用）
  run-tool-call-hooks run-tool-result-hooks run-before-turn-hooks run-context-hooks
+ run-error-hooks
  make-host-observer
  ;; 加载
  load-plugin-trusted! load-plugin-sandbox! unload-plugin!

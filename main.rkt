@@ -28,6 +28,7 @@
  (file "src/credentials.rkt")
  (file "src/auto.rkt")
  (file "src/retry.rkt")
+ (file "src/goal.rkt")
  (file "src/rpc.rkt")
  (file "src/resources.rkt")
  (file "src/tui/terminal.rkt")
@@ -127,12 +128,17 @@
   (define auto-arg (box #f))
   (define fallback-arg (box #f))
   (define max-calls-arg (box #f))
+  (define goal-arg (box #f))
+  (define until-cmds (box '()))
+  (define max-turns-arg (box 20))
 
   (command-line
    #:program "pi++"
    #:multi
    [("--plugins") dir "load plugins from a directory (repeatable)"
                   (set-box! plugin-dirs (cons dir (unbox plugin-dirs)))]
+   [("--until") cmd "goal-mode acceptance command (exit 0 = done); repeatable, all must pass"
+                (set-box! until-cmds (cons cmd (unbox until-cmds)))]
    #:once-each
    [("--trust-plugins") "grant all plugin trust/capabilities without prompting (persists)"
                         (set-box! trust-plugins? #t)]
@@ -152,6 +158,11 @@
    [("--fork-at") n "fork the resumed session at message N (new branch)" (set-box! fork-at (string->number n))]
    [("--rm") arg "delete a session (list index or path) and exit" (set-box! rm-arg arg)]
    [("-p" "--prompt") p "one-shot prompt (non-interactive)" (set-box! prompt p)]
+   [("--goal") g "autonomous goal mode: pursue <goal> across turns until every --until command passes" (set-box! goal-arg g)]
+   [("--max-turns") n "goal mode: max turns before stopping (default 20)"
+                    (let ([v (string->number n)])
+                      (if (exact-positive-integer? v) (set-box! max-turns-arg v)
+                          (begin (eprintf "invalid --max-turns: ~a\n" n) (exit 1))))]
    [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
    [("--mode") md "permission mode: yolo|normal|strict|auto (auto = scoped auto-approve: in-workdir read/write auto, network/destructive asks)" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
@@ -356,6 +367,19 @@
   (define sess (session-open! sess-path cfg*))
 
   (cond
+    ;; Goal 模式：外层驱动循环,自主多轮推进直到 --until 全过或轮数耗尽（design-goalmode.md）。
+    [(unbox goal-arg)
+     (define cmds (reverse (unbox until-cmds)))
+     (cond
+       [(null? cmds)
+        (eprintf "--goal requires at least one --until <cmd> (the acceptance oracle; exit 0 = done)\n")
+        (session-close! sess) (exit 1)]
+       [else
+        (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
+        (run-goal! d st0 sess (unbox goal-arg) cmds (unbox max-turns-arg) host
+                   #:emit (lambda (s) (displayln s) (flush-output)))
+        (unsub) (session-close! sess)])
+    ] ; end goal case
     ;; 无头 JSONL 模式（IDE/编排器）：复用内核，事件与响应走 stdout NDJSON。
     [(unbox rpc?)
      (run-rpc! d st0 sess #:plugin-host host)

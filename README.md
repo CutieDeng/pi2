@@ -178,6 +178,25 @@ racket main.rkt --rm 3                    # 删除某会话
   `state` 含 `escalate` 字段。升级时以 `[adaptive: repeated failures → escalate to <model> · thinking <lvl>]` 报到 bus。
 - 非侵入：只改 config-model + 设 reasoning box,在 `loop.rkt` 的 step 循环里按工具结果计失败轮,内核 provider 不动。
 
+## Goal 模式：自主多轮工程（`src/goal.rkt`，见 [design-goalmode.md](design-goalmode.md)）
+
+给定「目标 + 机器可判定的验收命令」,pi2 **自主多轮**推进,直到验收全过或轮数耗尽——把「手动
+喂 milestone / `--continue` / 看测试绿没绿」变成一条命令。
+
+```sh
+racket -l pi2 -- -C <proj> --mode auto --provider deepseek \
+   --goal "build X per AGENTS.md" --until "python3 -m unittest" --max-turns 20
+```
+
+- **核心原则**：终止**只认验收 `--until` 的 exit code**（ground truth）,**绝不让模型自判完成**
+  （虚假胜利是自主 agent 头号失败模式）。`--until` 可重复,全 exit 0 才算 done。
+- **驱动循环**：每轮把「目标 + 上轮验收失败输出」喂回,跑一轮 `run-turn!`,再跑验收;过则 DONE。
+- **进度 monitor**（回答「是在稳步推进还是困住了」）：每轮算失败量信号(解析 `failures=`/`errors=`,
+  或数 FAIL/ERROR/Traceback 行),连 K 轮不降=**困住** → 复用升级梯 climb 模型;升到顶仍无进展 → 停下
+  给人结构化总结。monitor 与 escalate 同构,只差粒度(轮间 vs 轮内)。
+- **复合**：与 retry/escalate/auto/cost/`--mode auto`/AGENTS.md/`--max-calls`/session 全部复合,内核不改。
+- 当前为 P1(线性 monitor,plan 靠 session 历史)。P2 持久 checklist plan + 回滚 + 预算,P3 DAG 并行(spawn_agent)。
+
 ## 记费（`src/pricing.rkt`）
 
 内核逐轮累计 `usage(input/output tokens)`；记费按**每百万 token 单价**估算美元开销。
@@ -386,6 +405,7 @@ pi2/
 │   ├── credentials.rkt   密钥/实例token存储解析       pricing.rkt  记费估算(USD)
 │   ├── auto.rkt          Auto 模式(DeepSeek 按任务切模型)
 │   ├── escalate.rkt      自适应升级梯(失败驱动 flash→pro→max)
+│   ├── goal.rkt          Goal 模式(驱动循环+验收 oracle+进度 monitor)
 │   ├── retry.rkt         增强式回退(分类/决策/回退链/动态重算)
 │   ├── rpc.rkt           无头 JSONL 模式(--rpc)   subagent.rkt  spawn_agent
 │   ├── stream.rkt        SSE/accumulator        repl.rkt      终端交互

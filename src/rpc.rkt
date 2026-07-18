@@ -13,6 +13,7 @@
 ;;       {"type":"set_provider","name":"..."}     切供应商（含实例名 base[label]；重写 endpoint/key/model）
 ;;       {"type":"set_reasoning","level":"off|low|medium|high|max"}  设推理强度
 ;;       {"type":"set_auto","on":true|false}       开/关 Auto 模式（DeepSeek 按任务切 flash/pro）
+;;       {"type":"set_escalate","on":true|false}    开/关失败驱动模型升级（DeepSeek: flash→pro→max）
 ;;       {"type":"add_key","base":"deepseek","label":"work","token":"sk-..."}  存实例 token
 ;;       {"type":"set_fallback","chain":["anthropic","deepseek-v4-flash"]}     设 on-error 回退链（[] 清空）
 ;;       {"type":"state"}                          查询模型/供应商/轮次/用量
@@ -42,6 +43,7 @@
  (file "credentials.rkt")               ; 实例 token 写入
  (file "pricing.rkt")                   ; 记费：估算 token 开销
  (file "auto.rkt")                      ; Auto 模式
+ (file "escalate.rkt")                  ; 自适应：失败驱动模型升级梯
  (file "retry.rkt")                     ; 增强式回退：回退链读写
 ) ; end require
 
@@ -229,6 +231,14 @@
             [else
              (emit! (hasheq 'type "error" 'message "set_reasoning requires off|low|medium|high"))
              (loop st)])]
+         [("set_escalate")
+          ;; {"type":"set_escalate","on":true|false} 开/关失败驱动模型升级
+          (define on? (jget req 'on))
+          (cond
+            [(boolean? on?)
+             (set-escalate! on?)
+             (emit! (hasheq 'type "ok" 'for "set_escalate" 'escalate on?)) (loop st)]
+            [else (emit! (hasheq 'type "error" 'message "set_escalate requires boolean 'on")) (loop st)])]
          [("set_fallback")
           ;; {"type":"set_fallback","chain":["anthropic","deepseek-v4-flash"]}；[] 清空。
           (define ch (jget req 'chain))
@@ -246,6 +256,7 @@
                          'provider (host-current-provider host)
                          'reasoning (symbol->string (current-reasoning-effort))
                          'auto (auto-mode-on?)
+                         'escalate (escalate-on?)
                          'fallback (fallback-chain)
                          'turn (agent-state-turn-count st)
                          'messages (pvector-length (agent-state-history st))

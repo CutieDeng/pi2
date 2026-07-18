@@ -22,6 +22,7 @@
  (file "credentials.rkt")                     ; 凭据：TUI 内录入/存储 token
  (file "pricing.rkt")                         ; 记费：估算 token 开销
  (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
+ (file "escalate.rkt")                        ; 自适应：失败驱动模型升级梯（/escalate）
  (file "retry.rkt")                           ; 增强式回退：回退链读写（/fallback）
  (file "resources.rkt")
  (file "tui/terminal.rkt")
@@ -56,6 +57,7 @@
     ("/provider" "[name|add|key]" "list/switch provider; add|key sets an instance token")
     ("/reasoning" "[level]" "show/pick reasoning effort (off|low|medium|high|max)")
     ("/auto"    "[on|off]" "auto model switching (DeepSeek: flash/pro by task)")
+    ("/escalate" "[on|off]" "failure-driven model escalation (DeepSeek: climb flash→pro→max)")
     ("/fallback" "[targets|clear]" "on-error fallback chain (provider[label]|model …)")
     ("/model"   "<id>" "switch model")
    ) ; end list
@@ -765,6 +767,21 @@
         (values st #t)]
        [else (say (red "usage: /auto [on|off]")) (values st #t)])
     ] ; end auto case
+    [("/escalate")
+     ;; 失败驱动的模型升级梯：一轮里连续失败达阈值即climb到更强模型（见 escalate.rkt）。
+     (define (ladder-str)
+       (string-join (for/list ([r (in-list (escalation-ladder))]) f"{(car r)}/{(cdr r)}") " → "))
+     (cond
+       [(null? args)
+        (say (dim f"escalate: {(if (escalate-on?) "on" "off")}  (DeepSeek 选中时,连 {(escalate-threshold)} 轮失败即升)"))
+        (say (dim f"ladder: {(ladder-str)}"))
+        (values st #t)]
+       [(member (car args) '("on" "off"))
+        (set-escalate! (string=? (car args) "on"))
+        (say (dim f"escalate → {(car args)}"))
+        (values st #t)]
+       [else (say (red "usage: /escalate [on|off]")) (values st #t)])
+    ] ; end escalate case
     [("/fallback")
      ;; on-error 回退链：鉴权/额度失败时按序降级到备用 provider/模型（见 retry.rkt）。
      (cond

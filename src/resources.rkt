@@ -67,7 +67,35 @@
                 f"- {(resource-name s)}: {(resource-description s)} (read: {(resource-path s)})\n"))))
 ) ; end define skills-addendum
 
+;; ---------------------------------------------------------------- 项目指令自动加载
+;; 对标 Claude Code 的 CLAUDE.md / AGENTS.md：在工作目录放一份项目约定，启动即注入系统提示词，
+;; 让 agent 每个 session 不再对项目规范「失忆」。按优先级取**首个存在**的文件（避免重复注入）。
+
+(define PROJECT-INSTRUCTION-FILES '("AGENTS.md" "CLAUDE.md" ".pi/AGENTS.md" "PI.md"))
+
+;; 在 dir 下按优先级找项目指令文件，返回 (values 路径字符串 正文) 或 (values #f "")。
+(define (find-project-instructions dir)
+  (let loop ([cs PROJECT-INSTRUCTION-FILES])
+    (cond
+      [(null? cs) (values #f "")]
+      [else
+       (define fp (build-path dir (car cs)))
+       (if (file-exists? fp)
+           (values (path->string fp) (file->string fp))
+           (loop (cdr cs)))]))
+) ; end define find-project-instructions
+
+;; 项目指令注入片段（空正文 → 空串，不注入）。
+(define (project-instructions-addendum body [path #f])
+  (if (and (string? body) (non-empty-string? (string-trim body)))
+      (string-append "\n\n## Project instructions"
+                     (if path f" (from {path})" "")
+                     "\nFollow these project-specific conventions.\n\n" body)
+      "")
+) ; end define project-instructions-addendum
+
 (provide
  (struct-out resource)
  parse-front-matter read-resource discover-resources skills-addendum
+ PROJECT-INSTRUCTION-FILES find-project-instructions project-instructions-addendum
 ) ; end provide

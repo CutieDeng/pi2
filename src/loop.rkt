@@ -13,6 +13,7 @@
  (file "context.rkt")
  (file "plugin.rkt")
  (file "retry.rkt")                      ; 增强式回退：失败分类/决策/回退目标应用
+ (file "escalate.rkt")                   ; 自适应：失败驱动的模型升级梯
 ) ; end require
 
 ;; 依赖包：一次装配，处处传递
@@ -286,7 +287,9 @@
         (for/fold ([s (state-append st-c user-msg)]) ([m (in-list (run-before-turn-hooks host st-c))])
           (state-append s m))
         (state-append st-c user-msg)))
-  (let step ([st st-injected] [ncalls 0])
+  (let step ([st st-injected] [ncalls 0]
+             [fails 0]                                   ; 连续失败轮计数（自适应升级用）
+             [rung (ladder-rung-of (config-model (agent-state-config st-injected)))])
     ;; 带恢复地取一段 assistant 输出；st1 = 成功那次所用状态（可能被压缩/降级过）。
     (define-values (asst-msg _stop u st1) (stream-with-recovery! st d host))
     (define cfg* (agent-state-config st1))          ; live config（回退可能已改）
@@ -327,13 +330,33 @@
       ] ; end budget case
       [else
        (define results (parameterize ([current-loop-config cfg*]) (execute-calls! calls d)))
-       (step (state-append st* (message 'user results))
+       ;; 自适应：本轮工具多数失败即计一次「失败轮」；连续达阈值且可升 → climb 到更强模型。
+       (define failed? (round-failed? results))
+       (define fails* (if failed? (add1 fails) 0))
+       (define-values (st-next rung* esc)
+         (if (and failed? (>= fails* (escalate-threshold)) (escalation-active? host))
+             (escalate-step st* host rung)
+             (values st* rung #f)))
+       (when esc
+         (bus-publish! (deps-bus d)
+                       (evt:delta (now-ms) 'text
+                                  f"\n[adaptive: repeated failures → escalate to {(car esc)} · thinking {(cdr esc)}]\n")))
+       (step (state-append st-next (message 'user results))
              (+ ncalls (length calls))
+             (if esc 0 fails*)                 ; 升级后重置计数，给新模型一个干净的机会
+             rung*
        ) ; end step
       ] ; end tool case
     ) ; end cond
   ) ; end let step
 ) ; end define run-turn!
+
+;; 一轮工具结果是否算「失败轮」：至少一半（向上取整）的调用报错。单调用报错即算失败。
+(define (round-failed? results)
+  (define n (length results))
+  (define e (count tool-result-block-is-error? results))
+  (and (positive? e) (>= e (quotient (add1 n) 2)))
+) ; end define round-failed?
 
 ;; ---------------------------------------------------------------- provide
 

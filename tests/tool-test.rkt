@@ -25,8 +25,9 @@
 
 (test-case "registry lookup and specs"
   (check-true (tool? (registry-lookup reg "bash")))
+  (check-true (tool? (registry-lookup reg "git")))
   (check-false (registry-lookup reg "nope"))
-  (check-equal? (length (registry-specs reg)) 6)
+  (check-equal? (length (registry-specs reg)) 7)
   (for ([spec (in-list (registry-specs reg))])
     (check-equal? (hash-ref spec 'type) "function")
   ) ; end for
@@ -78,12 +79,73 @@
   (define r5 (run "edit_file" (hasheq 'path "a/b.txt"
                                       'old_string "nope" 'new_string "x")))
   (check-true (tool-outcome-is-error? r5))
-  ;; edit: 多次出现
+  ;; edit: 多次出现（未开 replace_all）→ 报错，提示 replace_all
   (run "write_file" (hasheq 'path "dup.txt" 'content "aa aa"))
   (define r6 (run "edit_file" (hasheq 'path "dup.txt"
                                       'old_string "aa" 'new_string "b")))
   (check-true (tool-outcome-is-error? r6))
-  (check-true (string-contains? (tool-outcome-content r6) "must be unique"))
+  (check-true (string-contains? (tool-outcome-content r6) "replace_all"))
+) ; end test-case
+
+(test-case "edit_file: replace_all 替换全部出现"
+  (run "write_file" (hasheq 'path "ra.txt" 'content "x x x y"))
+  (define r (run "edit_file" (hasheq 'path "ra.txt"
+                                     'old_string "x" 'new_string "Z" 'replace_all #t)))
+  (check-false (tool-outcome-is-error? r))
+  (check-equal? (file->string (build-path tmpdir "ra.txt")) "Z Z Z y")
+  (check-true (string-contains? (tool-outcome-content r) "3 replacement"))
+) ; end test-case
+
+(test-case "edit_file: 批量 edits 按序原子应用"
+  (run "write_file" (hasheq 'path "m.txt" 'content "alpha beta gamma"))
+  (define r (run "edit_file"
+                 (hasheq 'path "m.txt"
+                         'edits (list (hasheq 'old_string "alpha" 'new_string "A")
+                                      (hasheq 'old_string "gamma" 'new_string "G")))))
+  (check-false (tool-outcome-is-error? r))
+  (check-equal? (file->string (build-path tmpdir "m.txt")) "A beta G")
+) ; end test-case
+
+(test-case "edit_file: 批量任一失败则整体不落盘（原子性）"
+  (run "write_file" (hasheq 'path "atomic.txt" 'content "keep this"))
+  (define r (run "edit_file"
+                 (hasheq 'path "atomic.txt"
+                         'edits (list (hasheq 'old_string "keep" 'new_string "KEEP")
+                                      (hasheq 'old_string "MISSING" 'new_string "x")))))
+  (check-true (tool-outcome-is-error? r))
+  (check-true (string-contains? (tool-outcome-content r) "edit #2"))
+  (check-equal? (file->string (build-path tmpdir "atomic.txt")) "keep this")  ; 未改
+) ; end test-case
+
+(test-case "edit_file: 缺 old_string 与 edits → 参数错误"
+  (run "write_file" (hasheq 'path "n.txt" 'content "hi"))
+  (define r (run "edit_file" (hasheq 'path "n.txt" 'new_string "x")))
+  (check-true (tool-outcome-is-error? r))
+) ; end test-case
+
+(test-case "git: init/add/commit/status/log/diff（真机 git，离线）"
+  (define grepo (build-path tmpdir "grepo"))
+  (make-directory* grepo)
+  (define gctx (tool-ctx grepo void (default-config)))
+  (define (git . args) (tool-run (registry-lookup reg "git") (hasheq 'args args) gctx))
+  (void (git "init"))
+  (void (git "config" "user.email" "t@example.com"))
+  (void (git "config" "user.name" "pi2 test"))
+  (call-with-output-file (build-path grepo "f.txt") (lambda (o) (write-string "hello" o)))
+  (define r-status (git "status" "--short"))
+  (check-false (tool-outcome-is-error? r-status))
+  (check-true (string-contains? (tool-outcome-content r-status) "f.txt"))
+  (void (git "add" "-A"))
+  ;; commit message 含空格：argv 直传无需转义
+  (define r-commit (git "commit" "-m" "first commit with spaces"))
+  (check-false (tool-outcome-is-error? r-commit))
+  (define r-log (git "log" "--oneline"))
+  (check-true (string-contains? (tool-outcome-content r-log) "first commit with spaces"))
+  ;; 非法子命令 → git 非零退出 → 工具错误（携带 git 报错）
+  (define r-bad (git "not-a-real-subcommand"))
+  (check-true (tool-outcome-is-error? r-bad))
+  ;; 空 args → 参数错误
+  (check-true (tool-outcome-is-error? (tool-run (registry-lookup reg "git") (hasheq 'args '()) gctx)))
 ) ; end test-case
 
 (test-case "read_file: missing file is a tool error, not an exception"

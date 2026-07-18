@@ -38,7 +38,7 @@
   (define p (profile-by-name "deepseek"))
   (check-equal? (provider-profile-kind p) 'anthropic)
   (check-equal? (provider-profile-endpoint p) "https://api.deepseek.com/anthropic")
-  (check-equal? (provider-profile-model p) "deepseek-chat")
+  (check-equal? (provider-profile-model p) "deepseek-v4-flash")
   (check-equal? (provider-profile-key-env-of "deepseek") "DEEPSEEK_API_KEY")
 ) ; end test-case
 
@@ -105,7 +105,7 @@
   (define cw (apply-provider-profile (default-config) "deepseek[work]"))
   (check-equal? (config-api-key cw) "sk-work-token")
   (check-equal? (config-endpoint cw) "https://api.deepseek.com/anthropic")
-  (check-equal? (config-model cw) "deepseek-chat")
+  (check-equal? (config-model cw) "deepseek-v4-flash")
   (define cd (apply-provider-profile (default-config) "deepseek"))
   (check-equal? (config-api-key cd) "sk-default-token")        ; 默认标签
   (check-equal? (map car (all-instances)) '("deepseek" "deepseek"))
@@ -237,6 +237,27 @@
       (check-equal? (hash-ref (hash-ref body 'thinking) 'budget_tokens) 4096)
       (check-equal? (hash-ref body 'temperature) 1)
       (check-equal? (hash-ref body 'max_tokens) (+ 4096 4096))))
+) ; end test-case
+
+(test-case "DeepSeek thinking 只有 high/max：low/medium 夹到 high，off/high/max 原样；非 deepseek 不改"
+  (check-eq? (normalize-effort 'low    "deepseek-v4-pro") 'high)
+  (check-eq? (normalize-effort 'medium "deepseek-v4-pro") 'high)
+  (check-eq? (normalize-effort 'high   "deepseek-v4-pro") 'high)
+  (check-eq? (normalize-effort 'max    "deepseek-v4-pro") 'max)
+  (check-eq? (normalize-effort 'off    "deepseek-v4-pro") 'off)
+  (check-true (deepseek-model? "deepseek-v4-flash"))
+  (check-false (deepseek-model? "claude-sonnet-5"))
+  ;; Claude 等保留梯度思考，不夹
+  (check-eq? (normalize-effort 'medium "claude-sonnet-5") 'medium)
+  (check-eq? (normalize-effort 'low    "gpt-5") 'low)
+  ;; 端到端：deepseek + medium → 实际 thinking budget = high(12288)；max → 24576
+  (define dcfg (struct-copy config (default-config) [model "deepseek-v4-pro"] [max-tokens 4096]))
+  (with-effort 'medium
+    (lambda ()
+      (check-equal? (hash-ref (hash-ref (build-anthropic-body dcfg (list (text-msg 'user "hi")) '()) 'thinking) 'budget_tokens) 12288)))
+  (with-effort 'max
+    (lambda ()
+      (check-equal? (hash-ref (hash-ref (build-anthropic-body dcfg (list (text-msg 'user "hi")) '()) 'thinking) 'budget_tokens) 24576)))
 ) ; end test-case
 
 (test-case "Anthropic thinking round-trip: signed thinking block sent first; unsigned skipped"

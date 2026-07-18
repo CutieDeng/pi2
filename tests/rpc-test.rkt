@@ -189,7 +189,16 @@
                                       (equal? (hash-ref j 'for #f) "add_key"))) evs))
   (check-equal? (hash-ref ok1 'provider) "deepseek[work]")
   (check-equal? (hash-ref (find-type evs "state") 'provider) "deepseek[work]")
-  (check-equal? (hash-ref (find-type evs "state") 'model) "deepseek-chat")
+  (check-equal? (hash-ref (find-type evs "state") 'model) "deepseek-v4-flash")
+) ; end test-case
+
+(test-case "set_escalate toggles; state carries escalate flag"
+  (define evs (drive (list (hasheq 'type "set_escalate" 'on #f)
+                           (hasheq 'type "state")
+                           (hasheq 'type "shutdown"))))
+  (check-equal? (hash-ref (find-type evs "ok") 'for) "set_escalate")
+  (check-equal? (hash-ref (find-type evs "state") 'escalate) #f)
+  (void (drive (list (hasheq 'type "set_escalate" 'on #t) (hasheq 'type "shutdown"))))  ; 复位
 ) ; end test-case
 
 (test-case "set_fallback sets the on-error chain; state carries it; [] clears"

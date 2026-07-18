@@ -137,54 +137,101 @@
    (define (tool-permission-level _t) 'mutating)
    (define (tool-spec _t)
      (function-spec "edit_file"
-                    "Replace an exact string in a file. old_string must appear exactly once."
-                    (hasheq 'path (hasheq 'type "string")
-                            'old_string (hasheq 'type "string")
-                            'new_string (hasheq 'type "string")
+                    (string-append
+                     "Replace exact string(s) in a file. Single edit: pass old_string + new_string "
+                     "(old_string must be unique unless replace_all=true, which replaces every occurrence). "
+                     "Batch: pass edits=[{old_string,new_string,replace_all?}, …] applied in order and "
+                     "ATOMICALLY (all-or-nothing — if any edit fails, the file is left unchanged). "
+                     "Batching many edits in one call is preferred over many separate calls.")
+                    (hasheq 'path (hasheq 'type "string" 'description "File path")
+                            'old_string (hasheq 'type "string" 'description "Exact text to replace (single-edit mode)")
+                            'new_string (hasheq 'type "string" 'description "Replacement text (single-edit mode; \"\" deletes)")
+                            'replace_all (hasheq 'type "boolean"
+                                                 'description "Replace all occurrences instead of requiring uniqueness (default false)")
+                            'edits (hasheq 'type "array"
+                                           'description "Batch mode: list of {old_string, new_string, replace_all?} applied in order, atomically"
+                                           'items (hasheq 'type "object"))
                     ) ; end hasheq
-                    (list "path" "old_string" "new_string")
+                    (list "path")
      ) ; end function-spec
    ) ; end define tool-spec
    (define (tool-run _t input ctx)
      (define p (input-str input 'path))
-     (define old-s (input-str input 'old_string))
-     (define new-s (input-str input 'new_string))
      (cond
-       [(or (not p) (not old-s) (not new-s))
-        (err-outcome "missing required parameter: path, old_string, new_string")
-       ] ; end missing case
+       [(not p) (err-outcome "missing required parameter: path")]
        [else
         (define fp (resolve ctx p))
         (cond
           [(not (file-exists? fp)) (err-outcome f"file not found: {p}")]
           [else
-           (define text (file->string fp))
-           (define n (count-occurrences text old-s))
+           (define edits (normalize-edits input))
            (cond
-             [(zero? n)
-              (err-outcome
-               f"old_string not found in {p}. Read the file again and match the exact text including whitespace."
-              ) ; end err-outcome
-             ] ; end zero case
-             [(> n 1)
-              (err-outcome
-               f"old_string appears {n} times in {p}; it must be unique. Add surrounding context to disambiguate."
-              ) ; end err-outcome
-             ] ; end multi case
+             [(not edits)
+              (err-outcome "provide old_string (+ new_string), or an edits array")]
              [else
-              (atomic-write! fp (string-replace text old-s new-s))
-              (ok-outcome f"edited {p}: 1 replacement"
-                          #:display f"edit {p}"
-              ) ; end ok-outcome
-             ] ; end else
-           ) ; end cond
-          ] ; end else
+              (define text (file->string fp))
+              (define-values (text* applied errmsg) (apply-edits text edits))
+              (cond
+                [errmsg (err-outcome errmsg)]              ; 任一编辑失败 → 整体不落盘
+                [else
+                 (atomic-write! fp text*)
+                 (ok-outcome f"edited {p}: {applied} replacement(s) across {(length edits)} edit(s)"
+                             #:display f"edit {p}")])])]
         ) ; end cond
        ] ; end else
      ) ; end cond
    ) ; end define tool-run
   ] ; end methods
 ) ; end struct edit-file-tool
+
+;; JSON 布尔/缺省 → Racket 真值（'null 视作假）
+(define (truthy v) (and v (not (eq? v 'null))))
+
+;; 从 input 归一出编辑列表 (list (list old new replace-all?) …)，无有效输入 → #f。
+;; 优先 edits 数组（批量）；否则退回单条 old_string/new_string(+replace_all)。
+(define (normalize-edits input)
+  (define raw (input-ref input 'edits #f))
+  (cond
+    [(and (list? raw) (pair? raw))
+     (for/list ([e (in-list raw)])
+       (list (and (hash? e) (let ([v (hash-ref e 'old_string #f)]) (and (string? v) v)))
+             (and (hash? e) (let ([v (hash-ref e 'new_string "")]) (if (string? v) v "")))
+             (and (hash? e) (truthy (hash-ref e 'replace_all #f)))))]
+    [else
+     (define old-s (input-str input 'old_string))
+     (if old-s
+         (list (list old-s (or (input-str input 'new_string) "") (truthy (input-ref input 'replace_all #f))))
+         #f)]
+  ) ; end cond
+) ; end define normalize-edits
+
+(define (clip-str s) (if (> (string-length s) 60) (string-append (substring s 0 60) "…") s))
+
+;; 顺序把 edits 逐条应用到 text；任一步失败即返回错误（不改 text），成功返回
+;; (values 新文本 替换总数 #f)。edits 元素 = (list old new replace-all?)。
+(define (apply-edits text edits)
+  (let loop ([text text] [es edits] [i 1] [count 0])
+    (cond
+      [(null? es) (values text count #f)]
+      [else
+       (define old (car (car es)))
+       (define new (cadr (car es)))
+       (define ra? (caddr (car es)))
+       (cond
+         [(not (string? old)) (values text count f"edit #{i}: missing old_string")]
+         [else
+          (define n (count-occurrences text old))
+          (cond
+            [(zero? n)
+             (values text count
+                     f"edit #{i}: old_string not found. Match the exact text including whitespace: {(clip-str old)}")]
+            [(and (> n 1) (not ra?))
+             (values text count
+                     f"edit #{i}: old_string appears {n} times; set replace_all:true or add surrounding context to disambiguate.")]
+            [else (loop (string-replace text old new) (cdr es) (add1 i) (+ count n))])])]
+    ) ; end cond
+  ) ; end let loop
+) ; end define apply-edits
 
 (define (count-occurrences text sub)
   (let loop ([start 0] [n 0])
@@ -212,4 +259,5 @@
  make-write-file-tool
  make-edit-file-tool
  count-occurrences
+ apply-edits normalize-edits
 ) ; end provide

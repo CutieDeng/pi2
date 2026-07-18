@@ -6,6 +6,7 @@
  (file "bash.rkt")
  (file "file.rkt")
  (file "search.rkt")
+ (file "git.rkt")
 ) ; end require
 
 (define (builtin-tools _cfg)
@@ -16,6 +17,7 @@
    (make-edit-file-tool)
    (make-glob-tool)
    (make-grep-tool)
+   (make-git-tool)
   ) ; end list
 ) ; end define builtin-tools
 

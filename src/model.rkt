@@ -75,7 +75,7 @@
    system-prompt    ; (or/c #f string)
    context-budget   ; exact-positive-integer — 发送窗口 token 预算
    turn-max-calls   ; exact-positive-integer — 单用户轮最大工具调用数
-   permission-mode  ; 'strict | 'normal | 'yolo
+   permission-mode  ; 'strict | 'normal | 'yolo | 'auto（作用域自动批准）
    workdir          ; path-string
   ) ; end fields
   #:prefab

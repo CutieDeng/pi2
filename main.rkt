@@ -6,7 +6,7 @@
 ;;   racket main.rkt -m <model> -e <endpoint> 覆盖模型/端点
 ;;   racket main.rkt --resume <session.rktd>  恢复会话
 ;;   racket main.rkt -p "问题"                单次问答（管道友好）
-;;   racket main.rkt --mode yolo|normal|strict 权限模式
+;;   racket main.rkt --mode yolo|normal|strict|auto 权限模式（auto=作用域自动批准,适合无人值守长跑）
 
 (require
  racket/cmdline
@@ -126,6 +126,7 @@
   (define reasoning-arg (box #f))
   (define auto-arg (box #f))
   (define fallback-arg (box #f))
+  (define max-calls-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -152,8 +153,12 @@
    [("--rm") arg "delete a session (list index or path) and exit" (set-box! rm-arg arg)]
    [("-p" "--prompt") p "one-shot prompt (non-interactive)" (set-box! prompt p)]
    [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
-   [("--mode") md "permission mode: yolo|normal|strict" (set-box! mode md)]
+   [("--mode") md "permission mode: yolo|normal|strict|auto (auto = scoped auto-approve: in-workdir read/write auto, network/destructive asks)" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
+   [("--max-calls") n "max tool calls per user turn (default 16; raise for multi-file refactors)"
+                    (let ([v (string->number n)])
+                      (if (exact-positive-integer? v) (set-box! max-calls-arg v)
+                          (begin (eprintf "invalid --max-calls: ~a\n" n) (exit 1))))]
   ) ; end command-line
 
   ;; ---- 推理强度（全局运行时 box，非 prefab config）：--reasoning 设初值
@@ -243,6 +248,15 @@
   (define skills (discover-resources (build-path project-root "skills")))
   (define prompts (discover-resources (build-path project-root "prompts")))
 
+  ;; 项目指令自动加载（AGENTS.md/CLAUDE.md…）：从**工作目录**（即被开发的项目）读，注入系统提示词。
+  ;; 仅在全新启动注入；resume 沿用存档 system-prompt（避免重复叠加）。
+  (define-values (proj-instr-path proj-instr-body)
+    (if (unbox resume-path)
+        (values #f "")
+        (find-project-instructions (unbox workdir))))
+  (when proj-instr-path
+    (eprintf "[project instructions loaded: ~a]\n" proj-instr-path))
+
   ;; 组装 config：resume 时以存档 config 为基，命令行覆盖；追加技能清单到系统提示词。
   (define base-cfg
     (if (unbox resume-path)
@@ -259,8 +273,10 @@
                                       (string->symbol (unbox mode))
                                       (config-permission-mode base-cfg))]
                  [workdir (unbox workdir)]
+                 [turn-max-calls (or (unbox max-calls-arg) (config-turn-max-calls base-cfg))]
                  [system-prompt (string-append (or (config-system-prompt base-cfg) "")
-                                               (skills-addendum skills))]
+                                               (skills-addendum skills)
+                                               (project-instructions-addendum proj-instr-body proj-instr-path))]
     ) ; end struct-copy
   ) ; end define cfg
 

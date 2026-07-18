@@ -34,8 +34,10 @@
                      "grok-4" "XAI_API_KEY")
    ;; DeepSeek 提供 Anthropic 兼容端点（/anthropic/v1/messages），故走原生 anthropic 线路，
    ;; 复用 provider-anthropic.rkt 的 x-api-key 鉴权与 SSE 累加器，零新线路代码。
+   ;; 默认模型用 V4 flash（便宜快；Auto/升级梯会按任务升到 deepseek-v4-pro + thinking high/max）。
+   ;; 旧的 deepseek-chat/deepseek-reasoner(V3) 仍可用 --model 显式选。
    (provider-profile "deepseek"  'anthropic "https://api.deepseek.com/anthropic"
-                     "deepseek-chat" "DEEPSEEK_API_KEY")
+                     "deepseek-v4-flash" "DEEPSEEK_API_KEY")
   ) ; end list
 ) ; end define BUILTIN-PROFILES
 

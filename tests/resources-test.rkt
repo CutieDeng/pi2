@@ -50,4 +50,30 @@
   (check-equal? (skills-addendum '()) "")
 ) ; end test-case
 
+(test-case "project instructions：按优先级取首个存在的文件；正文注入片段"
+  (define dir (make-temporary-file "pi2-proj-~a" 'directory))
+  ;; 无文件 → 无路径、空片段
+  (let-values ([(p b) (find-project-instructions dir)])
+    (check-false p)
+    (check-equal? (project-instructions-addendum b p) ""))
+  ;; 放 CLAUDE.md，先命中它
+  (call-with-output-file (build-path dir "CLAUDE.md")
+    (lambda (o) (write-string "use tabs not spaces" o)))
+  (let-values ([(p b) (find-project-instructions dir)])
+    (check-true (string-contains? p "CLAUDE.md"))
+    (check-true (string-contains? b "use tabs"))
+    (define add (project-instructions-addendum b p))
+    (check-true (string-contains? add "Project instructions"))
+    (check-true (string-contains? add "use tabs not spaces")))
+  ;; 再放 AGENTS.md：优先级更高，应改命中它
+  (call-with-output-file (build-path dir "AGENTS.md")
+    (lambda (o) (write-string "run make test before commit" o)))
+  (let-values ([(p b) (find-project-instructions dir)])
+    (check-true (string-contains? p "AGENTS.md"))
+    (check-true (string-contains? b "make test")))
+  ;; 空正文 → 不注入
+  (check-equal? (project-instructions-addendum "   \n" "AGENTS.md") "")
+  (delete-directory/files dir)
+) ; end test-case
+
 (displayln "resources-test: all passed")

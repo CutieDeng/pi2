@@ -131,6 +131,15 @@
   (case eff [(low) 1024] [(medium) 4096] [(high) 12288] [(max) 24576] [else 1024])
 ) ; end define effort->budget
 
+;; DeepSeek 系模型（deepseek-v4-flash / deepseek-v4-pro / deepseek-chat…）。
+(define (deepseek-model? m) (and (string? m) (regexp-match? #rx"^deepseek" m)))
+
+;; DeepSeek 的 thinking 只有 high/max 两级（外加 off 不思考）：把 low/medium 夹到 high，
+;; 使 deepseek 开思考时总落在其真实的两级上；对 Claude 等有梯度思考的模型不改（原样）。
+(define (normalize-effort eff model)
+  (if (and (deepseek-model? model) (memq eff '(low medium))) 'high eff)
+) ; end define normalize-effort
+
 (define (build-anthropic-body cfg msgs tool-specs)
   (define anth-msgs
     (mark-last-message-cache (filter values (map message->anthropic msgs))))
@@ -141,7 +150,8 @@
             'messages anth-msgs
             'stream #t))
   ;; 扩展思考（reasoning_effort → thinking）：需 temperature=1，且 max_tokens 要容纳思考+输出。
-  (define eff (current-reasoning-effort))
+  ;; DeepSeek 只有 high/max 两级 → 先按模型归一（low/medium 夹到 high）。
+  (define eff (normalize-effort (current-reasoning-effort) (config-model cfg)))
   (define base*
     (if (eq? eff 'off)
         base
@@ -361,4 +371,5 @@
  message->anthropic
  build-anthropic-body
  openai-spec->anthropic-tool
+ effort->budget normalize-effort deepseek-model?
 ) ; end provide

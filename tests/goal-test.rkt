@@ -117,4 +117,49 @@
   (check-equal? (string-trim (file->string (build-path tmpdir "CT2"))) "3")  ; 恰好跑满 3 轮
 ) ; end test-case
 
+;; ---------------------------------------------------------------- P2：plan / budget / replan
+
+(test-case "read-plan：解析 PLAN.md 复选框 → done/total/active；无文件→(0 0 #f)"
+  (define pd (make-temporary-file "pi2-plan-~a" 'directory))
+  (call-with-output-file (build-path pd "PLAN.md")
+    (lambda (o) (write-string "# Plan\n- [x] first\n- [X] second\n- [ ] third task\n- [ ] fourth\nnot an item\n" o)))
+  (define-values (done total active) (read-plan pd))
+  (check-equal? done 2)
+  (check-equal? total 4)
+  (check-equal? active "third task")
+  (define-values (a b c) (read-plan (make-temporary-file "pi2-plan2-~a" 'directory)))
+  (check-equal? (list a b c) (list 0 0 #f))
+  (delete-directory/files pd)
+) ; end test-case
+
+(test-case "run-goal!：累计成本超 --budget → BUDGET 停"
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config)
+                           [workdir (path->string tmpdir)] [permission-mode 'yolo]
+                           [model "deepseek-v4-flash"]))     ; 有价:0.14/0.28
+  (define d (make-deps #:provider (noop-provider) #:registry (make-registry '())
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  ;; 恒失败但信号递减(避免 stuck 先触发),让预算成为唯一终止因。
+  (define cmd "c=$(cat CB 2>/dev/null||echo 0); c=$((c+1)); echo $c>CB; echo failures=$((100-c)); exit 1")
+  (when (file-exists? (build-path tmpdir "CB")) (delete-file (build-path tmpdir "CB")))
+  (define-values (emit dump) (collect-emit))
+  (define sess (open-sess cfg "budget.rktd"))
+  (run-goal! d (make-initial-state cfg) sess "spendy" (list cmd) 50 host #:budget 0.000001 #:emit emit)
+  (session-close! sess)
+  (check-true (string-contains? (string-join (dump) "\n") "BUDGET"))
+) ; end test-case
+
+(test-case "run-goal!：困住且无法升级 → replan → 用尽 → STUCK"
+  (define host (make-plugin-host))          ; 非 deepseek → escalate 不生效 → 走 replan
+  (define-values (d cfg) (goal-deps host))
+  (define-values (emit dump) (collect-emit))
+  (define sess (open-sess cfg "replan.rktd"))
+  (run-goal! d (make-initial-state cfg) sess "impossible" (list "echo nope; exit 1") 12 host
+             #:stuck-k 2 #:max-replans 1 #:emit emit)
+  (session-close! sess)
+  (define log (string-join (dump) "\n"))
+  (check-true (string-contains? log "replan"))              ; 先尝试换策略
+  (check-true (string-contains? log "STUCK"))               ; 用尽后停
+) ; end test-case
+
 (delete-directory/files tmpdir)

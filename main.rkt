@@ -131,6 +131,7 @@
   (define goal-arg (box #f))
   (define until-cmds (box '()))
   (define max-turns-arg (box 20))
+  (define budget-arg (box #f))
 
   (command-line
    #:program "pi++"
@@ -163,6 +164,10 @@
                     (let ([v (string->number n)])
                       (if (exact-positive-integer? v) (set-box! max-turns-arg v)
                           (begin (eprintf "invalid --max-turns: ~a\n" n) (exit 1))))]
+   [("--budget") usd "goal mode: stop when estimated spend exceeds this many USD (default: no cap)"
+                 (let ([v (string->number usd)])
+                   (if (and (real? v) (> v 0)) (set-box! budget-arg v)
+                       (begin (eprintf "invalid --budget: ~a\n" usd) (exit 1))))]
    [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
    [("--mode") md "permission mode: yolo|normal|strict|auto (auto = scoped auto-approve: in-workdir read/write auto, network/destructive asks)" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
@@ -377,6 +382,7 @@
        [else
         (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
         (run-goal! d st0 sess (unbox goal-arg) cmds (unbox max-turns-arg) host
+                   #:budget (unbox budget-arg)
                    #:emit (lambda (s) (displayln s) (flush-output)))
         (unsub) (session-close! sess)])
     ] ; end goal case

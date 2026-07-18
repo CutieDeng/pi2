@@ -194,8 +194,14 @@ racket -l pi2 -- -C <proj> --mode auto --provider deepseek \
 - **进度 monitor**（回答「是在稳步推进还是困住了」）：每轮算失败量信号(解析 `failures=`/`errors=`,
   或数 FAIL/ERROR/Traceback 行),连 K 轮不降=**困住** → 复用升级梯 climb 模型;升到顶仍无进展 → 停下
   给人结构化总结。monitor 与 escalate 同构,只差粒度(轮间 vs 轮内)。
+- **持久 plan**（P2）：agent 在 workdir 维护 `PLAN.md` markdown 复选框(`- [ ]`/`- [x]`),驱动每轮解析、
+  注入进度与当前任务、展示 `plan X/Y`——当工作记忆防漂移(但**不是终止权威**,终止仍只认 `--until`)。
+- **replan**（P2）：困住且升到顶仍无进展 → 逼模型换策略重写 PLAN.md 再试(默认 1 次),用尽才停。
+- **regressed 反馈**（P2）：验收信号变差时,提示最近更优的 git commit,让模型**自己用 git 工具回退**
+  (驱动不做破坏性 git 手术,尊重权限模型)。
+- **`--budget <USD>`**（P2）：按 `pricing.rkt` 估算累计成本,超预算即停(困住多花钱的总闸)。
 - **复合**：与 retry/escalate/auto/cost/`--mode auto`/AGENTS.md/`--max-calls`/session 全部复合,内核不改。
-- 当前为 P1(线性 monitor,plan 靠 session 历史)。P2 持久 checklist plan + 回滚 + 预算,P3 DAG 并行(spawn_agent)。
+- 现为 P1+P2。P3 待做:DAG plan 并行(解 `spawn_agent` 深度 1)+ TUI `/goal` 可视化 + RPC goal 事件流。
 
 ## 记费（`src/pricing.rkt`）
 

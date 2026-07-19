@@ -72,6 +72,24 @@
   (set-escalate! #t)
 ) ; end test-case
 
+;; ---------------------------------------------------------------- reasoning 现为 parameter → thread-local
+
+(test-case "reasoning effort thread-local：并行 worker parameterize 隔离,互不泄漏,不污染主线程"
+  (set-reasoning-effort! 'off)
+  (define results (make-vector 2 #f))
+  (define (worker slot lvl)
+    (thread (lambda ()
+              (parameterize ([current-reasoning-effort (current-reasoning-effort)])
+                (set-reasoning-effort! lvl)
+                (sleep 0.02)                            ; 交错运行：若共享一个 cell 会互相覆盖
+                (vector-set! results slot (current-reasoning-effort))))))
+  (define t1 (worker 0 'max)) (define t2 (worker 1 'high))
+  (thread-wait t1) (thread-wait t2)
+  (check-equal? (vector-ref results 0) 'max)            ; 各看到自己设的值
+  (check-equal? (vector-ref results 1) 'high)
+  (check-equal? (current-reasoning-effort) 'off)        ; 主线程不受 worker 影响
+) ; end test-case
+
 ;; ---------------------------------------------------------------- 集成：run-turn! 真升级
 
 ;; 恒失败工具：任何调用都返回 error outcome。

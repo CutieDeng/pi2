@@ -101,12 +101,12 @@
 
 ;; 运行时推理强度：'off | 'low | 'medium | 'high | 'max。
 ;; **刻意不入 prefab config**（加字段会破坏旧 .rktd 重放，参照 provider 选用的做法），
-;; 用进程级 box——任意线程可读，`/reasoning`、`--reasoning`、RPC set_reasoning 均改它。
+;; **parameter**（非 box）——故 thread-local：主线程 `/reasoning`、`--reasoning`、RPC set_reasoning 直接设；
+;; 并行 goal worker 各自 `(parameterize ([current-reasoning-effort …]) …)` 隔离，互不干扰(P4.2 v2)。
 ;; provider 每次请求读取：OpenAI 兼容 → reasoning_effort（'max 无对应，钳到 high）；
 ;; Anthropic → thinking budget（'max 给最大预算，供 DeepSeek 等 high/max 两档场景）。
-(define reasoning-effort-box (box 'off))
-(define (current-reasoning-effort) (unbox reasoning-effort-box))
-(define (set-reasoning-effort! level) (set-box! reasoning-effort-box level))
+(define current-reasoning-effort (make-parameter 'off))
+(define (set-reasoning-effort! level) (current-reasoning-effort level))
 (define (valid-reasoning-effort? v) (and (memq v '(off low medium high max)) #t))
 
 ;; ---------------------------------------------------------------- Agent 状态

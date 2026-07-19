@@ -332,10 +332,13 @@
         (define wsess-path (make-temporary-file "pi-wsess-~a"))
         (delete-file wsess-path)
         (define wsess (session-open! wsess-path (agent-state-config st-worker)))
+        ;; parameterize 隔离本 worker 的推理档：worker 内 escalate 只动自己这个 cell，不泄漏到
+        ;; 主线程/其它并行 worker（current-reasoning-effort 现为 parameter，见 model.rkt）。
         (define st-w
-          (with-handlers ([exn:fail? (lambda (_e) st-worker)])
-            (run-goal! (worker-deps d wt-dir) st-worker wsess
-                       task-desc (list task-until) worker-turns host #:emit emit)))
+          (parameterize ([current-reasoning-effort (current-reasoning-effort)])
+            (with-handlers ([exn:fail? (lambda (_e) st-worker)])
+              (run-goal! (worker-deps d wt-dir) st-worker wsess
+                         task-desc (list task-until) worker-turns host #:emit emit))))
         (session-close! wsess)
         (when (file-exists? wsess-path) (delete-file wsess-path))
         (define-values (ok? _s _r) (run-oracle (list task-until) wt-dir))

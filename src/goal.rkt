@@ -225,75 +225,84 @@
 
 ;; ---------------------------------------------------------------- 驱动循环
 
+(define (dim s) f"\e[2m{s}\e[0m")
+
+;; progress monitor 的跨轮状态（run-goal! 与 run-goal-dag! 的顺序轮共用 goal-step!，故抽成 struct）。
+(struct mon (prev-signal noprog rung last-report best-signal best-commit regressed? replan? replans) #:prefab)
+(define (fresh-mon st) (mon #f 0 (ladder-rung-of (config-model (agent-state-config st))) #f #f #f #f #f 0))
+
+;; 跑「一轮 goal」：header + prompt + run-turn! + 验收 + monitor 决策。
+;; 返回 (values decision st* m* delta-cost)。decision ∈ 'done | 'continue | 'stuck。
+;; 摘要(DONE/STUCK/MAX-TURNS/BUDGET)由调用方(驱动)据 decision 打印——故 run-goal! 与 run-goal-dag! 共用。
+(define (goal-step! d st sess host goal until-cmds workdir turn max-turns spent m
+                    #:stuck-k [K 2] #:max-replans [max-replans 1] #:budget [budget #f] #:emit [emit displayln])
+  (define tasks (parse-dag workdir))
+  (define-values (pdone ptotal) (dag-counts tasks))
+  (define pactive (dag-active tasks))
+  (define issues (dag-issues tasks))
+  (emit (dim (string-append
+              f"\n── goal turn {(add1 turn)}/{max-turns} · model {(config-model (agent-state-config st))}"
+              (if (> ptotal 0) f" · plan {pdone}/{ptotal}" "")
+              (if (pair? issues) f" · ⚠ {(length issues)} plan issue(s)" "")
+              (if budget f" · spent ~{(format-cost spent)}/{(format-cost budget)}" "")
+              " ──")))
+  (define first? (not (mon-last-report m)))
+  (define st1
+    (with-handlers ([exn:fail? (lambda (e) (emit f"[turn error] {(exn-message e)}") st)])
+      (run-turn! st (text-msg 'user
+                     (goal-prompt goal until-cmds (mon-last-report m) first?
+                                  pdone ptotal pactive issues (mon-replan? m) (mon-regressed? m) (mon-best-commit m))) d)))
+  (bus-drain! (deps-bus d))
+  (persist-goal-turn! sess st st1)
+  (define dcost (turn-cost st st1))
+  (define-values (pass? signal report) (run-oracle until-cmds workdir))
+  (cond
+    [pass? (values 'done st1 m dcost)]
+    [else
+     (define prev (mon-prev-signal m))
+     (define progressed? (or (not prev) (< signal prev)))
+     (define regr? (and prev (> signal prev)))
+     (define noprog* (if progressed? 0 (add1 (mon-noprog m))))
+     (define-values (best-signal* best-commit*)
+       (if (or (not (mon-best-signal m)) (< signal (mon-best-signal m))) (values signal (git-head workdir))
+           (values (mon-best-signal m) (mon-best-commit m))))
+     (emit (dim f"verify: signal {signal} · {(cond [progressed? "progressing"] [regr? "REGRESSED"] [else "no progress"])} · stuck {noprog*}/{K}"))
+     (define base (struct-copy mon m [prev-signal signal] [last-report report]
+                               [best-signal best-signal*] [best-commit best-commit*] [regressed? regr?]))
+     (cond
+       [(>= noprog* K)
+        (define-values (st2 rung* esc)
+          (if (escalation-active? host) (escalate-step st1 host (mon-rung m)) (values st1 (mon-rung m) #f)))
+        (cond
+          [esc (emit (dim f"monitor: stuck → escalate to {(car esc)} · thinking {(cdr esc)}"))
+               (values 'continue st2 (struct-copy mon base [noprog 0] [rung rung*] [replan? #f]) dcost)]
+          [(< (mon-replans m) max-replans)
+           (emit (dim f"monitor: stuck at top model → replan #{(add1 (mon-replans m))}/{max-replans}"))
+           (values 'continue st1 (struct-copy mon base [noprog 0] [replan? #t] [replans (add1 (mon-replans m))]) dcost)]
+          [else (values 'stuck st1 base dcost)])]
+       [else (values 'continue st1 (struct-copy mon base [noprog noprog*] [replan? #f]) dcost)])])
+) ; end define goal-step!
+
 ;; run-goal! : deps state session goal until-cmds max-turns host -> agent-state
-;;   #:stuck-k    连续多少轮验收信号不降算困住(默认 2)→ 升模型
-;;   #:max-replans 升到顶仍困后,最多 replan 几次换策略(默认 1),用尽才停
-;;   #:budget     USD 成本上限(#f=无);累计超限即停
-;;   #:emit       状态行输出(流式 turn 输出由调用方订阅 renderer)
+;;   #:stuck-k / #:max-replans / #:budget / #:emit（见 goal-step!）。顺序驱动（无并行）。
 (define (run-goal! d st0 sess goal until-cmds max-turns host
                    #:stuck-k [K 2] #:max-replans [max-replans 1] #:budget [budget #f]
                    #:emit [emit displayln])
-  (define bus (deps-bus d))
   (define workdir (config-workdir (agent-state-config st0)))
-  (define (dim s) f"\e[2m{s}\e[0m")
-  (let loop ([st st0] [turn 0] [prev-signal #f] [noprog 0]
-             [rung (ladder-rung-of (config-model (agent-state-config st0)))]
-             [last-report #f] [spent 0.0] [replans 0]
-             [best-signal #f] [best-commit #f] [regressed? #f] [replan? #f])
+  (let loop ([st st0] [turn 0] [m (fresh-mon st0)] [spent 0.0])
     (cond
       [(>= turn max-turns) (emit (goal-summary "MAX-TURNS reached (not done)" st turn spent)) st]
       [(and budget (>= spent budget))
        (emit (goal-summary f"BUDGET reached (~{(format-cost spent)} ≥ {(format-cost budget)}), not done" st turn spent)) st]
       [else
-       (define tasks (parse-dag workdir))
-       (define-values (pdone ptotal) (dag-counts tasks))
-       (define pactive (dag-active tasks))
-       (define issues (dag-issues tasks))
-       (emit (dim (string-append
-                   f"\n── goal turn {(add1 turn)}/{max-turns} · model {(config-model (agent-state-config st))}"
-                   (if (> ptotal 0) f" · plan {pdone}/{ptotal}" "")
-                   (if (pair? issues) f" · ⚠ {(length issues)} plan issue(s)" "")
-                   (if budget f" · spent ~{(format-cost spent)}/{(format-cost budget)}" "")
-                   " ──")))
-       ;; 1) 跑一轮。turn 内异常不致命：记错，当无进展。
-       (define st1
-         (with-handlers ([exn:fail? (lambda (e) (emit f"[turn error] {(exn-message e)}") st)])
-           (run-turn! st (text-msg 'user
-                          (goal-prompt goal until-cmds last-report (zero? turn)
-                                       pdone ptotal pactive issues replan? regressed? best-commit)) d)))
-       (bus-drain! bus)
-       (persist-goal-turn! sess st st1)
-       (define spent* (+ spent (turn-cost st st1)))
-       ;; 2) 验收 oracle（ground truth）。
-       (define-values (pass? signal report) (run-oracle until-cmds workdir))
-       (cond
-         [pass? (emit (goal-summary "DONE ✓ acceptance passed" st1 (add1 turn) spent*)) st1]
-         [else
-          ;; 3) progress monitor。
-          (define progressed? (or (not prev-signal) (< signal prev-signal)))
-          (define regr? (and prev-signal (> signal prev-signal)))
-          (define noprog* (if progressed? 0 (add1 noprog)))
-          ;; 记录“最接近通过”的 checkpoint（最低 signal 时的 git HEAD）。
-          (define-values (best-signal* best-commit*)
-            (if (or (not best-signal) (< signal best-signal)) (values signal (git-head workdir))
-                (values best-signal best-commit)))
-          (define state-str (cond [progressed? "progressing"] [regr? "REGRESSED"] [else "no progress"]))
-          (emit (dim f"verify: signal {signal} · {state-str} · stuck {noprog*}/{K}"))
-          ;; 4) 决策：困住→升模型；升到顶→replan；replan 用尽→停。
-          (cond
-            [(>= noprog* K)
-             (define-values (st2 rung* esc)
-               (if (escalation-active? host) (escalate-step st1 host rung) (values st1 rung #f)))
-             (cond
-               [esc (emit (dim f"monitor: stuck → escalate to {(car esc)} · thinking {(cdr esc)}"))
-                    (loop st2 (add1 turn) signal 0 rung* report spent* replans best-signal* best-commit* regr? #f)]
-               [(< replans max-replans)
-                (emit (dim f"monitor: stuck at top model → replan #{(add1 replans)}/{max-replans}"))
-                (loop st1 (add1 turn) signal 0 rung report spent* (add1 replans) best-signal* best-commit* regr? #t)]
-               [else (emit (goal-summary "STUCK — no progress after escalation + replans" st1 (add1 turn) spent*)) st1])]
-            [else
-             (loop st1 (add1 turn) signal noprog* rung report spent* replans best-signal* best-commit* regr? #f)])])]
-    ) ; end cond
+       (define-values (decision st* m* dcost)
+         (goal-step! d st sess host goal until-cmds workdir turn max-turns spent m
+                     #:stuck-k K #:max-replans max-replans #:budget budget #:emit emit))
+       (define spent* (+ spent dcost))
+       (case decision
+         [(done) (emit (goal-summary "DONE ✓ acceptance passed" st* (add1 turn) spent*)) st*]
+         [(stuck) (emit (goal-summary "STUCK — no progress after escalation + replans" st* (add1 turn) spent*)) st*]
+         [else (loop st* (add1 turn) m* spent*)])])
   ) ; end let loop
 ) ; end define run-goal!
 
@@ -449,10 +458,9 @@
 ;;   worker 不 escalate，同档并发；顺序回退不含 monitor/replan(那是 run-goal! 的)。
 (define (run-goal-dag! d st0 sess host goal until-cmds max-turns
                        #:budget [budget #f] #:concurrency [cap 4] #:worker-turns [worker-turns 4]
-                       #:stuck-k [K 3] #:emit [emit displayln])
+                       #:stuck-k [K 3] #:max-replans [max-replans 1] #:emit [emit displayln])
   (define repo-dir (config-workdir (agent-state-config st0)))
-  (define (dim s) f"\e[2m{s}\e[0m")
-  (let loop ([st st0] [turn 0] [prev-signal #f] [noprog 0] [spent 0.0])
+  (let loop ([st st0] [turn 0] [m (fresh-mon st0)] [spent 0.0])
     (cond
       [(>= turn max-turns) (emit (goal-summary "MAX-TURNS reached (not done)" st turn spent)) st]
       [(and budget (>= spent budget))
@@ -465,42 +473,32 @@
           (define tasks (parse-dag repo-dir))
           (define ready (disjoint-ready tasks cap))
           (cond
-            ;; —— 并行轮 ——
+            ;; —— 并行轮：就绪集≥2 文件不相交 → 并发 worker + 确定序 merge ——
             [(>= (length ready) 2)
              (emit (dim f"\n── goal turn {(add1 turn)}/{max-turns} · PARALLEL {(length ready)} workers: {(string-join (map (lambda (t) (or (plan-task-id t) "?")) ready) " ")} ──"))
              (define specs (parallel-spawn! d st host repo-dir ready worker-turns emit))
-             ;; 串行 merge（按 task-id 确定序，git index 不能并发）；merged 者在 PLAN.md 勾掉推进 DAG。
-             ;; 全局验收不在此逐个跑（并行要等全部 merge 完），交给循环顶端。
              (for ([spec (in-list (sort specs string<? #:key car))])
                (define tid (list-ref spec 0)) (define status (list-ref spec 1))
                (define branch (list-ref spec 2)) (define wt-dir (list-ref spec 3))
                (cond
                  [(eq? status 'ready)
-                  (define m (merge-branch! repo-dir branch wt-dir))
-                  (cond [(eq? m 'ok) (mark-task-done! repo-dir tid) (emit (dim f"  merge {tid}: merged ✓"))]
-                        [else (emit (dim f"  merge {tid}: {m} (retry sequentially)"))])]
+                  (define mres (merge-branch! repo-dir branch wt-dir))
+                  (cond [(eq? mres 'ok) (mark-task-done! repo-dir tid) (emit (dim f"  merge {tid}: merged ✓"))]
+                        [else (emit (dim f"  merge {tid}: {mres} (retry sequentially)"))])]
                  [else (emit (dim f"  worker {tid}: {status}"))]))
-             ;; 计入 worker 成本（各 worker st* 的 usage 增量）；main st 历史不并入(worker 在隔离副本)。
              (define worker-cost (for/sum ([spec (in-list specs)]) (turn-cost st (list-ref spec 4))))
-             (loop st (add1 turn) gsig 0 (+ spent worker-cost))]
-            ;; —— 顺序轮（就绪 ≤1 或未声明 files/verify）——
+             ;; 并行有进展 → 重置 monitor 的 stuck 计数/replan，prev-signal 取最新全局信号。
+             (loop st (add1 turn) (struct-copy mon m [prev-signal gsig] [noprog 0] [replan? #f]) (+ spent worker-cost))]
+            ;; —— 顺序轮（就绪 ≤1 或未声明 files/verify）：复用 goal-step! 全套 monitor/escalate/replan ——
             [else
-             (define-values (pdone ptotal) (dag-counts tasks))
-             (define pactive (dag-active tasks))
-             (emit (dim f"\n── goal turn {(add1 turn)}/{max-turns} · sequential · plan {pdone}/{ptotal} ──"))
-             (define st1
-               (with-handlers ([exn:fail? (lambda (e) (emit f"[turn error] {(exn-message e)}") st)])
-                 (run-turn! st (text-msg 'user
-                                (goal-prompt goal until-cmds #f (zero? turn) pdone ptotal pactive
-                                             (dag-issues tasks) #f #f #f)) d)))
-             (bus-drain! (deps-bus d))
-             (persist-goal-turn! sess st st1)
-             (define spent* (+ spent (turn-cost st st1)))
-             (define progressed? (or (not prev-signal) (< gsig prev-signal)))
-             (define noprog* (if progressed? 0 (add1 noprog)))
-             (cond
-               [(>= noprog* K) (emit (goal-summary "STUCK — no global progress" st1 (add1 turn) spent*)) st1]
-               [else (loop st1 (add1 turn) gsig noprog* spent*)])])])]
+             (define-values (decision st* m* dcost)
+               (goal-step! d st sess host goal until-cmds repo-dir turn max-turns spent m
+                           #:stuck-k K #:max-replans max-replans #:budget budget #:emit emit))
+             (define spent* (+ spent dcost))
+             (case decision
+               [(done) (emit (goal-summary "DONE ✓ acceptance passed" st* (add1 turn) spent*)) st*]
+               [(stuck) (emit (goal-summary "STUCK — no progress after escalation + replans" st* (add1 turn) spent*)) st*]
+               [else (loop st* (add1 turn) m* spent*)])])])]
     ) ; end cond
   ) ; end let loop
 ) ; end define run-goal-dag!
@@ -508,7 +506,7 @@
 (provide
  run-goal!
  run-oracle failure-count run-verify read-plan turn-cost
- goal-prompt
+ goal-prompt goal-step! (struct-out mon) fresh-mon
  ;; P4.0 DAG
  (struct-out plan-task)
  parse-task-line parse-dag dag-ready dag-active dag-counts dag-issues dag-has-cycle?

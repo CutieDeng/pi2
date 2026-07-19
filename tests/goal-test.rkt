@@ -339,4 +339,40 @@
   (delete-directory/files repo)
 ) ; end test-case
 
+(test-case "run-goal-dag!：无可并行任务(未声明 files) → 顺序路径复用 goal-step! → DONE"
+  (define repo (make-temporary-file "pi2-seqdag-~a" 'directory))
+  (git! repo "init" "-q") (git! repo "config" "user.email" "t@e.com") (git! repo "config" "user.name" "t")
+  (void (call-with-output-file (build-path repo "PLAN.md")
+          (lambda (o) (write-string "- [ ] {a} create a.py\n" o))))
+  (git! repo "add" "-A") (git! repo "commit" "-m" "plan")
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config) [workdir (path->string repo)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider (make-module-provider) #:registry (make-registry (list (make-write-file-tool)))
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define sess (session-open! (build-path repo "s.rktd") cfg))
+  (define-values (emit dump) (collect-emit))
+  (run-goal-dag! d (make-initial-state cfg) sess host "create a.py" (list "test -f a.py") 4 #:emit emit)
+  (session-close! sess)
+  (define log (string-join (dump) "\n"))
+  (check-true (string-contains? log "DONE"))
+  (check-false (string-contains? log "PARALLEL"))     ; 未声明 files → 不并行 → 走顺序 goal-step!
+  (check-true (file-exists? (build-path repo "a.py")))
+) ; end test-case
+
+;; goal-step! 直接单测：一轮不达标 → 'continue + monitor 推进（复用于两个驱动）。
+(test-case "goal-step!：单轮不过 → 'continue 且 monitor 状态推进"
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config) [workdir (path->string tmpdir)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider (noop-provider) #:registry (make-registry '())
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define sess (session-open! (build-path tmpdir "gs.rktd") cfg))
+  (define-values (emit _dump) (collect-emit))
+  (define-values (decision st* m* dcost)
+    (goal-step! d (make-initial-state cfg) sess host "x" (list "false") (path->string tmpdir) 0 5 0.0 (fresh-mon (make-initial-state cfg)) #:emit emit))
+  (session-close! sess)
+  (check-eq? decision 'continue)
+  (check-true (mon? m*))
+  (check-true (>= (mon-prev-signal m*) 1000000))       ; 记录了失败信号
+) ; end test-case
+
 (delete-directory/files tmpdir)

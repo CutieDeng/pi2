@@ -203,8 +203,10 @@ racket -l pi2 -- -C <proj> --mode auto --provider deepseek \
 - **复合**：与 retry/escalate/auto/cost/`--mode auto`/AGENTS.md/`--max-calls`/session 全部复合,内核不改。
 - **三面启动**：CLI(`--goal/--until/--max-turns/--budget`)· **TUI `/goal <desc>`**(问验收命令,Ctrl-C 停) ·
   **RPC `{"type":"goal",…}`**(headless 可编程,流式 `goal_start`/turn 事件/`goal_status`/`goal_end`,含 cost_usd)。
-- 现为 P1+P2+P3 surfaces。**DAG plan 并行**刻意推迟到 P4:并行写文件的子 agent 共享 workdir 会竞态/冲突,
-  安全并行须 **git worktree 隔离**(每 worker 一副本再 merge),是独立大工程——不在共享 workdir 上硬塞不安全并行。
+- **并行 DAG（P4，`--parallel`）**：PLAN.md 声明 `(needs:)` 依赖 + `(files:)` 文件所有权 + `(verify:)` 任务验收;
+  driver 取「文件不相交的就绪集」,**各 worker 在隔离 git worktree 里并发干活**(互不见未提交改动→无竞态),完成后按
+  task-id **确定序 merge** 回主分支,冲突→下轮顺序重试,全局验收把关。实测 deepseek 3 独立模块并行→全绿。安全靠
+  worktree 隔离 + 文件不相交 + 「STRICT SCOPE 只碰声明文件」约束。详见 [design-goalmode-p4.md](design-goalmode-p4.md)。
 
 ## 记费（`src/pricing.rkt`）
 

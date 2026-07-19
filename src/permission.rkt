@@ -34,6 +34,11 @@
   (permission-policy (config-permission-mode cfg) always store-path (config-workdir cfg))
 ) ; end define make-policy
 
+;; 派生一个换了作用域根 workdir 的策略副本（并行 worker 各在自己 worktree，需各自的作用域 +
+;; 独立 always-set，避免并发 hash 竞态）。P4.2 用。
+(define (policy-with-workdir p dir)
+  (permission-policy (permission-policy-mode p) (make-hash) (permission-policy-store-path p) dir))
+
 ;; 决策矩阵：需要询问的组合返回 'ask，否则 'allow
 (define (matrix-decision mode level)
   (case mode
@@ -148,7 +153,7 @@
  permission-policy?
  permission-policy-mode
  permission-policy-workdir
- make-policy
+ make-policy policy-with-workdir
  permission-check
  ;; 作用域自动批准（'auto）— 导出供单测/复用
  scoped-decision path-in-workdir? bash-scope-decision git-scope-decision

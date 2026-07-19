@@ -277,4 +277,66 @@
   (delete-directory/files nod)
 ) ; end test-case
 
+;; ---------------------------------------------------------------- P4.2：并行 DAG
+
+(test-case "disjoint-ready：文件不相交且声明 verify 者并行；重叠/未声明排除；cap 截断"
+  (define tasks (map parse-task-line (list
+    "- [ ] {a} create a.py (files: a.py) (verify: test -f a.py)"
+    "- [ ] {b} create b.py (files: b.py) (verify: test -f b.py)"
+    "- [ ] {c} create c (files: a.py) (verify: test -f a.py)"   ; 与 a 文件重叠 → 排除
+    "- [ ] {e} no-files task (verify: test -f e.py)"            ; 无 files → 排除
+    "- [ ] {f} no-verify (files: f.py)")))                      ; 无 verify → 排除
+  (check-equal? (map plan-task-id (disjoint-ready tasks 4)) '("a" "b"))
+  (check-equal? (length (disjoint-ready tasks 1)) 1)             ; cap
+) ; end test-case
+
+;; module provider（无状态,线程安全）：从窗口解析目标 *.py 文件名；未写过 → 吐 write_file，写过 → 终止。
+(define (make-module-provider)
+  (provider "mod"
+    (lambda (msgs _t)
+      (define ch (make-async-channel))
+      (define txt (apply string-append
+                         (for/list ([m (in-list msgs)] #:when (eq? (message-role m) 'user)) (message-text m))))
+      (define fm (regexp-match #px"([a-z]+\\.py)" txt))
+      (define fname (if fm (cadr fm) "x.py"))
+      (define wrote? (for/or ([m (in-list msgs)])
+                       (for/or ([b (in-list (message-tool-uses m))]) (string=? (tool-use-block-name b) "write_file"))))
+      (thread (lambda ()
+                (cond
+                  [wrote?
+                   (async-channel-put ch (evt:message (now-ms) (text-msg 'assistant "done")))
+                   (async-channel-put ch (evt:turn-end (now-ms) "stop" (usage 1 1)))]
+                  [else
+                   (async-channel-put ch (evt:message (now-ms)
+                     (message 'assistant (list (tool-use-block "c" "write_file" (hasheq 'path fname 'content "module"))))))
+                   (async-channel-put ch (evt:turn-end (now-ms) "tool_calls" (usage 1 1)))])))
+      ch)
+    void))
+
+(test-case "run-goal-dag!：两独立任务并行 worker(隔离 worktree) → 串行 merge → 全局验收过 → DONE"
+  (define repo (make-temporary-file "pi2-par-~a" 'directory))
+  (git! repo "init" "-q") (git! repo "config" "user.email" "t@e.com") (git! repo "config" "user.name" "t")
+  (void (call-with-output-file (build-path repo "PLAN.md")
+          (lambda (o) (write-string (string-join (list
+            "- [ ] {a} create a.py (files: a.py) (verify: test -f a.py)"
+            "- [ ] {b} create b.py (files: b.py) (verify: test -f b.py)") "\n") o))))
+  (git! repo "add" "-A") (git! repo "commit" "-m" "plan")
+  (define host (make-plugin-host))
+  (define cfg (struct-copy config (default-config) [workdir (path->string repo)] [permission-mode 'yolo]))
+  (define d (make-deps #:provider (make-module-provider) #:registry (make-registry (list (make-write-file-tool)))
+                       #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define sess (session-open! (build-path repo "s.rktd") cfg))
+  (define-values (emit dump) (collect-emit))
+  (define st (run-goal-dag! d (make-initial-state cfg) sess host "build a and b"
+                            (list "test -f a.py && test -f b.py") 6
+                            #:concurrency 4 #:worker-turns 3 #:emit emit))
+  (session-close! sess)
+  (define log (string-join (dump) "\n"))
+  (check-true (string-contains? log "PARALLEL 2 workers"))
+  (check-true (string-contains? log "DONE"))
+  (check-true (file-exists? (build-path repo "a.py")))    ; 两个 worker 的产物都 merge 回主树
+  (check-true (file-exists? (build-path repo "b.py")))
+  (delete-directory/files repo)
+) ; end test-case
+
 (delete-directory/files tmpdir)

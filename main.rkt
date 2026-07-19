@@ -132,6 +132,7 @@
   (define until-cmds (box '()))
   (define max-turns-arg (box 20))
   (define budget-arg (box #f))
+  (define parallel? (box #f))
 
   (command-line
    #:program "pi++"
@@ -168,6 +169,8 @@
                  (let ([v (string->number usd)])
                    (if (and (real? v) (> v 0)) (set-box! budget-arg v)
                        (begin (eprintf "invalid --budget: ~a\n" usd) (exit 1))))]
+   [("--parallel") "goal mode: run independent DAG tasks (disjoint files) in parallel git worktrees"
+                   (set-box! parallel? #t)]
    [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
    [("--mode") md "permission mode: yolo|normal|strict|auto (auto = scoped auto-approve: in-workdir read/write auto, network/destructive asks)" (set-box! mode md)]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
@@ -381,9 +384,12 @@
         (session-close! sess) (exit 1)]
        [else
         (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
-        (run-goal! d st0 sess (unbox goal-arg) cmds (unbox max-turns-arg) host
-                   #:budget (unbox budget-arg)
-                   #:emit (lambda (s) (displayln s) (flush-output)))
+        (define emit (lambda (s) (displayln s) (flush-output)))
+        (if (unbox parallel?)
+            (run-goal-dag! d st0 sess host (unbox goal-arg) cmds (unbox max-turns-arg)
+                           #:budget (unbox budget-arg) #:emit emit)
+            (run-goal! d st0 sess (unbox goal-arg) cmds (unbox max-turns-arg) host
+                       #:budget (unbox budget-arg) #:emit emit))
         (unsub) (session-close! sess)])
     ] ; end goal case
     ;; 无头 JSONL 模式（IDE/编排器）：复用内核，事件与响应走 stdout NDJSON。

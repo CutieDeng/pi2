@@ -66,6 +66,8 @@
   (check-true (escalation-active? host))
   (host-set-provider! host "lmstudio")
   (check-false (escalation-active? host))
+  (host-set-provider! host "deepseek-lite")
+  (check-false (escalation-active? host))                 ; lite 只用 flash，不上升级梯
   (host-set-provider! host "deepseek")
   (set-escalate! #f)
   (check-false (escalation-active? host))                 ; 开关 off

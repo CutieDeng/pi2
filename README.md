@@ -95,6 +95,7 @@ racket main.rkt --rm 3                    # 删除某会话
 | `gemini` | OpenAI 兼容 | Google `.../v1beta/openai` | `GEMINI_API_KEY` |
 | `grok` | OpenAI 兼容 | `api.x.ai/v1` | `XAI_API_KEY` |
 | `deepseek` | **原生 Messages**（复用 anthropic 线路） | `api.deepseek.com/anthropic` | `DEEPSEEK_API_KEY` |
+| `deepseek-lite` | 同 `deepseek`（仅 `deepseek-v4-flash`，无 auto/升级梯） | `api.deepseek.com/anthropic` | `DEEPSEEK_API_KEY` |
 
 - 启动用 `--provider <name>`；运行时用 `/provider <name>` 切换，`/model <id>` 再改模型。切档案会把
   endpoint / 密钥（读环境变量）/ 默认 model 写进当前 config，下一轮即生效（读 `current-config`）。
@@ -126,7 +127,8 @@ racket main.rkt --rm 3                    # 删除某会话
 
 实例名 `base[label]`（默认 label `default`）——把同一 provider 的多套 token 视作不同实例：
 `deepseek[work]`、`deepseek[home]`。实例 token 独立存于凭据文件（键 `provider:deepseek:work`），
-`default` 实例无 stored key 时回落该 profile 的 env 变量。
+`default` 实例无 stored key 时回落该 profile 的 env 变量；仍无则回落**同 key-env 兄弟档案**的
+`default` 实例密钥（`deepseek` 与 `deepseek-lite` 共用 `DEEPSEEK_API_KEY`，任一录过 token 即共享）。
 
 - CLI：`--provider 'deepseek[work]'`；`--list-keys` 列出实例。
 - TUI：`/provider add <name[label]>` 贴底录 token → 存缓存配置并切过去；`/provider key <name[label]>` 仅改 token。
@@ -142,6 +144,8 @@ racket main.rkt --rm 3                    # 删除某会话
 
 - 开关：默认 on；`/auto on|off`、`--auto on|off`、RPC `{"type":"set_auto","on":false}`。
 - 生效面只限 deepseek，其它 provider 一律不受影响；`/auto off` 可退回手动 `/model`。
+- 轻量档案 `deepseek-lite`（base ≠ deepseek）不在 auto / 升级梯生效面内——始终停在
+  `deepseek-v4-flash`，适合固定的轻量对话任务。
 - 实现全在「turn 之前」层（改 config-model + 设推理 box），内核 loop/provider 不动；接入 repl/rpc/一次性 -p 各一行。
 - 每轮回显选择：REPL `auto → <model> · thinking <lvl>`；RPC 发 `{"type":"auto","model":...,"reasoning":...}`。
 

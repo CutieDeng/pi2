@@ -8,7 +8,8 @@
 ;;   · 覆写终端原生滚屏：alt screen（无原生 scrollback），滚动由我们控制——
 ;;     鼠标滚轮（SGR）/ PageUp·PageDown 翻动自有视口；新输出到达时自动跟随到底部。
 ;;   · 输入框恒钉底部并显示光标；LLM 流式输出滚动于内容区，输出体上无光标游走
-;;     （每帧 \e[?25l…\e[?25h 括起，末尾绝对定位光标到框内）。
+;;     （每帧 \e[?2026h/\e[?25l…\e[?25h/\e[?2026l 括起——同步更新 + 藏光标，
+;;     末尾绝对定位光标到框内）。
 ;;   · LLM 工作动画：等待模型输出（尤其首 token 前）时，状态行显示 braille 转轮 + 标签，
 ;;     由 animator 线程每 120ms 推进，明示「正在工作」。
 ;;   · 全程 raw；单锁串行化一切写；Ctrl-C 阶梯（不回显 ^C）；空回车不派发仅换行；
@@ -123,6 +124,8 @@
    rate-acc   ; box of exact — 上次采样以来累计的输出字符数
    rate-t     ; box of real — 上次采样时刻（ms）
    osc?       ; boolean — 是否发 OSC 9;4 终端原生进度条
+   pastes     ; box of (listof (cons string string)) — 折叠粘贴：占位符→原文
+              ;   （会话生命周期，提交派发时展开；历史/回显保留折叠形态）
   ) ; end fields
 ) ; end struct console
 
@@ -165,7 +168,7 @@
            (box 80) (box 24) (box 'input) (make-async-channel)
            (box #f) (box history) interrupt hint
            (box #f) (box 0) (box #f) (box #f) complete shortcut (box #f) (box #f) progress-style
-           (box 0.0) (box 0) (box 0.0) osc?)
+           (box 0.0) (box 0) (box 0.0) osc? (box '()))
 ) ; end define make-console
 
 ;; 尺寸夹紧：拒绝退化/零尺寸（真实终端偶发上报 0，或查询失败）。
@@ -315,11 +318,16 @@
   (fit-rows (take (drop vis starti) (- endi starti)) Ch)
 ) ; end define compute-content
 
-;; 把内容行 + 底部框行组装成整屏 body（\e[H + 每行 \e[K + \r\n 拼接 + \e[J）
-(define (assemble-body content box-lines)
+;; 把内容行 + 底部框行组装成整屏 body（\e[H 起始，行间 \r\n，末尾 \e[J）。
+;; 每行**先写内容再** \e[K 清行尾——「先擦后写」在终端中途刷新时会闪一下空白；
+;; 恰满宽的行跳过 \e[K：写满末列后处于延迟折行态，EL 会擦掉刚写入的末列字符。
+(define (assemble-body content box-lines W)
   (string-append
    "\e[H"
-   (string-join (for/list ([r (in-list (append content box-lines))]) (string-append "\e[K" r)) "\r\n")
+   (string-join
+    (for/list ([r (in-list (append content box-lines))])
+      (if (< (visible-width r) W) (string-append r "\e[K") r))
+    "\r\n")
    "\e[J")
 ) ; end define assemble-body
 
@@ -345,7 +353,7 @@
      (input-display-lines con)))
   (define-values (crow ccol) (input-cursor-rc con))
   (define input-row0 (+ Ch (if status 1 0) 1 (length hints) 1))  ; 输入首行(1 基)
-  (string-append (assemble-body content box-lines) f"\e[{(+ input-row0 crow)};{ccol}H")
+  (string-append (assemble-body content box-lines W) f"\e[{(+ input-row0 crow)};{ccol}H")
 ) ; end define render-input-frame
 
 ;; 贴底内联小选框：底部 = [标题] + [选项…]，内容区（对话）仍占其上方并可见。
@@ -362,7 +370,7 @@
   (define content (compute-content con Ch))
   ;; 光标落在选中项行首（高亮已指示选择；此处仅作视觉锚点）
   (define cur-row (+ Ch 2 idx))                   ; 内容 Ch 行 + 标题 1 行 + (idx+1)
-  (string-append (assemble-body content box-lines) f"\e[{cur-row};1H")
+  (string-append (assemble-body content box-lines W) f"\e[{cur-row};1H")
 ) ; end define render-choose-frame
 
 (define (dim s) f"\e[2m{s}\e[0m")
@@ -371,9 +379,10 @@
   (dim (string-append frame " " label))
 ) ; end define dim-status
 
-;; 单次原子写入：藏光标→写整帧→（帧末已定位）复现光标。
+;; 单次原子写入：DEC 同步更新括帧（\e[?2026h…l，支持的终端把整帧原子呈现，杜绝
+;; 大帧写入中途被渲染成半成品；不支持的终端忽略之）+ 藏光标→写整帧→复现光标。
 (define (frame! con s)
-  (term-write (console-term con) (string-append "\e[?25l" s "\e[?25h"))
+  (term-write (console-term con) (string-append "\e[?2026h\e[?25l" s "\e[?25h\e[?2026l"))
 ) ; end define frame!
 
 ;; 选择器模式：整屏画列表、藏光标（无输入框光标）；否则常规整帧。
@@ -386,7 +395,7 @@
                                       (max 20 (unbox (console-cols con)))
                                       (max 4 (unbox (console-termrows con)))))
      (term-write (console-term con)
-                 (string-append "\e[?25l\e[H" (string-join lines "\r\n") "\e[J"))
+                 (string-append "\e[?2026h\e[?25l\e[H" (string-join lines "\r\n") "\e[J\e[?2026l"))
     ] ; end picker
     [else (frame! con (render-frame con))]
   ) ; end cond
@@ -399,6 +408,7 @@
     (lambda ()
       (when (unbox (console-status con)) (set-box! (console-status con) #f))  ; 有输出→停动画
       (define W (unbox (console-cols con)))
+      (define N0 (total-vrows con))               ; 锚定基准：变更前总视觉行数
       (define combined (string-append (unbox (console-pending con)) text))
       (define segs (regexp-split #rx"\n" combined))
       (define complete (reverse (cdr (reverse segs))))
@@ -409,13 +419,57 @@
           (wrap-count l W)))
       (set-box! (console-vrows con) (+ (unbox (console-vrows con)) added))
       (set-box! (console-pending con) newpend)
-      ;; 上滚状态下保持视口锚定（新行不把用户拽走）
+      ;; 上滚状态下保持视口锚定：按**总**视觉行数增量补偿（含 pending 的折行变化——
+      ;; 只补已提交行会让未完行每跨一次折行边界视口上爬一行、行提交时又回跳）
       (when (> (unbox (console-view con)) 0)
-        (set-box! (console-view con) (+ (unbox (console-view con)) added)))
+        (set-box! (console-view con)
+                  (max 0 (+ (unbox (console-view con)) (- (total-vrows con) N0)))))
       (redraw! con)
     ) ; end lambda
   ) ; end call-with-semaphore
 ) ; end define console-emit!
+
+;; ------------------------------------------------------------ 括号粘贴
+
+;; 超过此长度的单行粘贴也折叠（多行粘贴一律折叠）
+(define PASTE-VERBATIM-MAX 200)
+
+;; 折叠占位符："[paste #1 +12 lines]"（多行）/ "[paste #2 345 chars]"（超长单行）
+(define (paste-placeholder n text)
+  (define ls (length (regexp-split #rx"\n" text)))
+  (if (> ls 1) f"[paste #{n} +{ls} lines]" f"[paste #{n} {(string-length text)} chars]")
+) ; end define paste-placeholder
+
+;; 括号粘贴入框：统一换行（\r\n / \r → \n）；多行或超长 → 折叠为占位符插入
+;; （原文入 pastes 注册表，提交时展开），否则原样插入光标处。
+;; 粘贴整段是一个事件，绝不触发提交——这正是括号粘贴模式的意义。
+(define (console-paste! con text0)
+  (define text (regexp-replace* #rx"\r\n?" text0 "\n"))
+  (call-with-semaphore (console-lock con)
+    (lambda ()
+      (define ins
+        (cond
+          [(or (regexp-match? #rx"\n" text) (> (string-length text) PASTE-VERBATIM-MAX))
+           (define n (add1 (length (unbox (console-pastes con)))))
+           (define ph (paste-placeholder n text))
+           (set-box! (console-pastes con) (cons (cons ph text) (unbox (console-pastes con))))
+           ph
+          ] ; end collapse
+          [else text]
+        ) ; end cond
+      ) ; end define ins
+      (set-box! (console-ledit con) (insert-str (unbox (console-ledit con)) ins))
+      (redraw! con)
+    ) ; end lambda
+  ) ; end call-with-semaphore
+) ; end define console-paste!
+
+;; 把行内所有粘贴占位符展开回原文（提交派发前调用）。注册表存活整个会话，
+;; 故从历史召回的折叠行再次提交仍能展开。
+(define (expand-pastes con line)
+  (for/fold ([s line]) ([p (in-list (unbox (console-pastes con)))])
+    (string-replace s (car p) (cdr p)))
+) ; end define expand-pastes
 
 ;; ------------------------------------------------------------ 提交行改道
 
@@ -438,6 +492,10 @@
 
 (define (console-handle-key! con k)
   (cond
+    [(kpaste? k)                                      ; 括号粘贴：整段入框，不逐键
+     (unless (or (unbox (console-choose con)) (unbox (console-picker con)))
+       (console-paste! con (kpaste-text k)))
+     'continue]
     [(unbox (console-choose con)) (handle-choose-key! con k) 'continue]
     [(unbox (console-picker con)) (handle-picker-key! con k) 'continue]
     [((console-shortcut con) k)                       ; 插件快捷键：命中即执行其 thunk
@@ -515,9 +573,13 @@
                      [else SCROLL-STEP]))
       (define dir (if (memq (kev-name k) '(scroll-up pgup)) 1 -1))
       (define maxv (max 0 (- (total-vrows con) Ch)))
-      (set-box! (console-view con)
-                (max 0 (min maxv (+ (unbox (console-view con)) (* dir step)))))
-      (redraw! con)
+      (define v0 (unbox (console-view con)))
+      (define v (max 0 (min maxv (+ v0 (* dir step)))))
+      ;; 已在边缘（底部 v=0 / 顶部 v=maxv）继续滚动 → 视口不变，跳过重绘。
+      ;; 惯性滚轮在边缘会连发大量事件，逐帧全屏重绘是可见的抖动源。
+      (unless (= v v0)
+        (set-box! (console-view con) v)
+        (redraw! con))
     ) ; end lambda
   ) ; end call-with-semaphore
 ) ; end define do-scroll!
@@ -554,7 +616,7 @@
          (set-box! (console-view con) 0)
          (set-box! (console-ledit con) (make-ledit #:history (unbox (console-history con))))
          (redraw! con)))
-     (route-value! con line)
+     (route-value! con (expand-pastes con line))   ; 派发展开原文；回显/历史保留折叠形态
      'continue
     ] ; end else
   ) ; end cond
@@ -752,8 +814,8 @@
 
 (define (console-start! con)
   (term-raw-on! (console-term con))
-  ;; 进 alt screen（禁原生 scrollback）+ SGR 鼠标上报 + modifyOtherKeys
-  (term-write (console-term con) "\e[?1049h\e[?1000h\e[?1006h\e[>4;1m")
+  ;; 进 alt screen（禁原生 scrollback）+ SGR 鼠标上报 + modifyOtherKeys + 括号粘贴
+  (term-write (console-term con) "\e[?1049h\e[?1000h\e[?1006h\e[>4;1m\e[?2004h")
   (define-values (c r) (term-size (console-term con)))
   (set-box! (console-cols con) (clamp-dim c 80 20))
   (set-box! (console-termrows con) (clamp-dim r 24 4))
@@ -767,7 +829,7 @@
   (call-with-semaphore (console-lock con)
     (lambda ()
       (term-write (console-term con)
-                  "\e[?1000l\e[?1006l\e[>4;0m\e[?25h\e[?1049l")))  ; 复原鼠标/键/光标/主屏
+                  "\e[?2004l\e[?1000l\e[?1006l\e[>4;0m\e[?25h\e[?1049l")))  ; 复原粘贴/鼠标/键/光标/主屏
   (term-raw-off! (console-term con))
 ) ; end define console-stop!
 

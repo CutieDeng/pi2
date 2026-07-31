@@ -172,6 +172,28 @@
   (check-true (string-contains? (last-frame st) "─"))    ; 分隔线
 ) ; end test-case
 
+(test-case "frames are bracketed by DEC synchronized update (2026)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "hello\n")
+  (define out (scripted-output st))
+  ;; 每帧：\e[?2026h 开帧在 \e[H 之前，\e[?2026l 收帧在最末（光标复现之后）
+  (check-true (string-contains? out "\e[?2026h\e[?25l"))
+  (check-true (string-contains? out "\e[?25h\e[?2026l"))
+  (check-equal? (substring out (- (string-length out) 8)) "\e[?2026l")
+) ; end test-case
+
+(test-case "rows are written content-first then \\e[K; full-width rows skip the clear"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "hello\n")
+  (define f (last-frame st))
+  (check-true (string-contains? f "hello\e[K"))    ; 先写内容再清行尾（不闪空白）
+  (check-false (string-contains? f "\e[Khello"))   ; 不再「先擦后写」
+  ;; 分隔线恰满 80 列：写满末列后处于延迟折行态，\e[K 会擦掉末列字符 → 必须跳过
+  (check-false (string-contains? f "\e[0m\e[K"))   ; 唯一以 \e[0m 结尾的满宽行无 \e[K
+) ; end test-case
+
 (test-case "Tab applies the completion callback to the input line"
   (define comp (lambda (t) (if (string=? t "/mo") "/model " #f)))
   (define-values (term st) (make-scripted-terminal ""))
@@ -220,6 +242,37 @@
   (check-false (string-contains? (last-frame st) "mark0."))
 ) ; end test-case
 
+(test-case "scrolled-up view is rock-solid while a long line streams (pending wrap boundaries)"
+  ;; 回归：锚定补偿曾只计已提交行——未完行每跨一次折行边界（80 列）视口上爬一行，
+  ;; 行提交时又回跳。修正后按总视觉行数增量补偿，锚定期间整帧应逐字节不变。
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (for ([i (in-range 60)]) (console-emit! con f"mark{i}.\n"))
+  (feed! con (bytes-append #"\e[5~" #"\e[5~" #"\e[5~"))         ; 上滚到最旧
+  (check-true (string-contains? (last-frame st) "mark0."))
+  (define anchored (last-frame st))
+  ;; 流式追加 3×60 字符（无换行）：pending 依次折成 1/2/3 视觉行
+  (for ([i (in-range 3)])
+    (console-emit! con (make-string 60 (integer->char (+ (char->integer #\a) i))))
+    (check-equal? (last-frame st) anchored f"chunk {i}: 视口被流式 pending 拽动"))
+  ;; 该行提交（\n）：已提交行数 +3、pending 行数 -3，增量为 0 → 仍不动
+  (console-emit! con "\n")
+  (check-equal? (last-frame st) anchored "行提交时视口回跳")
+  ;; 滚回底部后能看到新内容（数据没丢，只是锚定期间不显示）
+  (feed! con "\r")                                              ; 空回车 → 跳回底部
+  (check-true (string-contains? (last-frame st) "aaa"))
+) ; end test-case
+
+(test-case "at bottom (follow mode) streaming pending stays visible, no anchoring"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-emit! con "before\n")
+  (console-emit! con (make-string 100 #\z))       ; 跨折行的未完行
+  (define f (last-frame st))
+  (check-true (string-contains? f "before"))
+  (check-true (string-contains? f "zzz"))          ; 跟随底部：pending 可见
+) ; end test-case
+
 (test-case "mouse wheel scrolls the viewport"
   (define-values (term st) (make-scripted-terminal ""))
   (define con (make-console term))
@@ -227,6 +280,87 @@
   (for ([_ (in-range 12)]) (feed! con #"\e[<64;1;1M"))         ; 滚轮上滚 12×3 行
   (check-true (string-contains? (last-frame st) "mark20."))
   (check-false (string-contains? (last-frame st) "mark59."))
+) ; end test-case
+
+;; ---------------------------------------------------------------- 括号粘贴
+
+(test-case "keys: bracketed paste parses into a single kpaste event"
+  (define ks (parse-keys "x\e[200~line1\nline2\e[201~y"))
+  (check-equal? (length ks) 3)
+  (check-equal? (kev-char (car ks)) #\x)
+  (check-true (kpaste? (cadr ks)))
+  (check-equal? (kpaste-text (cadr ks)) "line1\nline2")
+  (check-equal? (kev-char (caddr ks)) #\y)
+) ; end test-case
+
+(test-case "multi-line paste collapses to a placeholder, never dispatches; submit expands"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con "\e[200~line1\nline2\nline3\e[201~")
+  (check-false (async-channel-try-get (console-submit-channel con)))  ; 粘贴不触发提交
+  (check-true (string-contains? (last-frame st) "[paste #1 +3 lines]"))
+  (feed! con "\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "line1\nline2\nline3")
+  ;; 回显与历史保留折叠形态
+  (check-true (string-contains? (last-frame st) "[paste #1 +3 lines]"))
+  (check-equal? (console-history-list con) '("[paste #1 +3 lines]"))
+) ; end test-case
+
+(test-case "short single-line paste inserts verbatim (no placeholder)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con "\e[200~hello world\e[201~")
+  (check-false (string-contains? (last-frame st) "[paste"))
+  (feed! con "\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "hello world")
+) ; end test-case
+
+(test-case "pasted \\r line endings normalize to \\n (terminals paste Enter as CR)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con "\e[200~a\rb\e[201~")
+  (check-false (async-channel-try-get (console-submit-channel con)))  ; \r 不再当 Enter
+  (feed! con "\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "a\nb")
+) ; end test-case
+
+(test-case "placeholder composes with typed text around it"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (feed! con "before ")
+  (feed! con "\e[200~x\ny\e[201~")
+  (feed! con " after\r")
+  (check-equal? (async-channel-try-get (console-submit-channel con)) "before x\ny after")
+) ; end test-case
+
+(test-case "bracketed paste mode enabled on start, disabled on stop"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (console-start! con)
+  (console-stop! con)
+  (check-true (string-contains? (scripted-output st) "\e[?2004h"))
+  (check-true (string-contains? (scripted-output st) "\e[?2004l"))
+) ; end test-case
+
+;; ---------------------------------------------------------------- 滚动边缘去抖
+
+(test-case "scrolling past either edge is a no-op (no redraw storm from inertial wheel)"
+  (define-values (term st) (make-scripted-terminal ""))
+  (define con (make-console term))
+  (for ([i (in-range 60)]) (console-emit! con f"mark{i}.\n"))
+  ;; 底部（view=0）继续下滚：不产生任何写出
+  (define len0 (string-length (scripted-output st)))
+  (for ([_ (in-range 5)]) (feed! con #"\e[<65;1;1M"))          ; 滚轮下滚 ×5
+  (feed! con #"\e[6~")                                         ; PageDown
+  (check-equal? (string-length (scripted-output st)) len0)
+  ;; 顶部同理：滚到顶后继续上滚不再写出
+  (for ([_ (in-range 40)]) (feed! con #"\e[5~"))               ; PageUp 到顶（夹紧）
+  (define len1 (string-length (scripted-output st)))
+  (for ([_ (in-range 5)]) (feed! con #"\e[<64;1;1M"))          ; 滚轮上滚 ×5
+  (check-equal? (string-length (scripted-output st)) len1)
+  ;; 离开边缘后滚动恢复正常
+  (feed! con #"\e[<65;1;1M")                                   ; 下滚一步
+  (check-true (> (string-length (scripted-output st)) len1))
 ) ; end test-case
 
 ;; ---------------------------------------------------------------- 工作动画

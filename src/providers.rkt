@@ -38,6 +38,11 @@
    ;; 旧的 deepseek-chat/deepseek-reasoner(V3) 仍可用 --model 显式选。
    (provider-profile "deepseek"  'anthropic "https://api.deepseek.com/anthropic"
                      "deepseek-v4-flash" "DEEPSEEK_API_KEY")
+   ;; deepseek-lite：同端点/密钥的轻量档案——base ≠ "deepseek"，故 auto/升级梯（均
+   ;; gated 到 base=deepseek）天然不生效，始终停在 v4-flash。适合简单对话等固定
+   ;; 轻量任务；需要更强模型请选 deepseek 档案或显式 /model。
+   (provider-profile "deepseek-lite" 'anthropic "https://api.deepseek.com/anthropic"
+                     "deepseek-v4-flash" "DEEPSEEK_API_KEY")
   ) ; end list
 ) ; end define BUILTIN-PROFILES
 
@@ -71,11 +76,19 @@
 ;; base 是否内置档案名（实例名亦可，取其 base 判定）。
 (define (builtin-provider-instance? name) (builtin-provider-name? (instance-base name)))
 
-;; 解析某实例的 token：实例文件密钥优先；无则 default 标签回退 profile 的 env 变量；再无 → #f。
+;; 解析某实例的 token：实例文件密钥优先；无则 default 标签回退 profile 的 env 变量；
+;; 再无则回退**同 key-env 兄弟档案**的 default 实例密钥（如 deepseek-lite ↔ deepseek：
+;; 声明同一 key-env 即声明「同一套凭据」，任一档案录过 token 其余共享）；仍无 → #f。
 (define (resolve-provider-token base label)
   (or (resolve-instance-key base label)
       (and (string=? label "default")
-           (let ([env (provider-profile-key-env-of base)]) (and env (resolve-key env))))))
+           (let ([env (provider-profile-key-env-of base)])
+             (and env
+                  (or (resolve-key env)
+                      (for/or ([p (in-list BUILTIN-PROFILES)]
+                               #:when (and (equal? (provider-profile-key-env p) env)
+                                           (not (string=? (provider-profile-name p) base))))
+                        (resolve-instance-key (provider-profile-name p) "default"))))))))
 
 ;; profile → (config → provider)：线路格式按 kind 选，读 current-config 取 live 值。
 (define (profile->factory p)

@@ -18,6 +18,10 @@
 (define (knamed name [mods '()]) (kev 'named #f name mods))
 (define key-eof (kev 'eof #f #f '()))
 
+;; 括号粘贴事件（\e[200~…\e[201~ 之间的原文整段作为一个事件，不逐键解析——
+;; 否则粘贴里的 \r 会被当成 Enter 触发提交）
+(struct kpaste (text) #:prefab)
+
 (define (kev-ctrl? k) (and (memq 'ctrl (kev-mods k)) #t))
 (define (kev-alt? k) (and (memq 'alt (kev-mods k)) #t))
 (define (kev-shift? k) (and (memq 'shift (kev-mods k)) #t))
@@ -106,13 +110,44 @@
          (or (string->number p) 0)
        ) ; end for/list
      ) ; end define nums
-     (define mods
-       (if (>= (length nums) 2) (decode-mods (cadr nums)) '())
-     ) ; end define mods
-     (csi->kev final nums mods)
+     (cond
+       [(and final (= final (char->integer #\~)) (pair? nums) (= (car nums) 200))
+        (read-paste in)                        ; 括号粘贴开始标记 \e[200~
+       ] ; end paste
+       [else
+        (define mods
+          (if (>= (length nums) 2) (decode-mods (cadr nums)) '())
+        ) ; end define mods
+        (csi->kev final nums mods)
+       ] ; end else
+     ) ; end cond
     ] ; end else
   ) ; end cond
 ) ; end define parse-csi
+
+;; 括号粘贴（\e[200~ 已消费）：吞原文直到结束标记 \e[201~（或 eof），整段返回 kpaste。
+;; 原文按 UTF-8 解码；中途的 ESC 若非结束标记前缀则按普通字节保留。
+(define (read-paste in)
+  (define buf (open-output-bytes))
+  (let loop ()
+    (define b (read-byte in))
+    (cond
+      [(eof-object? b) (void)]
+      [(= b #x1B)
+       (define tail (peek-bytes 5 0 in))
+       (cond
+         [(and (bytes? tail) (= (bytes-length tail) 5) (bytes=? tail #"[201~"))
+          (read-bytes 5 in)
+          (void)
+         ] ; end terminator
+         [else (write-byte b buf) (loop)]
+       ) ; end cond
+      ] ; end esc
+      [else (write-byte b buf) (loop)]
+    ) ; end cond
+  ) ; end let loop
+  (kpaste (bytes->string/utf-8 (get-output-bytes buf) #\uFFFD))
+) ; end define read-paste
 
 ;; SGR 鼠标：仅关心滚轮（按钮码 bit6 置位；bit0：0=上,1=下）。其余（点击/移动）忽略。
 (define (sgr-mouse->kev param-str)
@@ -266,7 +301,7 @@
   (define in (open-input-bytes (if (string? bs) (string->bytes/utf-8 bs) bs)))
   (let loop ([acc '()])
     (define k (parse-key in))
-    (if (eq? (kev-kind k) 'eof)
+    (if (and (kev? k) (eq? (kev-kind k) 'eof))   ; kpaste 亦可能出现，非 kev
         (reverse acc)
         (loop (cons k acc))
     ) ; end if
@@ -277,6 +312,7 @@
 
 (provide
  (struct-out kev)
+ (struct-out kpaste)
  kchar
  knamed
  key-eof

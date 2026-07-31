@@ -25,11 +25,11 @@
 
 ;; ------------------------------------------------------------ 档案注册
 
-(test-case "register-builtin-providers! exposes all six profiles"
+(test-case "register-builtin-providers! exposes all seven profiles"
   (define host (make-plugin-host))
   (register-builtin-providers! host)
   (define avail (host-available-providers host))
-  (for ([name (in-list '("lmstudio" "openai" "anthropic" "deepseek" "gemini" "grok"))])
+  (for ([name (in-list '("lmstudio" "openai" "anthropic" "deepseek" "deepseek-lite" "gemini" "grok"))])
     (check-not-false (member name avail) (format "~a 应可选" name)))
   (check-equal? (host-current-provider host) "lmstudio")        ; 默认本地
 ) ; end test-case
@@ -40,6 +40,18 @@
   (check-equal? (provider-profile-endpoint p) "https://api.deepseek.com/anthropic")
   (check-equal? (provider-profile-model p) "deepseek-v4-flash")
   (check-equal? (provider-profile-key-env-of "deepseek") "DEEPSEEK_API_KEY")
+) ; end test-case
+
+(test-case "deepseek-lite: same wire/endpoint/key as deepseek, flash-only, outside auto/escalate gate"
+  (define p (profile-by-name "deepseek-lite"))
+  (check-equal? (provider-profile-kind p) 'anthropic)
+  (check-equal? (provider-profile-endpoint p) "https://api.deepseek.com/anthropic")
+  (check-equal? (provider-profile-model p) "deepseek-v4-flash")
+  (check-equal? (provider-profile-key-env-of "deepseek-lite") "DEEPSEEK_API_KEY")
+  ;; auto/升级梯 gated 到 base=deepseek 的精确匹配；lite 的 base 必须不等，
+  ;; 否则会被自动升到 pro，违背「只用 flash」的定位。
+  (check-false (string=? (provider-base-name "deepseek-lite") "deepseek"))
+  (check-false (string=? (provider-base-name "deepseek-lite[work]") "deepseek"))
 ) ; end test-case
 
 (test-case "host-set-provider! switches among builtins; unknown rejected"
@@ -120,6 +132,28 @@
   ;; 非 default 标签无 env 回退
   (check-false (resolve-provider-token "deepseek" "work"))
   (putenv "DEEPSEEK_API_KEY" "")
+  (delete-directory/files home)
+) ; end test-case
+
+(test-case "same key-env siblings share the default instance token (deepseek-lite ↔ deepseek)"
+  (define home (make-temporary-file "pi2-inst3-~a" 'directory))
+  (putenv "PI_CONFIG_HOME" (path->string home))
+  (putenv "DEEPSEEK_API_KEY" "")                               ; env 未设 → 走兄弟档案回退
+  (store-instance-key! "deepseek" "default" "sk-shared-token")
+  (check-equal? (resolve-provider-token "deepseek-lite" "default") "sk-shared-token")
+  (define c (apply-provider-profile (default-config) "deepseek-lite"))
+  (check-equal? (config-api-key c) "sk-shared-token")
+  (check-equal? (config-model c) "deepseek-v4-flash")
+  ;; env 设置时优先于兄弟文件密钥（自身文件密钥仍最优先）
+  (putenv "DEEPSEEK_API_KEY" "sk-env-wins")
+  (check-equal? (resolve-provider-token "deepseek-lite" "default") "sk-env-wins")
+  (check-equal? (resolve-provider-token "deepseek" "default") "sk-shared-token")
+  (putenv "DEEPSEEK_API_KEY" "")
+  ;; lite 自己录了 token → 自身实例密钥优先，不再借兄弟的
+  (store-instance-key! "deepseek-lite" "default" "sk-lite-own")
+  (check-equal? (resolve-provider-token "deepseek-lite" "default") "sk-lite-own")
+  ;; 非 default 标签不共享
+  (check-false (resolve-provider-token "deepseek-lite" "work"))
   (delete-directory/files home)
 ) ; end test-case
 

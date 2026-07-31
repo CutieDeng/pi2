@@ -301,6 +301,7 @@
  (struct-out ledit)
  make-ledit
  ledit-value
+ insert-str
  ledit-apply
  ledit-render
  ledit-line-count

@@ -60,6 +60,11 @@
   (define-values (st-c dec-c) (maybe-apply-auto st "hi" host))
   (check-equal? (car dec-c) "deepseek-v4-flash")
   (check-equal? (cdr dec-c) 'off)
+  ;; deepseek-lite 定位「只用 flash」：base ≠ deepseek，难任务也不升 pro
+  (host-set-provider! host "deepseek-lite")
+  (define-values (st-d dec-d) (maybe-apply-auto st "implement quicksort" host))
+  (check-false dec-d)
+  (check-eq? st-d st)
 ) ; end test-case
 
 (test-case "auto off → never fires even on deepseek"

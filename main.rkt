@@ -146,7 +146,7 @@
                         (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
-   [("--provider") name "LLM provider (lmstudio | openai | anthropic | deepseek | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--provider") name "LLM provider (lmstudio | openai | anthropic | deepseek | deepseek-lite | gemini | grok | plugin name)" (set-box! provider-arg name)]
    [("--set-key") env-name "store an API key (env var name); value read from stdin, then exit" (set-box! set-key-arg env-name)]
    [("--list-keys") "list configured provider keys (masked) and exit" (set-box! list-keys? #t)]
    [("--rm-key") env-name "delete a stored API key and exit" (set-box! rm-key-arg env-name)]

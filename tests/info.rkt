@@ -5,4 +5,6 @@
   '("provider-live-test.rkt"
     "loop-live-test.rkt"
     "subagent-live-test.rkt"
-    "deepseek-live-test.rkt"))
+    "deepseek-live-test.rkt"
+    "dsv4b-live-test.rkt"
+    "dsv4b-bench.rkt"))

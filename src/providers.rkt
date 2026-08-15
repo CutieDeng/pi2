@@ -43,6 +43,11 @@
    ;; 轻量任务；需要更强模型请选 deepseek 档案或显式 /model。
    (provider-profile "deepseek-lite" 'anthropic "https://api.deepseek.com/anthropic"
                      "deepseek-v4-flash" "DEEPSEEK_API_KEY")
+   ;; dsv4-b：Harness Minimal 锚定档案（两阶段：双工具首请求 → 促迁解锁全量，
+   ;; 见 src/dsv4b.rkt 与 design-dsv4b.md）。默认 v4-pro（官方极简基准搭配）；
+   ;; base ≠ "deepseek" ⇒ auto/升级梯不生效，模型钉死，保持锚定纯净。
+   (provider-profile "dsv4-b" 'anthropic "https://api.deepseek.com/anthropic"
+                     "deepseek-v4-pro" "DEEPSEEK_API_KEY")
   ) ; end list
 ) ; end define BUILTIN-PROFILES
 

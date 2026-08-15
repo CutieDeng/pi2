@@ -23,6 +23,7 @@
  (file "pricing.rkt")                         ; 记费：估算 token 开销
  (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
  (file "escalate.rkt")                        ; 自适应：失败驱动模型升级梯（/escalate）
+ (file "dsv4b.rkt")                           ; dsv4-b：锚定档案（切换提示）
  (file "retry.rkt")                           ; 增强式回退：回退链读写（/fallback）
  (file "goal.rkt")                            ; Goal 模式：自主多轮（/goal）
  (file "resources.rkt")
@@ -548,6 +549,10 @@
        (say (red f"warning: {name} 无 token（env {keyenv} 未设、也无 /provider key）— 请求将鉴权失败")))
      (when (auto-active? host)
        (say (dim f"auto on: 按任务在 {(light-model)} / {(pro-model)} 间切换（thinking max）")))
+     ;; dsv4-b 中途切入：锚定绑定在**首个请求**的工具 schema，此刻已错过——
+     ;; 只换端点/模型；完整锚定需启动时 --provider dsv4-b。
+     (when (and (string=? base DSV4B-BASE) (not (dsv4b-promoted?)))
+       (say (dim "note: dsv4-b anchoring binds to the FIRST request; mid-session switch only changes endpoint/model (launch with --provider dsv4-b for full anchoring)")))
      (values (struct-copy agent-state st [config c*]) #t)]
     [else
      (say (dim f"provider → {name}"))

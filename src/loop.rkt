@@ -14,6 +14,7 @@
  (file "plugin.rkt")
  (file "retry.rkt")                      ; 增强式回退：失败分类/决策/回退目标应用
  (file "escalate.rkt")                   ; 自适应：失败驱动的模型升级梯
+ (file "dsv4b.rkt")                      ; dsv4-b：Minimal 锚定档案的两阶段促迁
 ) ; end require
 
 ;; 依赖包：一次装配，处处传递
@@ -299,8 +300,12 @@
     (define calls (message-tool-uses asst-msg))
     (cond
       [(null? calls)
-       (struct-copy agent-state st*
-                    [turn-count (add1 (agent-state-turn-count st*))]
+       ;; dsv4-b：'either 模式下首条纯文本回复亦促迁（'tool-call 默认下此处 no-op）。
+       (define-values (st-p pnote) (dsv4b-maybe-promote! host st* 'assistant-message))
+       (when pnote
+         (bus-publish! (deps-bus d) (evt:delta (now-ms) 'text f"\n[{pnote}]\n")))
+       (struct-copy agent-state st-p
+                    [turn-count (add1 (agent-state-turn-count st-p))]
        ) ; end struct-copy
       ] ; end terminal case
       [(> (+ ncalls (length calls)) (config-turn-max-calls cfg*))
@@ -341,7 +346,12 @@
          (bus-publish! (deps-bus d)
                        (evt:delta (now-ms) 'text
                                   f"\n[adaptive: repeated failures → escalate to {(car esc)} · thinking {(cdr esc)}]\n")))
-       (step (state-append st-next (message 'user results))
+       ;; dsv4-b：首个 durable 工具调用（成败均算）后促迁——registry 灌全量 +
+       ;; system-prompt 追加解锁段；本 turn 的下一次请求即见完整目录（anchored 语义）。
+       (define-values (st-p pnote) (dsv4b-maybe-promote! host st-next 'tool-call))
+       (when pnote
+         (bus-publish! (deps-bus d) (evt:delta (now-ms) 'text f"\n[{pnote}]\n")))
+       (step (state-append st-p (message 'user results))
              (+ ncalls (length calls))
              (if esc 0 fails*)                 ; 升级后重置计数，给新模型一个干净的机会
              rung*

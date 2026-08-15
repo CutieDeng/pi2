@@ -96,10 +96,18 @@ racket main.rkt --rm 3                    # 删除某会话
 | `grok` | OpenAI 兼容 | `api.x.ai/v1` | `XAI_API_KEY` |
 | `deepseek` | **原生 Messages**（复用 anthropic 线路） | `api.deepseek.com/anthropic` | `DEEPSEEK_API_KEY` |
 | `deepseek-lite` | 同 `deepseek`（仅 `deepseek-v4-flash`，无 auto/升级梯） | `api.deepseek.com/anthropic` | `DEEPSEEK_API_KEY` |
+| `dsv4-b` | 同 `deepseek`（默认 `deepseek-v4-pro`，**Minimal 锚定两阶段**） | `api.deepseek.com/anthropic` | `DEEPSEEK_API_KEY` |
 
 - 启动用 `--provider <name>`；运行时用 `/provider <name>` 切换，`/model <id>` 再改模型。切档案会把
   endpoint / 密钥（读环境变量）/ 默认 model 写进当前 config，下一轮即生效（读 `current-config`）。
 - 插件亦可 `register-provider!` 注册自定义供应商，与内置档案共存于同一分发器。
+- **`dsv4-b`（Minimal 锚定，design-dsv4b.md）**：利用 V4-Pro 强 condition 于首请求工具
+  schema 目录的特性——启动时（须 `--provider dsv4-b`）首请求只暴露持久 `bash` +
+  `str_replace_editor` 两个 schema 与 Harness Minimal 原句系统提示词（锚定官方基准
+  轨迹分布）；首个工具调用后自动「促迁」：全量 pi2 工具灌回 registry、技能/项目指令
+  作为解锁段追加进系统提示词（同边界，prefix cache 只断一次，不可逆）。
+  `--dsv4b-promote either` 可让首条纯文本回复也触发促迁；auto/升级梯在此档案天然
+  关闭（模型钉死 v4-pro），插件跳过（避免污染锚定 schema）。
 - 供应商抽象在 `src/providers.rkt`（档案表）+ `src/provider-anthropic.rkt`（原生线路），
   **不侵入**内核 `provider.rkt`（OpenAI 兼容）。
 - **提示词缓存**：Anthropic 线路在 system / tools 末块 / 最后一条消息末块打 `cache_control` ephemeral

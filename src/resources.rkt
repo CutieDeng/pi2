@@ -47,13 +47,29 @@
             (if (string? path) path (path->string path)))
 ) ; end define read-resource
 
-;; 目录下全部 .md（含子目录，支持 skills/<name>/SKILL.md 结构）→ resource 列表
+;; 目录下的技能 → resource 列表。技能入口两种形态（对齐 Claude Code 约定）：
+;;   1. 顶层散文件 skills/<name>.md
+;;   2. 技能目录 skills/<name>/SKILL.md —— 该目录内**只有 SKILL.md 是技能入口**，
+;;      同目录其它 .md（README/README.zh 等）是配套文档，不单独列为技能。
 (define (discover-resources dir)
-  (if (directory-exists? dir)
-      (for/list ([f (in-directory dir)]
-                 #:when (and (file-exists? f) (regexp-match? #rx"\\.md$" (path->string f))))
-        (read-resource f))
-      '())
+  (cond
+    [(not (directory-exists? dir)) '()]
+    [else
+     ;; 含 SKILL.md 的目录集合：这些目录内的非 SKILL.md 文件被排除。
+     (define skill-dirs
+       (for/set ([f (in-directory dir)]
+                 #:when (and (file-exists? f)
+                             (string=? (let-values ([(_d n _?) (split-path f)]) (path->string n))
+                                       "SKILL.md")))
+         (let-values ([(d _n _?) (split-path f)]) (path->string (path->complete-path d)))))
+     (for/list ([f (in-directory dir)]
+                #:when (and (file-exists? f) (regexp-match? #rx"\\.md$" (path->string f)))
+                #:when (let-values ([(d n _?) (split-path f)])
+                         (or (string=? (path->string n) "SKILL.md")           ; 入口保留
+                             (not (set-member? skill-dirs                      ; 非技能目录的散文件保留
+                                               (path->string (path->complete-path d)))))))
+       (read-resource f))]
+  ) ; end cond
 ) ; end define discover-resources
 
 ;; 技能渐进披露：把可用技能列入系统提示词（名称/描述/路径），模型按需 read_file 取全文。

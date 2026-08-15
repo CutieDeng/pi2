@@ -260,4 +260,5 @@
  make-edit-file-tool
  count-occurrences
  apply-edits normalize-edits
+ atomic-write!
 ) ; end provide

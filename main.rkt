@@ -23,6 +23,9 @@
  (file "src/repl.rkt")
  (file "src/subagent.rkt")
  (file "src/tools/builtin.rkt")
+ (file "src/tools/editor.rkt")
+ (file "src/tools/bash-persistent.rkt")
+ (file "src/dsv4b.rkt")
  (file "src/plugin.rkt")
  (file "src/providers.rkt")
  (file "src/credentials.rkt")
@@ -133,6 +136,8 @@
   (define max-turns-arg (box 20))
   (define budget-arg (box #f))
   (define parallel? (box #f))
+  (define dsv4b-promote-arg (box #f))
+  (define write-allow-arg (box '()))
 
   (command-line
    #:program "pi++"
@@ -146,7 +151,8 @@
                         (set-box! trust-plugins? #t)]
    [("-m" "--model") m "model id" (set-box! model m)]
    [("-e" "--endpoint") e "OpenAI-compatible base url" (set-box! endpoint e)]
-   [("--provider") name "LLM provider (lmstudio | openai | anthropic | deepseek | deepseek-lite | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--provider") name "LLM provider (lmstudio | openai | anthropic | deepseek | deepseek-lite | dsv4-b | gemini | grok | plugin name)" (set-box! provider-arg name)]
+   [("--dsv4b-promote") v "dsv4-b: promotion trigger tool-call|either (default tool-call)" (set-box! dsv4b-promote-arg v)]
    [("--set-key") env-name "store an API key (env var name); value read from stdin, then exit" (set-box! set-key-arg env-name)]
    [("--list-keys") "list configured provider keys (masked) and exit" (set-box! list-keys? #t)]
    [("--rm-key") env-name "delete a stored API key and exit" (set-box! rm-key-arg env-name)]
@@ -172,7 +178,9 @@
    [("--parallel") "goal mode: run independent DAG tasks (disjoint files) in parallel git worktrees"
                    (set-box! parallel? #t)]
    [("--rpc") "headless JSONL mode over stdin/stdout (for IDE / orchestrator)" (set-box! rpc? #t)]
-   [("--mode") md "permission mode: yolo|normal|strict|auto (auto = scoped auto-approve: in-workdir read/write auto, network/destructive asks)" (set-box! mode md)]
+   [("--mode") md "permission mode: yolo|normal|strict|auto|read-only (auto = scoped auto-approve; read-only = review session: deny all writes without asking, bash statically vetted incl. invoked scripts)" (set-box! mode md)]
+   [("--allow-write") glob "read-only mode: exception — permit writes to files whose name matches this glob, within workdir (repeatable, e.g. --allow-write .commit)"
+                      (set-box! write-allow-arg (cons glob (unbox write-allow-arg)))]
    [("-C" "--workdir") wd "working directory" (set-box! workdir wd)]
    [("--max-calls") n "max tool calls per user turn (default 16; raise for multi-file refactors)"
                     (let ([v (string->number n)])
@@ -186,6 +194,14 @@
     (cond
       [(valid-reasoning-effort? lvl) (set-reasoning-effort! lvl)]
       [else (eprintf "invalid --reasoning: ~a (off|low|medium|high|max)\n" (unbox reasoning-arg)) (exit 1)]))
+
+  ;; ---- dsv4-b 促迁触发：--dsv4b-promote tool-call|either（默认 tool-call）
+  (when (unbox dsv4b-promote-arg)
+    (cond
+      [(member (unbox dsv4b-promote-arg) '("tool-call" "either"))
+       (set-dsv4b-promote-on! (string->symbol (unbox dsv4b-promote-arg)))]
+      [else (eprintf "invalid --dsv4b-promote: ~a (tool-call|either)\n" (unbox dsv4b-promote-arg))
+            (exit 1)]))
 
   ;; ---- Auto 模式：--auto on|off（默认 on，仅 DeepSeek 生效）
   (when (unbox auto-arg)
@@ -263,6 +279,12 @@
       (and s (if (path? s) (path->string s) s))))
   (set-box! resume-path resolved)              ; 下游按已解析路径工作
 
+  ;; provider 名与 dsv4-b 锚定启动判定需先于装配（工具集/系统提示词按其分支；
+  ;; design-dsv4b.md §2.6）。host 校验仍在下方 host-set-provider! 处。
+  (define provider-name (or (unbox provider-arg) "lmstudio"))
+  (define dsv4b-boot? (and (unbox provider-arg)
+                           (string=? (instance-base provider-name) DSV4B-BASE)))
+
   ;; 技能/提示词资源发现（skills/ prompts/ 项目目录）。技能渐进披露进系统提示词。
   (define skills (discover-resources (build-path project-root "skills")))
   (define prompts (discover-resources (build-path project-root "prompts")))
@@ -280,7 +302,8 @@
   (define base-cfg
     (if (unbox resume-path)
         (agent-state-config (session-replay (unbox resume-path)))
-        (struct-copy config (default-config) [system-prompt DEFAULT-SYSTEM])
+        (struct-copy config (default-config)
+                     [system-prompt (if dsv4b-boot? ANCHOR-SYSTEM DEFAULT-SYSTEM)])
     ) ; end if
   ) ; end define base-cfg
   (define cfg
@@ -293,9 +316,19 @@
                                       (config-permission-mode base-cfg))]
                  [workdir (unbox workdir)]
                  [turn-max-calls (or (unbox max-calls-arg) (config-turn-max-calls base-cfg))]
-                 [system-prompt (string-append (or (config-system-prompt base-cfg) "")
-                                               (skills-addendum skills)
-                                               (project-instructions-addendum proj-instr-body proj-instr-path))]
+                 ;; system-prompt 三种来源，语义互斥（不用 or 兜底，避免把常量伪装成默认值）：
+                 [system-prompt
+                  (cond
+                    ;; resume：存档串已封存当时的 persona/addenda/解锁段，原样沿用——
+                    ;; 不再叠加 addenda（否则每次 resume 重复追加 skills 段）。
+                    [(unbox resume-path) (config-system-prompt base-cfg)]
+                    ;; 全新 dsv4-b 锚定态：固定 Minimal 原句常量，addenda 推迟到促迁解锁段。
+                    [dsv4b-boot? ANCHOR-SYSTEM]
+                    ;; 全新普通会话：DEFAULT-SYSTEM（在 base-cfg 内）+ 技能清单 + 项目指令。
+                    [else (string-append (or (config-system-prompt base-cfg) "")
+                                         (skills-addendum skills)
+                                         (project-instructions-addendum proj-instr-body proj-instr-path))])]
+                 [context-budget (if dsv4b-boot? 200000 (config-context-budget base-cfg))]
     ) ; end struct-copy
   ) ; end define cfg
 
@@ -303,7 +336,11 @@
   (define bus (make-bus))
   (make-directory* cache-dir)
   (define perm-store (build-path cache-dir "permissions.rktd"))
-  (define base-tools (builtin-tools cfg))
+  ;; dsv4-b 锚定态：首请求 registry 恰两个 schema（持久 bash + str_replace_editor）。
+  (define base-tools
+    (if dsv4b-boot?
+        (list (make-persistent-bash-tool) (make-editor-tool))
+        (builtin-tools cfg)))
   ;; 可变 registry + 插件宿主（共享同一 registry，故插件工具直接可被模型调用）。
   (define registry (make-registry base-tools))
   (define host (make-plugin-host #:registry registry))
@@ -320,8 +357,16 @@
   ;; 加载 plugins/（若存在）+ 命令行 --plugins 目录（先于解析 provider，供插件注册供应商）。
   (define default-plugins-dir (build-path project-root "plugins"))
   (define plugin-load-dirs
-    (append (if (directory-exists? default-plugins-dir) (list default-plugins-dir) '())
-            (reverse (unbox plugin-dirs))))
+    (cond
+      ;; dsv4-b：插件工具会污染锚定首请求的 schema 目录，整体跳过（不推迟——
+      ;; 插件信任询问不宜发生在 turn 中途）。
+      [dsv4b-boot?
+       (when (or (pair? (unbox plugin-dirs)) (directory-exists? default-plugins-dir))
+         (eprintf "[dsv4-b: plugins skipped — plugin tools would pollute the anchored first-request schema]\n"))
+       '()]
+      [else
+       (append (if (directory-exists? default-plugins-dir) (list default-plugins-dir) '())
+               (reverse (unbox plugin-dirs)))]))
   (for ([pd (in-list plugin-load-dirs)])
     (load-plugins-dir! host pd
                        #:grants grants #:asker plugin-asker
@@ -329,7 +374,7 @@
   (define observer-unsub (bus-subscribe! bus (make-host-observer host)))   ; 观测型钩子分发（绑定以免模块顶层打印返回值）
   (void observer-unsub)
   ;; provider：--provider 名设为初始选用（校验），用分发器以支持 /provider 运行时切换。
-  (define provider-name (or (unbox provider-arg) "lmstudio"))
+  ;; （provider-name 已在装配前定义，供 dsv4b-boot? 分支使用。）
   (unless (host-set-provider! host provider-name)
     (eprintf "unknown provider: ~a (available: ~a)\n"
              provider-name (string-join (host-available-providers host) " "))
@@ -345,24 +390,49 @@
     (eprintf "warning: provider ~a has no token (env ~a unset & no stored key) — requests will fail auth\n"
              provider-name (or (provider-profile-key-env-of (instance-base provider-name)) "—")))
   (define prov (make-dispatch-provider host cfg*))
-  ;; spawn_agent 用解析后的 provider；加入 registry。
-  (define spawn-tool (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))
-  (registry-add! registry spawn-tool)
+  (cond
+    ;; dsv4-b：锚定态不注册 spawn_agent；促迁 payload 一次性灌入全量工具
+    ;; （bash 保持持久版——同名覆盖会改 schema，且持久语义严格更强）+ 解锁段。
+    [dsv4b-boot?
+     (define full-tools
+       (filter (lambda (t) (not (string=? (tool-name t) "bash"))) (builtin-tools cfg*)))
+     (define unlock-addendum
+       (dsv4b-unlock-addendum (skills-addendum skills)
+                              (project-instructions-addendum proj-instr-body proj-instr-path)))
+     (set-dsv4b-payload!
+      (lambda ()
+        (for ([t (in-list full-tools)]) (registry-add! registry t))
+        (registry-add! registry
+                       (make-spawn-agent-tool #:provider prov #:sub-tools (builtin-tools cfg*)))
+        unlock-addendum))]
+    [else
+     ;; spawn_agent 用解析后的 provider；加入 registry。
+     (registry-add! registry (make-spawn-agent-tool #:provider prov #:sub-tools base-tools))])
   (define d
     (make-deps #:provider prov
                #:registry registry
                #:bus bus
-               #:policy (make-policy cfg #:store-path perm-store)
+               #:policy (make-policy cfg #:store-path perm-store
+                                     #:write-allow (reverse (unbox write-allow-arg)))
                #:asker interactive-asker
                #:plugin-host host
     ) ; end make-deps
   ) ; end define d
 
   ;; 初始状态：resume 恢复历史，否则空
-  (define st0
+  (define st0-raw
     (if (unbox resume-path)
         (session-replay (unbox resume-path) #:config cfg*)
         (make-initial-state cfg*)
+    ) ; end if
+  ) ; end define st0-raw
+  ;; dsv4-b resume 重推：存档 history 已有工具调用 ⇒ 促迁在上一进程已发生，
+  ;; 本进程 registry 为新建，需立即重放副作用（解锁段含 marker 时不重复追加）。
+  (define st0
+    (if (and dsv4b-boot? (unbox resume-path)
+             (history-has-tool-call? (state-history-list st0-raw)))
+        (let-values ([(s _note) (dsv4b-maybe-promote! host st0-raw 'tool-call)]) s)
+        st0-raw
     ) ; end if
   ) ; end define st0
 

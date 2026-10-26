@@ -26,6 +26,7 @@
  (file "src/tools/editor.rkt")
  (file "src/tools/bash-persistent.rkt")
  (file "src/dsv4b.rkt")
+ (file "src/skill-script.rkt")
  (file "src/plugin.rkt")
  (file "src/providers.rkt")
  (file "src/credentials.rkt")
@@ -285,9 +286,23 @@
   (define dsv4b-boot? (and (unbox provider-arg)
                            (string=? (instance-base provider-name) DSV4B-BASE)))
 
+  ;; dsv4-b 锚定基准的招牌参数：reasoningEffort=max（design-dsv4b.md §基准：V4-Pro·max →
+  ;; Anchored 98/99）。因 base≠deepseek，auto/升级梯（会把 thinking 提到 high/max）天然不生效，
+  ;; 故这里为 dsv4-b 兜上 max 默认——否则 v4-pro 跑在 thinking=off，正是「性能回退」之因。
+  ;; 用户显式 --reasoning 仍优先（上面已据 reasoning-arg 设过，这里仅在未显式时兜底）。
+  (when (and dsv4b-boot? (not (unbox reasoning-arg)))
+    (set-reasoning-effort! 'max)
+    (eprintf "[dsv4-b] reasoning effort defaulted to max (anchored benchmark parameter; override with --reasoning)\n"))
+
   ;; 技能/提示词资源发现（skills/ prompts/ 项目目录）。技能渐进披露进系统提示词。
   (define skills (discover-resources (build-path project-root "skills")))
   (define prompts (discover-resources (build-path project-root "prompts")))
+  ;; .rktd 受控 skill 发现：用户全局 ~/.pi2/skills（可信来源）+ 项目 skills/。
+  ;; 经 $<skill> 在沙箱里跑，不走 agent bash（design: 受控执行平面第三落点）。
+  (define rktd-skills
+    (discover-rktd-skills
+     (list (build-path (find-system-path 'home-dir) ".pi2" "skills")
+           (build-path project-root "skills"))))
 
   ;; 项目指令自动加载（AGENTS.md/CLAUDE.md…）：从**工作目录**（即被开发的项目）读，注入系统提示词。
   ;; 仅在全新启动注入；resume 沿用存档 system-prompt（避免重复叠加）。
@@ -449,6 +464,10 @@
     [(unbox goal-arg)
      (define cmds (reverse (unbox until-cmds)))
      (cond
+       ;; --goal "$skill"：跑受控 skill 工作流（作用域 turn + 沙箱校验即验收），无需 --until。
+       [(skill-line? (unbox goal-arg))
+        (run-skill-line! (unbox goal-arg) d st0 sess rktd-skills)
+        (session-close! sess)]
        [(null? cmds)
         (eprintf "--goal requires at least one --until <cmd> (the acceptance oracle; exit 0 = done)\n")
         (session-close! sess) (exit 1)]
@@ -468,17 +487,24 @@
     ] ; end rpc case
     ;; 单次问答模式
     [(unbox prompt)
-     (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
-     (define-values (st0* auto-dec) (maybe-apply-auto st0 (unbox prompt) host))
-     (when auto-dec (eprintf "auto → ~a (thinking ~a)\n" (car auto-dec) (cdr auto-dec)))
-     (define st* (run-turn! st0* (text-msg 'user (unbox prompt)) d))
-     (bus-drain! bus)
-     (persist-turn! sess st0* st*)
-     (unsub) (session-close! sess)
+     (cond
+       ;; $skill：无头模式也走受控 skill 工作流（作用域 turn + 沙箱校验），不当裸文本发模型。
+       [(skill-line? (unbox prompt))
+        (run-skill-line! (unbox prompt) d st0 sess rktd-skills)
+        (session-close! sess)]
+       [else
+        (define unsub (bus-subscribe! bus (make-renderer (lambda (s) (display s) (flush-output)))))
+        (define-values (st0* auto-dec) (maybe-apply-auto st0 (unbox prompt) host))
+        (when auto-dec (eprintf "auto → ~a (thinking ~a)\n" (car auto-dec) (cdr auto-dec)))
+        (define st* (run-turn! st0* (text-msg 'user (unbox prompt)) d))
+        (bus-drain! bus)
+        (persist-turn! sess st0* st*)
+        (unsub) (session-close! sess)])
     ] ; end one-shot case
     ;; 交互式
     [else
      (run-repl! d st0 sess
+                #:rktd-skills rktd-skills
                 #:data-dir (path->string data-dir)
                 #:resumed? (and (unbox resume-path) #t)
                 #:plugin-host host)

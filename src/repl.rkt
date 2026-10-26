@@ -24,6 +24,8 @@
  (file "auto.rkt")                            ; Auto 模式：DeepSeek 按任务切模型
  (file "escalate.rkt")                        ; 自适应：失败驱动模型升级梯（/escalate）
  (file "dsv4b.rkt")                           ; dsv4-b：锚定档案（切换提示）
+ (file "skill-script.rkt")                    ; $<skill> 沙箱受控脚本
+ (file "permission.rkt")                      ; make-policy（$<skill> 作用域 turn）
  (file "retry.rkt")                           ; 增强式回退：回退链读写（/fallback）
  (file "goal.rkt")                            ; Goal 模式：自主多轮（/goal）
  (file "resources.rkt")
@@ -254,15 +256,95 @@
 
 ;; run-repl! : deps agent-state session -> void（返回时会话已持久化）
 ;; data-dir: 会话目录（/resume 选择器与列表用）；resumed?: 是否为恢复启动（渲染预览）
+(define current-rktd-skills (make-parameter (hash)))   ; name → (cons rktd-skill skill-dir)
+
 (define (run-repl! d st0 sess #:banner? [banner? #t]
                    #:data-dir [data-dir "data"] #:resumed? [resumed? #f]
-                   #:plugin-host [host #f])
+                   #:plugin-host [host #f] #:rktd-skills [rktd-skills (hash)])
   (define bus (deps-bus d))
-  (if (terminal-port? (current-input-port))
-      (run-repl/console! d st0 sess bus banner? data-dir resumed? host)
-      (run-repl/plain! d st0 sess bus banner? data-dir resumed? host)
-  ) ; end if
+  (parameterize ([current-rktd-skills rktd-skills])
+    (if (terminal-port? (current-input-port))
+        (run-repl/console! d st0 sess bus banner? data-dir resumed? host)
+        (run-repl/plain! d st0 sess bus banner? data-dir resumed? host))
+  ) ; end parameterize
 ) ; end define run-repl!
+
+;; $<skill> [args...] 工作流（「受控执行平面」用户入口）：
+;;   1. 若 skill 有 prompt → 跑一轮**作用域 agent turn**（read-only + 只写 writes 声明的文件）
+;;      让 agent 干活写产物（如 .commit）；2. 若有 entry → 沙箱校验产物，分级报告。
+;; run-turn-fn : (st prompt scoped-deps) -> st*，由各 loop 传入（含自己的动画/持久化）。loop 无关。
+(define (list-skills say)
+  (define names (sort (hash-keys (current-rktd-skills)) string<?))
+  (if (null? names) (say (dim "no .rktd skills discovered (put skill.rktd in ~/.pi2/skills/<name>/)"))
+      (say (dim (string-append "skills: " (string-join (map (lambda (n) (string-append "$" n)) names) "  "))))))
+
+;; read-only + 只写 skill 声明的 writes → 作用域 deps（agent 这轮只能读 + 写产物）
+(define (scoped-deps-for d st writes)
+  (define cfg (agent-state-config st))
+  (struct-copy deps d
+    [policy (make-policy (struct-copy config cfg [permission-mode 'read-only]) #:write-allow writes)]))
+
+(define (report-validation r say)
+  (say (if (skill-result-ok r) (green (result->brief r)) (red (result->brief r))))
+  (when (non-empty-string? (result->summary r)) (say (dim f"  {(result->summary r)}")))
+  (unless (skill-result-ok r) (say (dim f"  detail: {(result->detail r)}")))
+  (say (dim "  (validator sandboxed: only declared-read paths; no write/net/subprocess)")))
+
+(define (run-skill-workflow! line st d workdir say run-turn-fn)
+  (define parts (string-split (substring (string-trim line) 1)))
+  (cond
+    [(null? parts) (list-skills say) st]
+    [else
+     (define name (car parts)) (define extra (cdr parts))
+     (define found (hash-ref (current-rktd-skills) name #f))
+     (cond
+       [(not found) (say (red f"no .rktd skill: {name}")) st]
+       [else
+        (define skill (car found)) (define dir (cdr found))
+        ;; 开洞：把 skill 声明的 native 函数注册成 read-only 工具，agent 可主动调用验证（沙箱内跑）。
+        ;;   危险的 `racket -e` 仍被 cmdscan 拒；这些特定沙箱工具是受控的例外。
+        ;; dsv4-b 特殊性：锚定窗口内首请求工具目录须恰两把（bash + editor），此时**不开洞**
+        ;;   （否则第 3 个 schema 污染锚定）；agent 用锚定工具写产物，首个 tool-call 促迁后仍有
+        ;;   框架侧 run-entry 兜底校验。促迁后（常见交互态）照常开洞。
+        (define open-hole? (not (dsv4b-anchoring-live?)))
+        (define tools (if open-hole? (skill->tools skill dir) '()))
+        (for ([t (in-list tools)]) (registry-add! (deps-registry d) t))
+        (define tnames (if (pair? tools) (string-join (map tool-name tools) ", ") "—"))
+        (define st2
+          (dynamic-wind
+           void
+           (lambda ()
+             (cond
+               [(rktd-skill-prompt skill)
+                (say (dim (if open-hole?
+                              f"${name}: agent 作用域执行中（read-only + 只写 {(rktd-skill-writes skill)}；可调 {tnames} 自验）…"
+                              f"${name}: agent 作用域执行中（read-only + 只写 {(rktd-skill-writes skill)}；dsv4-b 锚定期洞延后，改由框架校验）…")))
+                (run-turn-fn st (rktd-skill-prompt skill) (scoped-deps-for d st (rktd-skill-writes skill)))]
+               [else st]))
+           (lambda () (for ([t (in-list tools)]) (registry-remove! (deps-registry d) (tool-name t))))))  ; 撤洞
+        ;; 框架侧再沙箱验一次，给用户最终确认
+        (when (rktd-skill-entry skill)
+          (report-validation (run-entry skill #:workdir workdir #:skill-dir dir #:args extra) say))
+        st2])]))
+
+;; 这行是不是 $skill 命令？（三条入口共用的前缀判定；main.rkt 的 -p/--goal 也据此分流）
+(define (skill-line? s) (string-prefix? (string-trim s) "$"))
+
+;; 非交互（-p / --goal）执行 $skill：自带 emit/say + run-turn-fn（含事件渲染与持久化），
+;; 内部 parameterize 好 skill 表，复用 run-skill-workflow!。让 $commit 在无头模式也走受控工作流，
+;; 而非当作裸文本发给模型。返回新 agent-state。
+(define (run-skill-line! line d st sess rktd-skills #:workdir [wd (config-workdir (agent-state-config st))])
+  (define bus (deps-bus d))
+  (define emit (lambda (s) (display s) (flush-output)))
+  (define (say s) (emit (string-append s "\n")))
+  (define unsub (bus-subscribe! bus (make-renderer emit)))
+  (parameterize ([current-rktd-skills rktd-skills])
+    (begin0
+      (run-skill-workflow! (string-trim line) st d wd say
+        (lambda (st0 pline sd)
+          (define st1 (run-turn! st0 (text-msg 'user pline) sd))
+          (bus-drain! bus) (persist-turn! sess st0 st1) st1))
+      (unsub))))
 
 ;; -------- 交互式：异步实时控制台
 
@@ -326,6 +408,19 @@
               (handle-command (string-trim line) st d sess-box say emit data-dir host))
             (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
            ] ; end command case
+           [(string-prefix? (string-trim line) "$")
+            (loop (run-skill-workflow! (string-trim line) st d (config-workdir (agent-state-config st)) say
+                    (lambda (st0 pline sd)
+                      (define um (text-msg 'user pline))
+                      (console-set-working! con #t) (statusf #t)
+                      (define cp (box #f))      ; 中断检查点：保留已完成步骤 + <turn_aborted> 标记（与 GUI 一致）
+                      (define st* (with-handlers ([exn:break? (lambda (_e) (provider-cancel! (deps-provider sd))
+                                                                (emit "\n") (say (yellow "⎯ interrupted · completed steps kept ⎯"))
+                                                                (or (interrupted-turn-state cp) st0))]
+                                                   [exn:fail? (lambda (e) (say (red f"[error] {(exn-message e)}")) st0)])
+                                    (parameterize-break #t (parameterize ([current-turn-checkpoint cp]) (run-turn! st0 um sd)))))
+                      (statusf #f) (console-set-working! con #f)
+                      (bus-drain! bus) (persist-turn! (unbox sess-box) st0 st*) st*)))]
            [else
             (define user-msg (text-msg 'user line))
             ;; Auto 模式（仅 DeepSeek 生效）：按任务改 model + 推理档，再跑本轮。
@@ -333,6 +428,8 @@
             (when auto-dec (say (dim f"auto → {(car auto-dec)} · thinking {(cdr auto-dec)}")))
             (console-set-working! con #t)       ; 整轮：底边隔离条进度动画
             (statusf #t)                        ; 首 token 前：转轮标签
+            ;; 中断检查点：保留本轮已完成步骤 + <turn_aborted> 标记（loop.rkt interrupted-turn-state，与 GUI 一致）
+            (define cp (box #f))
             (define st*
               (with-handlers ([exn:break?
                                (lambda (_e)
@@ -340,14 +437,14 @@
                                  ;; 中断提示作为独立元信息块：先换行结束流式输出，
                                  ;; 再单起一行，不与上文回显同块（也不回显 ^C）。
                                  (emit "\n")
-                                 (say (yellow "⎯ interrupted ⎯"))
-                                 st1
+                                 (say (yellow "⎯ interrupted · completed steps kept ⎯"))
+                                 (or (interrupted-turn-state cp) st1)
                                ) ; end lambda
                               ]
                               [exn:fail?
                                (lambda (e) (say (red f"[error] {(exn-message e)}")) st1)
                               ]) ; end handlers
-                (parameterize-break #t (run-turn! st1 user-msg d))
+                (parameterize-break #t (parameterize ([current-turn-checkpoint cp]) (run-turn! st1 user-msg d)))
               ) ; end with-handlers
             ) ; end define st*
             (statusf #f)                        ; 收尾：确保停动画
@@ -391,6 +488,13 @@
          (handle-command (string-trim line) st d sess-box say emit data-dir host))
        (if continue? (loop st*) (begin (unsub) (session-close! (unbox sess-box))))
       ] ; end command case
+      [(string-prefix? (string-trim line) "$")
+       (loop (run-skill-workflow! (string-trim line) st d (config-workdir (agent-state-config st)) say
+               (lambda (st0 pline sd)
+                 (define um (text-msg 'user pline))
+                 (define st* (with-handlers ([exn:fail? (lambda (e) (say (red f"[error] {(exn-message e)}")) st0)])
+                               (run-turn! st0 um sd)))
+                 (bus-drain! bus) (persist-turn! (unbox sess-box) st0 st*) st*)))]
       [else
        (define user-msg (text-msg 'user line))
        (define-values (st1 auto-dec) (maybe-apply-auto st line host))
@@ -454,23 +558,9 @@
 ) ; end define render-resume-preview
 
 ;; 持久化 st→st* 之间新增的历史消息与 usage 增量（tool-result 亦完整落盘，保 resume 配对）
+;; 轮内压缩过时按下标会漏记本轮消息：交给 session-persist-turn!（压缩过 → 记 compact，本轮消息都在里面）
 (define (persist-turn! sess st-before st-after)
-  (define before (pvector-length (agent-state-history st-before)))
-  (define after (pvector-length (agent-state-history st-after)))
-  (define hist (agent-state-history st-after))
-  (for ([i (in-range before after)])
-    (session-append-msg! sess (pvector-ref hist i))
-  ) ; end for
-  (define u-before (agent-state-token-usage st-before))
-  (define u-after (agent-state-token-usage st-after))
-  (define delta
-    (usage (- (usage-input-tokens u-after) (usage-input-tokens u-before))
-           (- (usage-output-tokens u-after) (usage-output-tokens u-before))
-    ) ; end usage
-  ) ; end define delta
-  (unless (equal? delta usage-zero)
-    (session-append-usage! sess delta)
-  ) ; end unless
+  (session-persist-turn! sess st-before st-after)
 ) ; end define persist-turn!
 
 ;; 每轮页脚：本轮新增 token 与估算开销（model 已知时）。空增量 → #f（不打印）。
@@ -818,20 +908,24 @@
         (define goal (string-join args " "))
         (define until
           (cond
-            [(and con (console? con)) (console-ask! con (yellow "acceptance command (--until, exit 0 = done): "))]
-            [else (say (dim "acceptance command (--until): ")) (let ([l (read-line)]) (if (eof-object? l) #f l))]))
+            [(and con (console? con)) (console-ask! con (yellow "acceptance command (exit 0 = done; empty = the workspace test flow, or write acceptance tests first): "))]
+            [else (say (dim "acceptance command (empty = the workspace test flow, or write acceptance tests first): ")) (let ([l (read-line)]) (if (eof-object? l) #f l))]))
         (cond
-          [(or (not until) (not (non-empty-string? (string-trim until))))
-           (say (red "cancelled: no acceptance command")) (values st #t)]
+          [(not until) (say (red "cancelled")) (values st #t)]
           [else
-           (say (dim f"goal: {goal}  ·  until: {(string-trim until)}  ·  Ctrl-C to stop"))
+           ;; 空 = 有工作区测试流程（.pi/tests.rktd）就用它；没有就先写验收（acceptance.rkt c）：另一个只读 agent 写测试 → 你确认 → 冻结 → 开工
+           (define empty? (not (non-empty-string? (string-trim until))))
+           (define tests-first? #f)
+           (say (dim (if empty? f"goal: {goal}  ·  acceptance: the workspace test flow, or tests written first that you approve  ·  Ctrl-C to stop"
+                         f"goal: {goal}  ·  until: {(string-trim until)}  ·  Ctrl-C to stop")))
            (define st*
              (with-handlers
                ([exn:break? (lambda (_e) (provider-cancel! (deps-provider d))
                                          (say (yellow "⎯ goal interrupted ⎯")) st)]
                 [exn:fail? (lambda (e) (say (red f"[goal error] {(exn-message e)}")) st)])
                (parameterize-break #t
-                 (run-goal! d st (unbox sess-box) goal (list (string-trim until)) 20 host
+                 (run-goal! d st (unbox sess-box) goal (if empty? '() (list (string-trim until))) 20 host
+                            #:tests-first? tests-first?
                             #:emit (lambda (s) (say s))))))
            (values st* #t)])])
     ] ; end goal case
@@ -842,7 +936,7 @@
         (define con (current-console))
         (cond
           [(and con (console? con))
-           (define cur (symbol->string (current-reasoning-effort)))
+           (define cur (symbol->string (effective-reasoning-effort (config-model (agent-state-config st)))))
            (define opts (for/list ([l (in-list REASONING-LEVELS)])
                           (if (string=? l cur) (string-append "● " l) (string-append "  " l))))
            (define idx (console-choose! con f"reasoning effort (current: {cur})" opts))
@@ -854,7 +948,7 @@
               (say (dim f"reasoning → {lvl}"))
               (values st #t)])]
           [else
-           (say (dim f"reasoning: {(current-reasoning-effort)}  (off|low|medium|high|max)"))
+           (say (dim f"reasoning: {(effective-reasoning-effort (config-model (agent-state-config st)))}  (off|low|medium|high|max)"))
            (values st #t)])]
        [(valid-reasoning-effort? (string->symbol (car args)))
         (set-reasoning-effort! (string->symbol (car args)))
@@ -899,6 +993,7 @@
 
 (provide
  run-repl!
+ skill-line? run-skill-line!
  make-renderer
  tty-asker
  interactive-asker

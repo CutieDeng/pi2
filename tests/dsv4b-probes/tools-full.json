@@ -1,0 +1,10 @@
+[
+  {"name":"bash","description":"Run commands in a bash shell. State is persistent across command calls. The bash command to run. Relative path is preferred in the command.","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+  {"name":"str_replace_editor","description":"Custom editing tool for viewing, creating and editing files. Commands: view, create, str_replace, insert.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","insert"]},"path":{"type":"string"},"file_text":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"insert_line":{"type":"integer"},"view_range":{"type":"array","items":{"type":"integer"}}},"required":["command","path"]}},
+  {"name":"read_file","description":"Read the contents of a file at a workdir-relative path.","input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+  {"name":"write_file","description":"Write content to a file (overwrites).","input_schema":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}},
+  {"name":"edit_file","description":"Replace a unique string in a file with another (supports batch).","input_schema":{"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}},
+  {"name":"glob","description":"Find files matching a glob pattern.","input_schema":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}},
+  {"name":"grep","description":"Search file contents with a regular expression.","input_schema":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}},
+  {"name":"git","description":"Run read-only git inspection commands (status, diff, log).","input_schema":{"type":"object","properties":{"args":{"type":"string"}},"required":["args"]}}
+]

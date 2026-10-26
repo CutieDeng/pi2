@@ -114,12 +114,13 @@
       (state-append s (text-msg (if (even? i) 'user 'assistant) f"msg {i}"))
     ) ; end for/fold
   ) ; end define st
-  (define st* (compact! st mock #:keep-recent 4))
+  (define st* (parameterize ([current-record-sink void]) (compact! st mock #:keep-recent 4)))
   (define hist (state-history-list st*))
-  ;; summary(1) + recent(4) = 5
-  (check-equal? (length hist) 5)
+  ;; 最近 4 条（msg 6–9，从轮边界 msg 6 开始）；总结并进 msg 6（角色交替，不出现两条相连的 user）
+  (check-equal? (length hist) 4)
   (check-true (regexp-match? #rx"compacted context summary" (message-text (first hist))))
   (check-true (regexp-match? #rx"SUMMARY: did X" (message-text (first hist))))
+  (check-true (regexp-match? #rx"msg 6" (message-text (first hist))))
   (check-equal? (message-text (last hist)) "msg 9")
 ) ; end test-case
 

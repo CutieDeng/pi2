@@ -13,6 +13,7 @@
   (path    ; path-string
    port    ; output-port (append mode)
    sema    ; semaphore — 多线程追加时 datum 不交错
+   [pos #:mutable]   ; 下一条写在文件的哪个字节（索引用：每条记录的偏移与长度）
   ) ; end fields
 ) ; end struct datum-log
 
@@ -22,18 +23,53 @@
     (make-directory* dir)
   ) ; end when
   (define port (open-output-file path #:exists 'append))
-  (datum-log path port (make-semaphore 1))
+  (datum-log path port (make-semaphore 1) (if (file-exists? path) (file-size path) 0))
 ) ; end define datum-log-open!
 
-(define (datum-log-append! log d)
+;; 写出的文字必须能读回：读不回（值里混进了 #<void>、过程等）→ 把读不回的部分换成它的打印文字再写，
+;; 否则一条坏记录会让顺序读到它就停（之后的记录全读不到）
+(define (readable-format d)
+  (define s (pretty-format d #:mode 'write))
+  (if (readable? s) s (pretty-format (sanitize d) #:mode 'write))
+) ; end define readable-format
+
+(define (readable? s)
+  (with-handlers ([exn:fail? (lambda (_e) #f)])
+    (parameterize ([read-accept-reader #f] [read-accept-lang #f]) (read (open-input-string s)) #t))
+) ; end define readable?
+
+(define (sanitize v)
+  (cond [(or (string? v) (symbol? v) (number? v) (boolean? v) (char? v) (null? v) (bytes? v) (keyword? v)) v]
+        [(pair? v) (cons (sanitize (car v)) (sanitize (cdr v)))]
+        [(vector? v) (for/vector ([x (in-vector v)]) (sanitize x))]
+        [(hash? v) (for/fold ([h (if (hash-eq? v) (hasheq) (hash))]) ([(k x) (in-hash v)]) (hash-set h (sanitize k) (sanitize x)))]
+        [(prefab-struct-key v) => (lambda (k) (apply make-prefab-struct k (map sanitize (cdr (vector->list (struct->vector v))))))]
+        [else (format "~a" v)])
+) ; end define sanitize
+
+;; → (cons 偏移 字节数)：这条记录在文件里的位置（含结尾换行）。after：在同一把锁里调 (after 偏移 字节数)（索引追加）
+(define (datum-log-append! log d #:after [after #f])
   (call-with-semaphore
    (datum-log-sema log)
    (lambda ()
-     (pretty-write d (datum-log-port log))
+     (define bs (string->bytes/utf-8 (readable-format d)))
+     (define off (datum-log-pos log))
+     (write-bytes bs (datum-log-port log))
+     (write-bytes #"\n" (datum-log-port log))
      (flush-output (datum-log-port log))
+     (define len (add1 (bytes-length bs)))
+     (set-datum-log-pos! log (+ off len))
+     (when after (after off len))
+     (cons off len)
    ) ; end lambda
   ) ; end call-with-semaphore
 ) ; end define datum-log-append!
+
+;; 从偏移处读一个 datum（索引定位后随机读）；坏 / 截断 → eof
+(define (datum-log-read-at in offset)
+  (file-position in offset)
+  (safe-read in)
+) ; end define datum-log-read-at
 
 (define (datum-log-close! log)
   (close-output-port (datum-log-port log))
@@ -129,4 +165,6 @@
  datum-log-fold
  datum-log-first
  datum-log-follow!
+ datum-log-read-at
+ datum-log-pos
 ) ; end provide

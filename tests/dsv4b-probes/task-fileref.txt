@@ -1,0 +1,1 @@
+The function `collect` (and its caller `dedup`) live in the file ./fix/cache.py. A user reports that `dedup` occasionally returns items from a *previous, unrelated* call. Review the code and find the root cause. State the exact failing scenario and the fix.

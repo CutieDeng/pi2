@@ -7,4 +7,5 @@
     "subagent-live-test.rkt"
     "deepseek-live-test.rkt"
     "dsv4b-live-test.rkt"
-    "dsv4b-bench.rkt"))
+    "dsv4b-bench.rkt"
+    "remote-live-test.rkt"))                ; 无头 / 跨主机子 agent 真机验收：PI2_LIVE_HOST=主机 时手动跑

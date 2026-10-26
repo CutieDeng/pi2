@@ -16,11 +16,11 @@
 ;; 隔离凭据目录，避免读到真实 ~/.config/pi++（保证 missing-key 用例确定）。
 (putenv "PI_CONFIG_HOME" (path->string (make-temporary-file "pi2-provtest-~a" 'directory)))
 
-;; 临时设推理强度跑 thunk，结束复位 off（全局 box 防跨用例污染）。
+;; 临时设推理强度跑 thunk，结束复位到缺省 'default（没人选过）（全局 box 防跨用例污染）。
 (define (with-effort lvl thunk)
   (dynamic-wind (lambda () (set-reasoning-effort! lvl))
                 thunk
-                (lambda () (set-reasoning-effort! 'off)))
+                (lambda () (set-reasoning-effort! 'default)))
 ) ; end define with-effort
 
 ;; ------------------------------------------------------------ 档案注册
@@ -292,6 +292,32 @@
   (with-effort 'max
     (lambda ()
       (check-equal? (hash-ref (hash-ref (build-anthropic-body dcfg (list (text-msg 'user "hi")) '()) 'thinking) 'budget_tokens) 24576)))
+) ; end test-case
+
+(test-case "没选过档位：DeepSeek 按服务端缺省 = high（加思考预算），其余 = off；选了 off 就真关（DeepSeek 两条线路都发 thinking disabled）"
+  (check-eq? (current-reasoning-effort) 'default)
+  (check-eq? (effective-reasoning-effort "deepseek-v4-flash") 'high)
+  (check-eq? (effective-reasoning-effort "gemma-4-31b-it@6bit") 'off)
+  (check-eq? (effective-reasoning-effort "deepseek-v4-flash" 'off) 'off)
+  (check-eq? (effective-reasoning-effort "deepseek-v4-flash" 'max) 'max)
+  (define dcfg (struct-copy config (default-config) [model "deepseek-v4-flash"] [max-tokens 4096]))
+  (define (anth c) (build-anthropic-body c (list (text-msg 'user "hi")) '()))
+  (define (oai c) (build-request-body c (list (text-msg 'user "hi")) '()))
+  ;; 没选过：anthropic 线路 thinking enabled、预算 12288、max_tokens = 12288 + 4096（原来 4096 全被思考吃掉 → 截断）
+  (check-equal? (hash-ref (hash-ref (anth dcfg) 'thinking) 'type) "enabled")
+  (check-equal? (hash-ref (anth dcfg) 'max_tokens) (+ 12288 4096))
+  (check-equal? (hash-ref (oai dcfg) 'reasoning_effort) "high")
+  ;; 选了 off：DeepSeek 显式关；max_tokens 不加预算
+  (with-effort 'off
+    (lambda ()
+      (check-equal? (hash-ref (anth dcfg) 'thinking) (hasheq 'type "disabled"))
+      (check-equal? (hash-ref (anth dcfg) 'max_tokens) 4096)
+      (check-equal? (hash-ref (oai dcfg) 'thinking) (hasheq 'type "disabled"))
+      (check-false (hash-ref (oai dcfg) 'reasoning_effort #f))))
+  ;; 非 DeepSeek 的 off：不发 thinking 字段（与原来一样）
+  (define ccfg (struct-copy config (default-config) [model "claude-sonnet-5"] [max-tokens 4096]))
+  (with-effort 'off (lambda () (check-false (hash-ref (anth ccfg) 'thinking #f))))
+  (check-false (hash-ref (anth ccfg) 'thinking #f))
 ) ; end test-case
 
 (test-case "Anthropic thinking round-trip: signed thinking block sent first; unsigned skipped"

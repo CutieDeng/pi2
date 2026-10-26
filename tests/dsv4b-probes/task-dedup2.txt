@@ -1,0 +1,7 @@
+A user reports that dedup() sometimes returns items from a previous, unrelated call. Root cause + one-line fix.
+
+def dedup(items, _seen=[]):
+    for it in items:
+        if it not in _seen:
+            _seen.append(it)
+    return _seen

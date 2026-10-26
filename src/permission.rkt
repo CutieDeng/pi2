@@ -36,8 +36,17 @@
   (permission-policy (config-permission-mode cfg) always store-path (config-workdir cfg) write-allow)
 ) ; end define make-policy
 
+;; 运行中换权限模式（GUI 设置页）：同一份 always 记忆，只换 mode
+(define PERMISSION-MODES '(strict normal auto read-only yolo))
+(define (policy-with-mode p mode)
+  (struct-copy permission-policy p [mode mode])
+) ; end define policy-with-mode
+
 ;; 派生一个换了作用域根 workdir 的策略副本（并行 worker 各在自己 worktree，需各自的作用域 +
 ;; 独立 always-set，避免并发 hash 竞态）。P4.2 用。
+;; 换作用域根、保留已答过的 always（会话换了工作目录：聊天会话）
+(define (policy-with-scope p dir) (struct-copy permission-policy p [workdir dir]))
+
 (define (policy-with-workdir p dir)
   (permission-policy (permission-policy-mode p) (make-hash) (permission-policy-store-path p) dir
                      (permission-policy-write-allow p)))
@@ -226,6 +235,12 @@
   ) ; end cond
 ) ; end define read-only-decision
 
+;; 询问期间的结构化上下文：(hasheq 'tool 名 'level 级别 'input 输入)。asker 的参数仍是给人看的字符串
+;; （TUI 原样显示）；需要结构化信息的前端（RPC → GUI 权限卡片）从这里读。询问之外为 #f。
+(define current-permission-request (make-parameter #f))
+;; 工具执行期间可用的询问函数（loop 在执行工具时设成本轮的 asker）：远端子 agent 把对方的权限询问转给本机用户时用。#f = 没有（缺省拒绝）
+(define current-asker (make-parameter #f))
+
 ;; 主入口：返回 'allow | 'deny | (cons 'deny reason)
 ;; asker : (-> string decision)，decision ∈ 'yes | 'always | 'no | (cons 'no reason-string)
 ;;   —— 阻塞式询问用户。(cons 'no reason) 表示拒绝并附带给 agent 的理由。
@@ -248,7 +263,8 @@
     [(hash-ref (permission-policy-always-set policy) name #f) 'allow]
     [else
      (define answer
-       (asker f"allow tool `{name}` ({level}) with input {input}?")
+       (parameterize ([current-permission-request (hasheq 'tool name 'level level 'input input)])
+         (asker f"allow tool `{name}` ({level}) with input {input}?"))
      ) ; end define answer
      (cond
        [(eq? answer 'yes) 'allow]
@@ -277,8 +293,10 @@
  permission-policy?
  permission-policy-mode
  permission-policy-workdir
- make-policy policy-with-workdir
+ make-policy policy-with-workdir policy-with-scope policy-with-mode PERMISSION-MODES
  permission-check
+ current-permission-request
+ current-asker
  ;; 作用域自动批准（'auto）— 导出供单测/复用
  scoped-decision path-in-workdir? bash-scope-decision git-scope-decision
  read-only-decision

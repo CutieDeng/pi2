@@ -1,0 +1,4 @@
+[
+  {"name":"bash","description":"Run commands in a bash shell. State is persistent across command calls and discussions with the user. The bash command to run. Relative path is preferred in the command.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"The bash command to run. Relative path is preferred in the command."}},"required":["command"]}},
+  {"name":"str_replace_editor","description":"Custom editing tool for viewing, creating and editing files. Commands: view, create, str_replace, insert.","input_schema":{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","insert"]},"path":{"type":"string","description":"Absolute path to file or directory."},"file_text":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"},"insert_line":{"type":"integer"},"view_range":{"type":"array","items":{"type":"integer"}}},"required":["command","path"]}}
+]

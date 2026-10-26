@@ -20,14 +20,22 @@
   (check-equal? (tool-permission-level t) 'dangerous)
   (define fn (hash-ref (tool-spec t) 'function))
   (check-equal? (hash-ref fn 'name) "bash")
-  (check-equal? (hash-ref fn 'description) PERSISTENT-BASH-DESCRIPTION)
-  (check-true (string-contains? PERSISTENT-BASH-DESCRIPTION
+  (check-equal? (hash-ref fn 'description) (bash-description))
+  (check-true (string-contains? (bash-description)
                                 "State is persistent across command calls"))
-  ;; 刻意不含基准沙箱专属的两条（本地为假，见模块头注释）
-  (check-false (string-contains? PERSISTENT-BASH-DESCRIPTION "internet"))
+  ;; 默认刻意不含基准沙箱专属的两条（本地为假，见模块头注释）
+  (check-false (string-contains? (bash-description) "internet"))
   (check-equal? (hash-ref (hash-ref fn 'parameters) 'required) '("command"))
   (check-equal? (hash-ref (hash-ref (hash-ref (hash-ref fn 'parameters) 'properties) 'command) 'description)
                 "The bash command to run. Relative path is preferred in the command.")
+) ; end test-case
+
+(test-case "PI_DSV4B_BASH_DESC=verbatim：恢复上游逐字（含联网/apt+pip 两条），供保真锚定"
+  (putenv "PI_DSV4B_BASH_DESC" "verbatim")
+  (check-true (string-contains? (bash-description) "You don't have access to the internet via this tool."))
+  (check-true (string-contains? (bash-description) "mirror of common linux and python packages via apt and pip"))
+  (putenv "PI_DSV4B_BASH_DESC" "")           ; 复位，勿污染同进程其它测试
+  (check-false (string-contains? (bash-description) "internet"))
 ) ; end test-case
 
 (test-case "初始 cwd = workdir"

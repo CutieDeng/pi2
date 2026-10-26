@@ -116,6 +116,18 @@
      (check-eq? st2 st1)))
 ) ; end test-case
 
+(test-case "anchoring-live?：payload 装配且未促迁为真；促迁后转假（$skill 洞延后的判据）"
+  (with-clean-dsv4b
+   (lambda ()
+     (check-false (dsv4b-anchoring-live?))            ; payload 未设 → 非锚定启动，洞照常开
+     (set-dsv4b-payload! (lambda () (dsv4b-unlock-addendum "" "")))
+     (check-true (dsv4b-anchoring-live?))             ; 装配后未促迁 → 首请求窗口开，不开洞
+     (define host (make-host-on "dsv4-b"))
+     (define-values (_st n) (dsv4b-maybe-promote! host (anchor-state) 'tool-call))
+     (check-not-false n)
+     (check-false (dsv4b-anchoring-live?))))          ; 促迁后 → 窗口关，洞恢复开
+) ; end test-case
+
 (test-case "促迁：either 模式下首条纯文本回复亦促迁"
   (with-clean-dsv4b
    (lambda ()

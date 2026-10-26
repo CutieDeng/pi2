@@ -9,11 +9,16 @@
 ;; provider 运行时读 current-config → /model、/provider 切换即时生效。
 
 (require
+ json
+ racket/string
+ net/http-client
+ net/url
  (file "model.rkt")
  (file "provider.rkt")
  (file "provider-anthropic.rkt")
  (file "plugin.rkt")                    ; plugin-host-providers（struct-out 已导出）
  (file "credentials.rkt")               ; resolve-key（env > 凭据文件）
+ (file "wire.rkt")                      ; OpenAI 形状端点的调用格式自动适配
 ) ; end require
 
 ;; kind: 'openai | 'anthropic（线路格式）
@@ -59,6 +64,49 @@
 
 (define (builtin-provider-names) (map provider-profile-name BUILTIN-PROFILES))
 
+;; ---------------------------------------------------------------- 本地端点的模型列表
+
+;; 端点在本机（LM Studio 等）才查询模型列表；云端点要密钥、也不需要
+(define (local-endpoint? endpoint)
+  (define h (url-host (string->url endpoint)))
+  (and h (member h '("localhost" "127.0.0.1" "::1")) #t)
+) ; end define local-endpoint?
+
+;; 本地 OpenAI 兼容端点上的模型：先试 LM Studio 的 /api/v0/models（带类型与加载状态，去掉嵌入模型），
+;; 不支持（404 / 格式不对）则退回 /v1/models（去掉名字含 embed 的）。
+;; → (cons 模型ids 已加载ids) | #f（不可达 / 超时）。超时后取数线程被杀掉，不留连接。
+(define (fetch-local-models endpoint #:timeout [timeout 1.5])
+  (define u (string->url endpoint))
+  (define host (url-host u))
+  (define port (or (url-port u) 80))
+  (define base (string-join (map path/param-path (url-path u)) "/"))
+  (define (get path)
+    (define-values (status _h in) (http-sendrecv host path #:port port))
+    (begin0 (and (regexp-match? #rx#" 200 " status) (read-json in)) (close-input-port in)))
+  (define (data-of j) (and (hash? j) (list? (hash-ref j 'data #f)) (filter hash? (hash-ref j 'data))))
+  (define (fetch)
+    (define v0 (data-of (with-handlers ([exn:fail? (lambda (_e) #f)]) (get "/api/v0/models"))))
+    (cond
+      [v0
+       (define ms (filter (lambda (m) (and (string? (hash-ref m 'id #f)) (member (hash-ref m 'type "llm") '("llm" "vlm")))) v0))
+       (cons (map (lambda (m) (hash-ref m 'id)) ms)
+             (for/list ([m (in-list ms)] #:when (equal? (hash-ref m 'state #f) "loaded")) (hash-ref m 'id)))]
+      [else
+       (define v1 (data-of (get (string-append "/" base "/models"))))
+       (and v1 (cons (for/list ([m (in-list v1)]
+                                #:when (and (string? (hash-ref m 'id #f)) (not (regexp-match? #rx"embed" (hash-ref m 'id)))))
+                       (hash-ref m 'id))
+                     '()))]
+    ) ; end cond
+  ) ; end define fetch
+  (and host
+       (let* ([ch (make-channel)]
+              [t (thread (lambda () (channel-put ch (with-handlers ([exn:fail? (lambda (_e) #f)]) (fetch)))))]
+              [r (sync/timeout timeout ch)])
+         (unless r (kill-thread t))
+         r))
+) ; end define fetch-local-models
+
 ;; ---------------------------------------------------------------- 供应商实例
 ;; 实例名形如 "deepseek[work]"：同一 provider 挂多套 token，视作不同实例。
 ;; 无方括号 → 标签 "default"。base 决定线路/端点/默认模型；label 决定用哪套 token。
@@ -99,7 +147,7 @@
 (define (profile->factory p)
   (case (provider-profile-kind p)
     [(anthropic) (lambda (cfg) (make-anthropic-provider cfg))]
-    [else        (lambda (cfg) (make-openai-provider cfg))]
+    [else        (lambda (cfg) (make-openai-auto-provider cfg))]   ; Chat Completions / Responses 自动选（wire.rkt）
   ) ; end case
 ) ; end define profile->factory
 
@@ -145,4 +193,6 @@
  instance-display
  builtin-provider-instance?
  resolve-provider-token
+ local-endpoint?
+ fetch-local-models
 ) ; end provide

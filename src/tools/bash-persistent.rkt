@@ -2,8 +2,10 @@
 ;; tools/bash-persistent.rkt — dsv4-b 锚定档案的持久化 bash（design-dsv4b.md §2.3）
 ;; 对齐 DeepSeek Harness minimal 预设的 bash 工具：name/参数 schema 与描述贴上游
 ;; （apps/cli/config/agent-presets/minimal/agent.cordis.yml 的 description 覆写），
-;; 刻意删去其中「无互联网 / apt+pip 镜像」两条 bullet——那是基准沙箱的事实，
+;; 默认刻意删去其中「无互联网 / apt+pip 镜像」两条 bullet——那是基准沙箱的事实，
 ;; 在本地 pi2 环境为假，保留会误导模型拒绝联网命令。
+;; 逃生门 `PI_DSV4B_BASH_DESC=verbatim`：恢复上游逐字 8 bullets，用于保真锚定实验
+;; （首请求字节需与 RL 分布逐字一致时；见 tests/dsv4b-probes/ALIGNMENT.md）。
 ;;
 ;; 「持久」的实现不走 PTY（上游用持久 shell 进程 + 标记协议），而是状态文件回放：
 ;; 每次调用在 /bin/bash 中先恢复上次的 env（export -p 落盘）与 cwd，执行后再落盘。
@@ -19,17 +21,27 @@
 
 (define DEFAULT-TIMEOUT-SECS 300)      ; 上游 minimal 预设 timeoutMs 300000
 
-(define PERSISTENT-BASH-DESCRIPTION
+;; 上游 minimal 预设 bash 描述（agent.cordis.yml）的三段：公共头 / 仅-verbatim 两条 / 公共尾。
+(define BASH-DESC-HEAD
+  '("Run commands in a bash shell"
+    "* When invoking this tool, the contents of the \"command\" parameter does NOT need to be XML-escaped."))
+(define BASH-DESC-VERBATIM-ONLY        ; 上游有、默认删（本地为假）；verbatim 时恢复
+  '("* You don't have access to the internet via this tool."
+    "* You do have access to a mirror of common linux and python packages via apt and pip."))
+(define BASH-DESC-TAIL
+  '("* State is persistent across command calls and discussions with the user."
+    "* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'."
+    "* Please avoid commands that may produce a very large amount of output."
+    "* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background."))
+
+;; PI_DSV4B_BASH_DESC=verbatim → 上游逐字 8 bullets；否则默认 6 bullets（删联网/镜像两条）。
+;; 在 tool-spec 里求值：进程启动时设的 env 即时生效，探针可控。
+(define (bash-description)
   (string-join
-   '("Run commands in a bash shell"
-     "* When invoking this tool, the contents of the \"command\" parameter does NOT need to be XML-escaped."
-     "* State is persistent across command calls and discussions with the user."
-     "* To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'."
-     "* Please avoid commands that may produce a very large amount of output."
-     "* Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.")
-   "\n"
-  ) ; end string-join
-) ; end define PERSISTENT-BASH-DESCRIPTION
+   (append BASH-DESC-HEAD
+           (if (equal? (getenv "PI_DSV4B_BASH_DESC") "verbatim") BASH-DESC-VERBATIM-ONLY '())
+           BASH-DESC-TAIL)
+   "\n"))
 
 ;; POSIX 单引号转义：' → '\''
 (define (shq s)
@@ -47,7 +59,7 @@
    (define (tool-permission-level _t) 'dangerous)
    (define (tool-spec _t)
      (function-spec "bash"
-                    PERSISTENT-BASH-DESCRIPTION
+                    (bash-description)
                     (hasheq 'command
                             (hasheq 'type "string"
                                     'description "The bash command to run. Relative path is preferred in the command."))
@@ -79,13 +91,18 @@
            "\n"
           ) ; end string-join
         ) ; end define wrapper
+        ;; 独立进程组：中断 / 超时时 subprocess-kill 杀整个组（与 bash.rkt 一致；这条命令里起的后台任务也随之结束）
         (define-values (proc out in _err)
-          (subprocess #f #f 'stdout "/bin/bash" "--noprofile" "--norc" "-c" wrapper)
+          (parameterize ([subprocess-group-enabled #t])
+            (subprocess #f #f 'stdout "/bin/bash" "--noprofile" "--norc" "-c" wrapper))
         ) ; end define-values
         (close-output-port in)
         (define buf (open-output-string))
         (define pump (thread (lambda () (copy-port out buf))))
-        (define done (sync/timeout (persistent-bash-tool-timeout-secs t) proc))
+        ;; 轮被中断（break）时杀掉子进程组再继续抛出，否则命令留在后台继续跑
+        (define done
+          (with-handlers ([exn:break? (lambda (e) (subprocess-kill proc #t) (raise e))])
+            (sync/timeout (persistent-bash-tool-timeout-secs t) proc)))
         (cond
           [(not done)
            (subprocess-kill proc #t)
@@ -131,5 +148,5 @@
 
 (provide
  make-persistent-bash-tool
- PERSISTENT-BASH-DESCRIPTION
+ bash-description
 ) ; end provide

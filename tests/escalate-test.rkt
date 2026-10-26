@@ -100,7 +100,7 @@
   [(define (tool-name _t) "failer")
    (define (tool-permission-level _t) 'read-only)
    (define (tool-spec _t) (hasheq))
-   (define (tool-run _t _input _ctx) (tool-outcome "always fails" #t #f))]
+   (define (tool-run _t _input _ctx) (err-outcome "always fails"))]
 ) ; end struct failer-tool
 
 ;; 每次都吐一个对 failer 的工具调用（迫使 loop 反复失败）。

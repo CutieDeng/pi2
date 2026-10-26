@@ -44,8 +44,10 @@
        [(not cmd) (err-outcome "missing required parameter: command")]
        [else
         (parameterize ([current-directory (tool-ctx-workdir ctx)])
+          ;; 独立进程组：中断 / 超时时 subprocess-kill 杀整个组（复合命令的孙进程也一并结束）
           (define-values (proc out in _err)
-            (subprocess #f #f 'stdout "/bin/zsh" "-c" cmd)
+            (parameterize ([subprocess-group-enabled #t])
+              (subprocess #f #f 'stdout "/bin/zsh" "-c" cmd))
           ) ; end define-values
           (close-output-port in)
           ;; 独立线程泵输出，避免管道写满死锁
@@ -57,7 +59,10 @@
              ) ; end lambda
             ) ; end thread
           ) ; end define pump
-          (define done (sync/timeout (bash-tool-timeout-secs t) proc))
+          ;; 轮被中断（break）时杀掉子进程组再继续抛出——否则命令在后台继续跑（实测会留下孤儿进程）
+          (define done
+            (with-handlers ([exn:break? (lambda (e) (subprocess-kill proc #t) (raise e))])
+              (sync/timeout (bash-tool-timeout-secs t) proc)))
           (cond
             [(not done)
              (subprocess-kill proc #t)

@@ -16,6 +16,7 @@
  (file "model.rkt")
  (file "provider.rkt")                  ; provider 结构 + provider-stream!/cancel!
  (file "stream.rkt")                    ; sse-pump!
+ (file "media.rkt")                     ; 消息里的媒体：按模型能力投影
 ) ; end require
 
 (define ANTHROPIC-VERSION "2023-06-01")
@@ -71,6 +72,16 @@
      (define content (assistant->content m))
      (if (null? content) #f (hasheq 'role "assistant" 'content content))
     ] ; end assistant case
+    [(has-media? m)
+     ;; 带媒体的用户消息：能收的图片作 base64 image 块，其余成文字占位
+     (define-values (imgs phs) (split-media blocks (let ([c (current-config)]) (and c (config-model c)))))
+     (define text (string-join (filter (lambda (s) (not (string=? s ""))) (cons (message-text m) phs)) "\n"))
+     (hasheq 'role "user"
+             'content (if (null? imgs)
+                          text
+                          (append (for/list ([pr (in-list imgs)])
+                                    (hasheq 'type "image" 'source (hasheq 'type "base64" 'media_type (media-block-media-type (car pr)) 'data (cdr pr))))
+                                  (if (string=? text "") '() (list (hasheq 'type "text" 'text text))))))]
     [else
      ;; user / 其它文本
      (hasheq 'role "user" 'content (message-text m))
@@ -131,8 +142,7 @@
   (case eff [(low) 1024] [(medium) 4096] [(high) 12288] [(max) 24576] [else 1024])
 ) ; end define effort->budget
 
-;; DeepSeek 系模型（deepseek-v4-flash / deepseek-v4-pro / deepseek-chat…）。
-(define (deepseek-model? m) (and (string? m) (regexp-match? #rx"^deepseek" m)))
+;; DeepSeek 系模型判断 deepseek-model? 在 model.rkt（缺省档位也按它取）。
 
 ;; DeepSeek 的 thinking 只有 high/max 两级（外加 off 不思考）：把 low/medium 夹到 high，
 ;; 使 deepseek 开思考时总落在其真实的两级上；对 Claude 等有梯度思考的模型不改（原样）。
@@ -151,10 +161,11 @@
             'stream #t))
   ;; 扩展思考（reasoning_effort → thinking）：需 temperature=1，且 max_tokens 要容纳思考+输出。
   ;; DeepSeek 只有 high/max 两级 → 先按模型归一（low/medium 夹到 high）。
-  (define eff (normalize-effort (current-reasoning-effort) (config-model cfg)))
+  ;; 'off 对 DeepSeek 要显式关：不发 thinking 参数时它照样思考（缺省开）。
+  (define eff (normalize-effort (effective-reasoning-effort (config-model cfg)) (config-model cfg)))
   (define base*
     (if (eq? eff 'off)
-        base
+        (if (deepseek-model? (config-model cfg)) (hash-set base 'thinking (hasheq 'type "disabled")) base)
         (let ([budget (effort->budget eff)])
           (hash-set* base
                      'thinking (hasheq 'type "enabled" 'budget_tokens budget)
@@ -345,23 +356,18 @@
 ;; ---------------------------------------------------------------- 构造器
 
 (define (make-anthropic-provider cfg)
-  (define current-cust (box #f))
+  (define streams (make-stream-set))
   (provider
    f"anthropic:{(config-model cfg)}"
    (lambda (msgs tool-specs)
      (define ecfg (or (current-config) cfg))    ; 运行时读 live config
      (define ch (make-async-channel))
-     (define cust (make-custodian))
-     (set-box! current-cust cust)
-     (parameterize ([current-custodian cust])
-       (thread
-        (lambda ()
-          (with-handlers ([exn:fail? (lambda (e) (async-channel-put ch (evt:error (now-ms) e #f)))])
-            (stream-with-retry! ecfg msgs tool-specs ch)))))
+     (stream-set-spawn! streams
+       (lambda ()
+         (with-handlers ([exn:fail? (lambda (e) (async-channel-put ch (evt:error (now-ms) e #f)))])
+           (stream-with-retry! ecfg msgs tool-specs ch))))
      ch)
-   (lambda ()
-     (define c (unbox current-cust))
-     (when c (custodian-shutdown-all c))))
+   (lambda () (stream-set-cancel-all! streams)))   ; 取消全部在途请求
 ) ; end define make-anthropic-provider
 
 ;; ---------------------------------------------------------------- provide

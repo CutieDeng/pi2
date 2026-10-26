@@ -1,0 +1,24 @@
+#!/bin/bash
+sub="$1"; shift
+case "$sub" in
+  validate)
+    f="$1"; [ -f "$f" ] || { echo "pi2 validate: no such file: $f"; exit 1; }
+    python3 - "$f" <<'PY'
+import sys,re
+s=open(sys.argv[1]).read().strip()
+m=re.match(r'^\((FEAT|FIX|REFACTOR|TEST|DOCS|BUILD)\s+"([^"]*)"', s)
+if not m: print('INVALID: first datum must be (TYPE "title" () "detail") with TYPE in FEAT/FIX/REFACTOR/TEST/DOCS/BUILD'); sys.exit(1)
+t=m.group(2)
+if len(t)>50: print(f'INVALID: title too long ({len(t)} chars > 50)'); sys.exit(1)
+if 'Modified:' not in s: print("INVALID: detail must contain a 'Modified:' list"); sys.exit(1)
+print(f'OK: valid {m.group(1)} commit, title {len(t)} chars')
+PY
+    ;;
+  skills)
+    echo "Available skills:"
+    echo "  commit    — prepare & validate a .commit message for staged changes"
+    echo "  changelog — update CHANGELOG from recent commits" ;;
+  skill)
+    [ "$1" = commit ] && echo '[skill commit] Write .commit as (TYPE "title" () "detail with Modified: list"), then run: pi2 validate .commit' || echo "no such skill: $1" ;;
+  *) echo "pi2: unknown subcommand '$sub' (try: validate, skills, skill)"; exit 2;;
+esac

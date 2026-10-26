@@ -11,6 +11,7 @@
  racket/format
  (file "../tool.rkt")
  (file "file.rkt")                      ; atomic-write!
+ (file "../diff.rkt")                   ; try-file-diff
 ) ; end require
 
 (define MAX-OUTPUT-CHARS 16000)
@@ -262,7 +263,8 @@
      (define-values (dir _n _d?) (split-path (string->path p)))
      (when (path? dir) (make-directory* dir))
      (atomic-write! (string->path p) text)
-     (ok-outcome f"New file created successfully at: {p}" #:display f"create {p}")
+     (ok-outcome f"New file created successfully at: {p}" #:display f"create {p}"
+                 #:diff (try-file-diff p "" text))
     ] ; end else
   ) ; end cond
 ) ; end define run-create
@@ -290,12 +292,13 @@
             f"No replacement was performed. Multiple occurrences of old_str `{old-s}` in lines [{lns}]. Please ensure it is unique")]
           [else
            (define off (car offsets))
-           (atomic-write! (string->path p)
-                          (string-append (substring before 0 off)
-                                         new-s
-                                         (substring before (+ off (string-length old-s)))))
+           (define after (string-append (substring before 0 off)
+                                        new-s
+                                        (substring before (+ off (string-length old-s)))))
+           (atomic-write! (string->path p) after)
            (ok-outcome f"The file {p} has been edited successfully."
-                       #:display f"str_replace {p}")
+                       #:display f"str_replace {p}"
+                       #:diff (try-file-diff p before after))
           ] ; end else
         ) ; end cond
        ] ; end else
@@ -328,7 +331,8 @@
              (string-join (append (take lines line) (split-lines new-s) (drop lines line)) "\n"))
            (atomic-write! (string->path p) after)
            (ok-outcome f"The file {p} has been edited successfully."
-                       #:display f"insert {p}")
+                       #:display f"insert {p}"
+                       #:diff (try-file-diff p before after))
           ] ; end else
         ) ; end cond
        ] ; end else

@@ -1,0 +1,182 @@
+#lang tstring racket
+;; memory-test.rkt — 记忆（design-memory.md M2）内核这边：注入的一节（顺序、上限、分组）、查询打分；
+;; 经 run-rpc!：会话开始时注入、之后冻结（条目改了这个会话不变）、新会话拿到新的；memory_note 发事件（全局 = 待确认）；
+;; memory_search 记 memory_used；读 / 写开关；session_stats 带注入与查到的 id
+
+(require rackunit json racket/async-channel racket/file
+         (file "../src/model.rkt") (file "../src/event.rkt") (file "../src/provider.rkt") (file "../src/tool.rkt")
+         (file "../src/permission.rkt") (file "../src/loop.rkt") (file "../src/session.rkt") (file "../src/plugin.rkt")
+         (file "../src/rpc.rkt") (file "../src/rktd.rkt") (file "../src/tools/builtin.rkt") (file "../src/memory.rkt"))
+
+(define CHAIN (list (hasheq 'id "global" 'kind "global" 'name "Global")
+                    (hasheq 'id "p1" 'kind "project" 'name "Shop")
+                    (hasheq 'id "w1" 'kind "workspace" 'name "web @ local")))
+(define (E id scope text updated [pinned #f]) (hasheq 'id id 'scope scope 'text text 'updated updated 'pinned pinned))
+
+(test-case "addendum: pinned first, then most recently updated; grouped by scope in chain order; other scopes left out; nothing → empty"
+  (define-values (t0 ids0) (memory-addendum '() CHAIN))
+  (check-equal? (list t0 ids0) '("" ()))
+  (define es (list (E "m1" "global" "reply in Chinese" "2026-10-01")
+                   (E "m2" "w1" "run `make test` before commit" "2026-10-20")
+                   (E "m3" "p1" "prices are in cents" "2026-10-10" #t)
+                   (E "m4" "w9" "other workspace fact" "2026-10-24")))
+  (define-values (t ids) (memory-addendum es CHAIN))
+  (check-equal? ids '("m3" "m2" "m1"))
+  (check-true (string-prefix? t MEMORY-HEADER))
+  (define (pos k) (caar (regexp-match-positions (regexp-quote k) t)))
+  (check-true (< (pos "### Global") (pos "[m1]") (pos "### project \"Shop\"") (pos "[m3]") (pos "### workspace \"web @ local\"") (pos "[m2]")))
+  (check-false (string-contains? t "other workspace")))
+
+(test-case "addendum: byte cap — entries that do not fit are skipped, shorter later ones still go in; newlines flattened"
+  (define big (make-string 300 #\x))
+  (define es (list (E "a" "global" big "2026-10-03") (E "b" "global" "short one" "2026-10-02") (E "c" "global" "line1\nline2" "2026-10-01")))
+  (define-values (t ids) (memory-addendum es CHAIN #:max-bytes 100))
+  (check-equal? ids '("b" "c"))
+  (check-true (string-contains? t "- [c] line1 line2")))
+
+(test-case "search: query words and CJK bigrams; best match first; only chain scopes"
+  (define es (list (E "m1" "global" "回答用中文" "2026-10-01") (E "m2" "w1" "run make test before commit" "2026-10-20")
+                   (E "m3" "w1" "make build is slow" "2026-10-21") (E "m4" "w9" "make test elsewhere" "2026-10-24")))
+  (check-equal? (map (lambda (e) (hash-ref e 'id)) (memory-search es CHAIN "make test")) '("m2" "m3"))
+  (check-equal? (map (lambda (e) (hash-ref e 'id)) (memory-search es CHAIN "用中文回答")) '("m1"))
+  (check-equal? (memory-search es CHAIN "nothing here") '()))
+
+;; ---------------------------------------------------------------- 经 run-rpc!
+(define dir (make-temporary-file "pi2-mem-~a" 'directory))
+(void (putenv "PI_CONFIG_HOME" (path->string (build-path dir "cfg"))))
+(define seen (box '()))                                   ; 每次请求的系统提示词
+(define script (box '()))                                 ; 下一次请求要发的工具调用（name . args）或 #f = 回文字
+(define last-results (box '()))
+(define prov (provider "s" (lambda (msgs _t)
+                             (set-box! seen (cons (config-system-prompt (current-config)) (unbox seen)))
+                             (define lastm (last msgs))
+                             (define tr (for/first ([b (in-list (message-blocks lastm))] #:when (tool-result-block? b)) b))
+                             (when tr (set-box! last-results (cons (tool-result-block-content tr) (unbox last-results))))
+                             (define ch (make-async-channel))
+                             (define call (and (not tr) (pair? (unbox script)) (car (unbox script))))
+                             (cond
+                               [call (set-box! script (cdr (unbox script)))
+                                     (async-channel-put ch (evt:message (now-ms) (message 'assistant (list (tool-use-block "c1" (car call) (cdr call))))))
+                                     (async-channel-put ch (evt:turn-end (now-ms) "tool_calls" (usage 1 1)))]
+                               [else (async-channel-put ch (evt:message (now-ms) (text-msg 'assistant "ok")))
+                                     (async-channel-put ch (evt:turn-end (now-ms) "stop" (usage 1 1)))])
+                             ch) void))
+
+(test-case "run-rpc!: injected at session start then frozen; a new session gets the new set; memory_note → event (global pending); memory_search → memory_used; switches; stats"
+  (define cfg (struct-copy config (default-config) [workdir (path->string dir)] [permission-mode 'normal] [system-prompt "BASE"]))
+  (define path (fresh-session-path (path->string dir)))
+  (define sess (session-open! path cfg))
+  (define host (make-plugin-host))
+  (define d (make-deps #:provider prov #:registry (make-registry (builtin-tools cfg)) #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define-values (in-r in-w) (make-pipe)) (define-values (out-r out-w) (make-pipe))
+  (thread (lambda () (parameterize ([current-input-port in-r] [current-output-port out-w])
+                       (run-rpc! d (make-initial-state cfg) sess #:plugin-host host #:fetch-models (lambda (_e) #f)))
+            (close-output-port out-w)))
+  (define (send! j) (write-string (jsexpr->string j) in-w) (newline in-w) (flush-output in-w))
+  (define (read-type type)
+    (let loop () (define l (sync/timeout 10 (read-line-evt out-r 'linefeed)))
+      (unless (string? l) (error 'read-type "timeout waiting for ~a" type))
+      (define j (string->jsexpr l)) (if (equal? (hash-ref j 'type #f) type) j (loop))))
+  (define (view! p memories #:read [rd #t] #:write [wr #t] #:auto [auto #f])
+    (send! (hasheq 'type "set_catalog_view" 'projects '("Shop") 'memories memories 'memory_global_auto auto
+                   'sessions (list (hasheq 'path p 'projects '("Shop") 'mem CHAIN 'mem_read rd 'mem_write wr)))))
+  (define (recs type p) (for/list ([r (in-datum-log p)] #:when (and (rec? r) (eq? (rec-type r) type))) (rec-data r)))
+  (read-type "session")
+  (view! (path->string path) (list (E "m1" "global" "GLOBAL-FACT" "2026-10-01") (E "m2" "w1" "WS-FACT make test" "2026-10-02")))
+  (send! (hasheq 'type "prompt" 'text "one")) (read-type "turn_complete")
+  (define s1 (car (unbox seen)))
+  (check-true (string-prefix? s1 "BASE"))
+  (check-true (string-contains? s1 "GLOBAL-FACT"))
+  (check-true (string-contains? s1 "WS-FACT"))
+  (check-equal? (hash-ref (car (recs 'memory path)) 'ids) '("m2" "m1"))
+  ;; 条目改了：这个会话的提示词不变（冻结），也不再记
+  (view! (path->string path) (list (E "m3" "w1" "NEW-FACT" "2026-10-03")))
+  (send! (hasheq 'type "prompt" 'text "two")) (read-type "turn_complete")
+  (check-equal? (car (unbox seen)) s1)
+  (check-equal? (length (recs 'memory path)) 1)
+  ;; memory_note：工作区 → 事件；全局 → 事件 + 结果说要确认
+  (set-box! script (list (cons "memory_note" (hasheq 'text "use pnpm, not npm" 'scope "workspace"))))
+  (send! (hasheq 'type "prompt" 'text "note it"))
+  (define ev1 (read-type "memory_note"))
+  (check-equal? (list (hash-ref ev1 'scope) (hash-ref ev1 'kind) (hash-ref ev1 'text) (hash-ref ev1 'session)) (list "w1" "workspace" "use pnpm, not npm" (path->string path)))
+  (read-type "turn_complete")
+  (check-regexp-match #rx"saved to workspace memory \"web @ local\"" (format "~a" (car (unbox last-results))))
+  (set-box! script (list (cons "memory_note" (hasheq 'text "answer in Chinese" 'scope "global"))))
+  (send! (hasheq 'type "prompt" 'text "global note"))
+  (check-equal? (hash-ref (read-type "memory_note") 'scope) "global")
+  (read-type "turn_complete")
+  (check-regexp-match #rx"user has to confirm" (format "~a" (car (unbox last-results))))
+  ;; memory_search → 命中 + memory_used 记录
+  (set-box! script (list (cons "memory_search" (hasheq 'query "NEW-FACT"))))
+  (send! (hasheq 'type "prompt" 'text "search")) (read-type "turn_complete")
+  (check-regexp-match #rx"^\\[m3\\] \\(workspace \"web @ local\"\\) NEW-FACT" (format "~a" (car (unbox last-results))))
+  (check-equal? (hash-ref (car (recs 'memory_used path)) 'ids) '("m3"))
+  ;; 写关掉：memory_note 报错、不发事件
+  (view! (path->string path) (list (E "m3" "w1" "NEW-FACT" "2026-10-03")) #:write #f)
+  (set-box! script (list (cons "memory_note" (hasheq 'text "x"))))
+  (send! (hasheq 'type "prompt" 'text "note again")) (read-type "turn_complete")
+  (check-regexp-match #rx"writing memory is turned off" (format "~a" (car (unbox last-results))))
+  ;; 信息面板
+  (send! (hasheq 'type "session_stats" 'path (path->string path)))
+  (define st (read-type "session_stats"))
+  (check-equal? (hash-ref (hash-ref st 'memory) 'ids) '("m2" "m1"))
+  (check-equal? (hash-ref st 'memory_used) '("m3"))
+  ;; 新会话：拿到现在的条目；读关掉的会话不注入
+  (send! (hasheq 'type "new_session")) (define ns (read-type "session"))
+  (define p2 (hash-ref ns 'path))
+  (view! p2 (list (E "m3" "w1" "NEW-FACT" "2026-10-03")))
+  (send! (hasheq 'type "prompt" 'text "fresh")) (read-type "turn_complete")
+  (check-true (string-contains? (car (unbox seen)) "NEW-FACT"))
+  (check-false (string-contains? (car (unbox seen)) "GLOBAL-FACT"))
+  (send! (hasheq 'type "new_session")) (define p3 (hash-ref (read-type "session") 'path))
+  (view! p3 (list (E "m3" "w1" "NEW-FACT" "2026-10-03")) #:read #f)
+  (send! (hasheq 'type "prompt" 'text "no read")) (read-type "turn_complete")
+  (check-false (string-contains? (car (unbox seen)) "## Memory"))
+  (send! (hasheq 'type "shutdown")) (void (read-type "bye")))
+
+(test-case "M3 kernel: dormant entries are not injected (still searchable)"
+  (define es (list (hasheq 'id "a" 'scope "global" 'text "active one" 'updated "2") (hasheq 'id "b" 'scope "global" 'text "dormant one" 'updated "1" 'dormant #t)))
+  (define-values (t ids) (memory-addendum es CHAIN))
+  (check-equal? ids '("a"))
+  (check-equal? (map (lambda (e) (hash-ref e 'id)) (memory-search es CHAIN "dormant")) '("b")))
+
+(test-case "M3 kernel via run-rpc!: memory_input (texts + one line per tool call, no tool output); local_complete; memory_used events"
+  (define cfg (struct-copy config (default-config) [workdir (path->string dir)] [permission-mode 'yolo] [system-prompt "BASE"]))
+  (define path (fresh-session-path (path->string dir)))
+  (define sess (session-open! path cfg))
+  (define host (make-plugin-host))
+  (define d (make-deps #:provider prov #:registry (make-registry (builtin-tools cfg)) #:bus (make-bus) #:policy (make-policy cfg) #:plugin-host host))
+  (define-values (in-r in-w) (make-pipe)) (define-values (out-r out-w) (make-pipe))
+  (thread (lambda () (parameterize ([current-input-port in-r] [current-output-port out-w])
+                       (run-rpc! d (make-initial-state cfg) sess #:plugin-host host #:fetch-models (lambda (_e) (cons '("m-local") '("m-local")))
+                                 #:complete-long (lambda (ep model msgs) (format "ECHO:~a" (string-length (message-text (car msgs)))))))
+            (close-output-port out-w)))
+  (define (send! j) (write-string (jsexpr->string j) in-w) (newline in-w) (flush-output in-w))
+  (define (read-type type)
+    (let loop () (define l (sync/timeout 10 (read-line-evt out-r 'linefeed)))
+      (unless (string? l) (error 'read-type "timeout waiting for ~a" type))
+      (define j (string->jsexpr l)) (if (equal? (hash-ref j 'type #f) type) j (loop))))
+  (read-type "session")
+  (send! (hasheq 'type "set_catalog_view" 'projects '() 'memories (list (E "m1" "global" "GLOBAL-FACT kept" "1")) 'sessions (list (hasheq 'path (path->string path) 'mem CHAIN))))
+  (set-box! script (list (cons "bash" (hasheq 'command "echo SECRET-OUTPUT-xyz"))))
+  (send! (hasheq 'type "prompt" 'text "please list"))
+  (check-equal? (hash-ref (read-type "memory_used") 'ids) '("m1"))                 ; 会话开始时注入 → 事件
+  (read-type "turn_complete")
+  (send! (hasheq 'type "memory_input" 'path (path->string path)))
+  (define mi (read-type "memory_input"))
+  (check-true (string-contains? (hash-ref mi 'text) "USER: please list"))
+  (check-true (string-contains? (hash-ref mi 'text) "ASSISTANT called bash"))
+  (check-false (string-contains? (hash-ref mi 'text) "SECRET-OUTPUT-xyz\n"))      ; 只有调用的参数行，没有输出
+  (check-true (>= (hash-ref mi 'messages) 4))
+  (send! (hasheq 'type "local_complete" 'id "x1" 'prompt "hello"))
+  (define lc (read-type "local_completed"))
+  (check-equal? (list (hash-ref lc 'id) (hash-ref lc 'text) (hash-ref lc 'model)) '("x1" "ECHO:5" "m-local"))
+  (send! (hasheq 'type "local_complete" 'id "x2" 'prompt "hello" 'endpoint "https://api.example.com/v1"))
+  (check-regexp-match #rx"not on this machine" (hash-ref (read-type "local_completed") 'error))
+  (set-box! script (list (cons "memory_search" (hasheq 'query "global-fact"))))
+  (send! (hasheq 'type "prompt" 'text "search"))
+  (check-equal? (hash-ref (read-type "memory_used") 'how) "search")
+  (read-type "turn_complete")
+  (send! (hasheq 'type "shutdown")) (void (read-type "bye")))
+
+(delete-directory/files dir)

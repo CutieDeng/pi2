@@ -15,6 +15,9 @@
 (struct tool-use-block (id name input) #:prefab)               ; input : jsexpr
 (struct tool-result-block (tool-use-id content is-error?) #:prefab)
 (struct image-block (media-type data) #:prefab)
+;; 媒体（design-content.md §3.3）：内容在 blob 存储里（按 sha256 寻址，src/media.rkt），记录里只有引用。
+;; kind：'image | 'audio | 'file；name：文件名或 #f；meta：hasheq（bytes width height duration transcript …）
+(struct media-block (kind media-type sha name meta) #:prefab)
 
 (define (content-block? v)
   (or (text-block? v)
@@ -22,6 +25,7 @@
       (tool-use-block? v)
       (tool-result-block? v)
       (image-block? v)
+      (media-block? v)
   ) ; end or
 ) ; end define content-block?
 
@@ -99,14 +103,19 @@
 ;; model/endpoint/key（而非创建时闭包的旧 cfg）——故 /model 等运行时切换即时生效。
 (define current-config (make-parameter #f))
 
-;; 运行时推理强度：'off | 'low | 'medium | 'high | 'max。
+;; 运行时推理强度：'default | 'off | 'low | 'medium | 'high | 'max。
+;; 'default = 没人选过：按模型取（effective-reasoning-effort）——DeepSeek 服务端缺省就思考（官方文档：缺省开、effort high）→ 'high；
+;; 其余 → 'off。选了 'off 就是真关：DeepSeek 发 thinking disabled（2026-10-26 实测：没有思考块）。界面显示解析后的档位。
 ;; **刻意不入 prefab config**（加字段会破坏旧 .rktd 重放，参照 provider 选用的做法），
 ;; **parameter**（非 box）——故 thread-local：主线程 `/reasoning`、`--reasoning`、RPC set_reasoning 直接设；
 ;; 并行 goal worker 各自 `(parameterize ([current-reasoning-effort …]) …)` 隔离，互不干扰(P4.2 v2)。
 ;; provider 每次请求读取：OpenAI 兼容 → reasoning_effort（'max 无对应，钳到 high）；
 ;; Anthropic → thinking budget（'max 给最大预算，供 DeepSeek 等 high/max 两档场景）。
-(define current-reasoning-effort (make-parameter 'off))
+(define current-reasoning-effort (make-parameter 'default))
 (define (set-reasoning-effort! level) (current-reasoning-effort level))
+(define (deepseek-model? m) (and (string? m) (regexp-match? #rx"^deepseek" m)))   ; deepseek-v4-flash / -v4-pro / -chat…
+(define (effective-reasoning-effort [model (let ([c (current-config)]) (and c (config-model c)))] [eff (current-reasoning-effort)])
+  (if (eq? eff 'default) (if (deepseek-model? model) 'high 'off) eff))
 (define (valid-reasoning-effort? v) (and (memq v '(off low medium high max)) #t))
 
 ;; ---------------------------------------------------------------- Agent 状态
@@ -163,6 +172,7 @@
  (struct-out tool-use-block)
  (struct-out tool-result-block)
  (struct-out image-block)
+ (struct-out media-block)
  content-block?
  (struct-out message)
  text-msg
@@ -174,7 +184,7 @@
  (struct-out config)
  default-config
  current-config
- current-reasoning-effort set-reasoning-effort! valid-reasoning-effort?
+ current-reasoning-effort set-reasoning-effort! valid-reasoning-effort? effective-reasoning-effort deepseek-model?
  (struct-out agent-state)
  make-initial-state
  state-append
@@ -188,4 +198,12 @@
  (struct-out evt:turn-end)
  (struct-out evt:error)
  now-ms
+ current-record-sink record!
 ) ; end provide
+
+;; ---------------------------------------------------------------- 会话记录的去向
+;; 内核在「历史真正变化的那一刻」把记录交给它：(kind payload)
+;;   'msg 消息（追加进历史）| 'compact 压缩后的完整历史（摘要 + 保留的消息；清空 = '()）| 'turn 'begin / 'revert（轮开始 / 出错撤回）
+;; 由前端（RPC / TUI）设成写会话文件；#f = 不记（测试、子 agent）
+(define current-record-sink (make-parameter #f))
+(define (record! kind payload) (let ([s (current-record-sink)]) (when s (s kind payload))))

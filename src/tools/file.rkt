@@ -6,6 +6,7 @@
  racket/file
  racket/list
  (file "../tool.rkt")
+ (file "../diff.rkt")                   ; try-file-diff
 ) ; end require
 
 (define READ-MAX-LINES 2000)
@@ -108,9 +109,11 @@
         (when (path? dir)
           (make-directory* dir)
         ) ; end when
+        (define before (if (file-exists? fp) (file->string fp) ""))
         (atomic-write! fp content)
         (ok-outcome f"wrote {(string-length content)} chars to {p}"
                     #:display f"write {p}"
+                    #:diff (try-file-diff p before content)
         ) ; end ok-outcome
        ] ; end else
      ) ; end cond
@@ -176,7 +179,8 @@
                 [else
                  (atomic-write! fp text*)
                  (ok-outcome f"edited {p}: {applied} replacement(s) across {(length edits)} edit(s)"
-                             #:display f"edit {p}")])])]
+                             #:display f"edit {p}"
+                             #:diff (try-file-diff p text text*))])])]
         ) ; end cond
        ] ; end else
      ) ; end cond

@@ -43,6 +43,11 @@
 (define promoted-box (box #f))
 (define (dsv4b-promoted?) (unbox promoted-box))
 
+;; 锚定窗口是否仍开着：dsv4-b 已锚定启动（payload 装配）且尚未促迁。
+;; 此窗口内**首请求工具目录必须纯净**（恰 bash + str_replace_editor），任何临时工具
+;; （如 $skill 的洞）都不可注册，否则污染锚定。促迁后返回 #f，洞恢复正常开。
+(define (dsv4b-anchoring-live?) (and (unbox payload-box) (not (unbox promoted-box))))
+
 ;; 测试用：复位全部进程级状态。
 (define (dsv4b-reset!)
   (set-box! promote-on-box 'tool-call)
@@ -117,6 +122,7 @@
  dsv4b-promote-on set-dsv4b-promote-on!
  set-dsv4b-payload!
  dsv4b-promoted?
+ dsv4b-anchoring-live?
  dsv4b-reset!
  dsv4b-active?
  history-has-tool-call?

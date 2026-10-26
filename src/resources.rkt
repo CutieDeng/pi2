@@ -9,7 +9,7 @@
 ;; 技能：渐进披露——名称/描述列入系统提示词，模型按需 read_file 全文。
 ;; 提示词：可经 /prompt <name> 激活（其正文追加进系统提示词）。
 
-(require racket/file racket/string)
+(require racket/file racket/string (file "instructions.rkt"))
 
 (struct resource (name description body path) #:transparent)
 
@@ -84,21 +84,23 @@
 ) ; end define skills-addendum
 
 ;; ---------------------------------------------------------------- 项目指令自动加载
-;; 对标 Claude Code 的 CLAUDE.md / AGENTS.md：在工作目录放一份项目约定，启动即注入系统提示词，
-;; 让 agent 每个 session 不再对项目规范「失忆」。按优先级取**首个存在**的文件（避免重复注入）。
+;; 对标 Claude Code 的 CLAUDE.md / AGENTS.md：启动即注入系统提示词，让 agent 每个 session 不再对项目规范「失忆」。
+;; 分层（instructions.rkt，design-memory.md M1）：全局 {config-home}/AGENTS.md + 从 git 根到 dir 每一级一个文件
+;; （同一级按优先级取首个：AGENTS.override.md > AGENTS.md > CLAUDE.md > .pi/AGENTS.md > PI.md）。
+;; 命令行这条路没有目录 catalog（项目 / 工作区的指令只在 GUI 里）。
 
-(define PROJECT-INSTRUCTION-FILES '("AGENTS.md" "CLAUDE.md" ".pi/AGENTS.md" "PI.md"))
+(define PROJECT-INSTRUCTION-FILES DIR-FILES)
 
-;; 在 dir 下按优先级找项目指令文件，返回 (values 路径字符串 正文) 或 (values #f "")。
-(define (find-project-instructions dir)
-  (let loop ([cs PROJECT-INSTRUCTION-FILES])
-    (cond
-      [(null? cs) (values #f "")]
-      [else
-       (define fp (build-path dir (car cs)))
-       (if (file-exists? fp)
-           (values (path->string fp) (file->string fp))
-           (loop (cdr cs)))]))
+;; → (values 来源（多个用 " + " 连）正文) 或 (values #f "")。只有一段时正文 = 那个文件的原文；多段时每段前有 ### 来源
+(define (find-project-instructions dir #:home [home 'default])
+  (define segs (filter (lambda (s) (non-empty-string? (hash-ref s 'text)))
+                       (if (eq? home 'default) (collect-instructions dir) (collect-instructions dir #:home home))))
+  (cond
+    [(null? segs) (values #f "")]
+    [(null? (cdr segs)) (values (hash-ref (car segs) 'label) (hash-ref (car segs) 'text))]
+    [else (values (string-join (map (lambda (s) (hash-ref s 'label)) segs) " + ")
+                  (string-join (for/list ([s (in-list segs)]) (string-append "### " (hash-ref s 'label) "\n\n" (string-trim (hash-ref s 'text) #:left? #f)))
+                               "\n\n"))])
 ) ; end define find-project-instructions
 
 ;; 项目指令注入片段（空正文 → 空串，不注入）。

@@ -17,7 +17,7 @@
   [(define (tool-name t) (mock-tool-name t))
    (define (tool-spec t) (hasheq))
    (define (tool-permission-level t) (mock-tool-level t))
-   (define (tool-run t input ctx) (tool-outcome "ran" #f #f))]
+   (define (tool-run t input ctx) (ok-outcome "ran"))]
 ) ; end struct mock-tool
 
 (define (policy mode) (make-policy (struct-copy config (default-config) [permission-mode mode])))

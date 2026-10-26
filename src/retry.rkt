@@ -48,9 +48,9 @@
     ;; 额度 / 计费。
     [(has? "quota" "insufficient" "billing" "credit" "payment" "balance" "402")
      'quota]
-    ;; 瞬时：网络/超时/5xx。
+    ;; 瞬时：网络/超时/5xx；provider 内部重试耗尽（"retries exhausted (network)"）、流中途断开（"stream interrupted"）也算
     [(has? "timeout" "timed out" "connection" "reset" "refused" "temporarily"
-           "500" "502" "503" "504" "eof" "broken pipe" "unavailable")
+           "500" "502" "503" "504" "eof" "broken pipe" "unavailable" "network" "interrupted")
      'transient]
     [else 'other]
   ) ; end cond
@@ -130,8 +130,10 @@
 (define (apply-fallback-target st host target)
   (cond
     [(and host (builtin-provider-instance? target))
-     (when host (host-set-provider! host target))
+     (host-set-provider! host target)
      (struct-copy agent-state st [config (apply-provider-profile (agent-state-config st) target)])]
+    ;; 无 host（子 agent）且目标是供应商：切不了线路，也不能把供应商名当模型名写进 config → 不变
+    [(builtin-provider-instance? target) st]
     [else
      (struct-copy agent-state st
                   [config (struct-copy config (agent-state-config st) [model target])])]

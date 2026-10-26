@@ -27,7 +27,8 @@
   (check-true (tool? (registry-lookup reg "bash")))
   (check-true (tool? (registry-lookup reg "git")))
   (check-false (registry-lookup reg "nope"))
-  (check-equal? (length (registry-specs reg)) 7)
+  (check-equal? (length (registry-specs reg)) 11)               ; 7 个 + racket_eval（沙箱 Racket，2026-10-23）+ tests_run / acceptance_report / tests_propose（工作区测试流程，2026-10-26）
+  (check-true (tool? (registry-lookup reg "racket_eval")))
   (for ([spec (in-list (registry-specs reg))])
     (check-equal? (hash-ref spec 'type) "function")
   ) ; end for

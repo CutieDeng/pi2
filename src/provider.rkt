@@ -10,8 +10,12 @@
  racket/string
  racket/list
  (file "model.rkt")
+ (file "hidden-text.rkt")               ; 送给模型前：隐藏文字（Unicode tag）按设置标出 / 原样（design-gui.md §30.4）
  (file "stream.rkt")
+ (file "media.rkt")                     ; 消息里的媒体：按模型能力投影
 ) ; end require
+
+(define (current-model-name) (let ([c (current-config)]) (and c (config-model c))))
 
 ;; ---------------------------------------------------------------- provider
 
@@ -22,13 +26,34 @@
   ) ; end fields
 ) ; end struct provider
 
+;; 所有发给模型的请求都经这里（轮、压缩、工具输出预览、路由池成员）：消息先按「隐藏文字」设置转换（会话记录不变）
 (define (provider-stream! p msgs tool-specs)
-  ((provider-stream!-proc p) msgs tool-specs)
+  ((provider-stream!-proc p) (model-view-messages msgs) tool-specs)
 ) ; end define provider-stream!
 
 (define (provider-cancel! p)
   ((provider-cancel!-proc p))
 ) ; end define provider-cancel!
+
+;; 一个 provider 的在途请求：每个请求一个 custodian；取消 = 全部关掉。
+;; （原来只记最近一次请求：并行子 agent / 并行 goal worker 时 Esc 只能取消最后一个，其余继续跑、继续计费）
+(struct stream-set (table sema))
+(define (make-stream-set) (stream-set (make-hasheq) (make-semaphore 1)))
+(define (stream-set-spawn! ss thunk)
+  (define cust (make-custodian))
+  (call-with-semaphore (stream-set-sema ss) (lambda () (hash-set! (stream-set-table ss) cust #t)))
+  (parameterize ([current-custodian cust])
+    (thread (lambda ()
+              (dynamic-wind void thunk
+                            (lambda () (call-with-semaphore (stream-set-sema ss) (lambda () (hash-remove! (stream-set-table ss) cust))))))))
+  cust
+) ; end define stream-set-spawn!
+(define (stream-set-cancel-all! ss)
+  (define cs (call-with-semaphore (stream-set-sema ss)
+                                  (lambda () (begin0 (hash-keys (stream-set-table ss)) (hash-clear! (stream-set-table ss))))))
+  (for ([c (in-list cs)]) (custodian-shutdown-all c))
+) ; end define stream-set-cancel-all!
+(define (stream-set-count ss) (call-with-semaphore (stream-set-sema ss) (lambda () (hash-count (stream-set-table ss)))))
 
 ;; ---------------------------------------------------- message -> OpenAI json
 
@@ -71,6 +96,17 @@
       ) ; end if
      ) ; end list
     ] ; end assistant case
+    [(has-media? m)
+     ;; 带媒体的用户消息：能收的图片作 image_url（data URL），其余成文字占位
+     (define-values (imgs phs) (split-media blocks (current-model-name)))
+     (define text (string-join (filter (lambda (s) (not (string=? s ""))) (cons (message-text m) phs)) "\n"))
+     (list (hasheq 'role (symbol->string (message-role m))
+                   'content (if (null? imgs)
+                                text
+                                (append (if (string=? text "") '() (list (hasheq 'type "text" 'text text)))
+                                        (for/list ([pr (in-list imgs)])
+                                          (hasheq 'type "image_url"
+                                                  'image_url (hasheq 'url (format "data:~a;base64,~a" (media-block-media-type (car pr)) (cdr pr)))))))))]
     [else
      (list (hasheq 'role (symbol->string (message-role m))
                    'content (message-text m)
@@ -104,9 +140,10 @@
   ;; 推理强度：非 off 时加 reasoning_effort（OpenAI o 系/gpt-5、Gemini、Grok 均识别；
   ;; LM Studio 等不识别的端点会忽略未知字段）。
   (define body+r
-    (let ([eff (current-reasoning-effort)])
+    (let ([eff (effective-reasoning-effort (config-model cfg))])
       (if (eq? eff 'off)
-          body+u
+          ;; DeepSeek 的 OpenAI 格式同样缺省思考 → 显式关（官方文档：thinking {"type":"disabled"}）
+          (if (deepseek-model? (config-model cfg)) (hash-set body+u 'thinking (hasheq 'type "disabled")) body+u)
           ;; OpenAI reasoning_effort 仅 low|medium|high；'max 无对应 → 钳到 "high"。
           (hash-set body+u 'reasoning_effort (symbol->string (if (eq? eff 'max) 'high eff)))
       ) ; end if
@@ -233,7 +270,7 @@
 ;; ---------------------------------------------------------------- 构造器
 
 (define (make-openai-provider cfg)
-  (define current-cust (box #f))
+  (define streams (make-stream-set))
   (provider
    f"openai:{(config-model cfg)}"
    ;; stream!
@@ -241,30 +278,21 @@
      ;; 每次请求取当前生效的 config（运行时 /model 等切换即时生效）；未设时回退创建 cfg。
      (define ecfg (or (current-config) cfg))
      (define ch (make-async-channel))
-     (define cust (make-custodian))
-     (set-box! current-cust cust)
-     (parameterize ([current-custodian cust])
-       (thread
-        (lambda ()
-          (with-handlers ([exn:fail?
-                           (lambda (e)
-                             (async-channel-put ch (evt:error (now-ms) e #f))
-                           ) ; end lambda
-                          ]) ; end handlers
-            (stream-with-retry! ecfg msgs tool-specs ch)
-          ) ; end with-handlers
-        ) ; end lambda
-       ) ; end thread
-     ) ; end parameterize
+     (stream-set-spawn! streams
+       (lambda ()
+         (with-handlers ([exn:fail?
+                          (lambda (e)
+                            (async-channel-put ch (evt:error (now-ms) e #f))
+                          ) ; end lambda
+                         ]) ; end handlers
+           (stream-with-retry! ecfg msgs tool-specs ch)
+         ) ; end with-handlers
+       ) ; end lambda
+     ) ; end stream-set-spawn!
      ch
    ) ; end stream! lambda
    ;; cancel!
-   (lambda ()
-     (define c (unbox current-cust))
-     (when c
-       (custodian-shutdown-all c)
-     ) ; end when
-   ) ; end cancel! lambda
+   (lambda () (stream-set-cancel-all! streams))
   ) ; end provider
 ) ; end define make-openai-provider
 
@@ -280,4 +308,7 @@
  make-openai-provider
  message->openai-msgs
  build-request-body
+ post!                                  ; provider-responses.rkt 复用
+ make-stream-set stream-set-spawn! stream-set-cancel-all! stream-set-count
+ endpoint-parts
 ) ; end provide

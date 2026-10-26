@@ -1,0 +1,1 @@
+The function `dedup` is defined in ./cache.py. A user reports that `dedup` occasionally returns items from a previous, unrelated call. Find the root cause. When you are confident, STOP calling tools and reply with a short final diagnosis: the exact failing scenario and the one-line fix.

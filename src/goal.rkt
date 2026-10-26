@@ -24,6 +24,8 @@
  (file "pricing.rkt")
  (file "worktree.rkt")                  ; P4.1：git worktree 隔离原语
  (file "plugin.rkt")
+ (file "acceptance.rkt")                ; 验收加固：防篡改 / 独立审查 / 先写验收（用户 2026-10-26 a + b + c）
+ (file "test-flow.rkt")                 ; 工作区测试流程（.pi/tests.rktd）：goal 的验收 = 额外命令 + 流程的全部步骤（§12）
 ) ; end require
 
 ;; ---------------------------------------------------------------- 验收 oracle
@@ -168,12 +170,29 @@
 
 ;; ---------------------------------------------------------------- 每轮提示词
 
-(define (goal-prompt goal until-cmds last-report first? pdone ptotal pactive issues replan? regr? best-commit)
+(define (goal-prompt goal until-cmds last-report first? pdone ptotal pactive issues replan? regr? best-commit
+                     #:protected [protected '()] #:tampered [tampered '()] #:review-findings [findings '()])
   (string-append
    f"You are working autonomously toward a goal across multiple turns.\n\nGOAL: {goal}\n\n"
    "ACCEPTANCE — the goal is DONE only when ALL of these shell commands exit 0:\n"
    (string-join (for/list ([c (in-list until-cmds)]) f"  $ {c}") "\n")
    "\n\n"
+   ;; 被保护的验收文件：先告诉它（改了会被恢复）
+   (if (pair? protected)
+       (string-append "PROTECTED acceptance files — you cannot change these; edits are reverted before every check. Make the implementation satisfy them:\n"
+                      (string-join (for/list ([p (in-list (take protected (min 30 (length protected))))]) f"  {p}") "\n")
+                      (if (> (length protected) 30) f"\n  … and {(- (length protected) 30)} more" "") "\n\n")
+       "")
+   (if (pair? tampered)
+       (string-append "WARNING: you changed protected acceptance files; they have been RESTORED to their original content:\n"
+                      (string-join (for/list ([t (in-list tampered)]) f"  {(car t)} ({(cdr t)})") "\n")
+                      "\nDo not edit them again — change the implementation instead.\n\n")
+       "")
+   ;; 独立审查复现了的问题：这些检查现在也是验收的一部分
+   (if (pair? findings)
+       (string-append "An independent review found problems, each demonstrated by a check that currently FAILS. These checks are now part of the acceptance:\n"
+                      (string-join (for/list ([f (in-list findings)]) f"  - {(hash-ref f 'problem)}\n    $ {(hash-ref f 'check)}") "\n") "\n\n")
+       "")
    ;; 持久 plan：有则报进度+当前任务；无则要求建 PLAN.md checklist（可选 DAG 注解）。
    (if (> ptotal 0)
        f"PLAN.md progress: {pdone}/{ptotal} done. Current task: {(or pactive "(all items checked — confirm acceptance)")}. Keep PLAN.md updated (check off `- [x]` as you finish each item).\n\n"
@@ -211,31 +230,27 @@
    "\n"))
 
 ;; before→after 新增历史 + usage 增量落盘（与 repl persist-turn! 同义，避免依赖 repl）。
-(define (persist-goal-turn! sess before after)
-  (define b (pvector-length (agent-state-history before)))
-  (define a (pvector-length (agent-state-history after)))
-  (define hist (agent-state-history after))
-  (for ([i (in-range b a)]) (session-append-msg! sess (pvector-ref hist i)))
-  (define ub (agent-state-token-usage before))
-  (define ua (agent-state-token-usage after))
-  (define delta (usage (- (usage-input-tokens ua) (usage-input-tokens ub))
-                       (- (usage-output-tokens ua) (usage-output-tokens ub))))
-  (unless (equal? delta usage-zero) (session-append-usage! sess delta))
-) ; end define persist-goal-turn!
+;; 轮内压缩、记录去向的处理见 session.rkt session-persist-turn!
+(define (persist-goal-turn! sess before after) (session-persist-turn! sess before after))
 
 ;; ---------------------------------------------------------------- 驱动循环
 
 (define (dim s) f"\e[2m{s}\e[0m")
 
 ;; progress monitor 的跨轮状态（run-goal! 与 run-goal-dag! 的顺序轮共用 goal-step!，故抽成 struct）。
-(struct mon (prev-signal noprog rung last-report best-signal best-commit regressed? replan? replans) #:prefab)
-(define (fresh-mon st) (mon #f 0 (ladder-rung-of (config-model (agent-state-config st))) #f #f #f #f #f 0))
+;; tampered：上一次验收前恢复了的被保护文件；findings：审查复现了的问题（它们的检查之后每次验收都在副本里跑）；reviews：审查了几次
+;; flow-results：工作区测试流程最近一次的结构化结果（完成时出验收报告用）
+(struct mon (prev-signal noprog rung last-report best-signal best-commit regressed? replan? replans tampered findings reviews flow-results) #:prefab)
+(define (fresh-mon st) (mon #f 0 (ladder-rung-of (config-model (agent-state-config st))) #f #f #f #f #f 0 '() '() 0 '()))
 
 ;; 跑「一轮 goal」：header + prompt + run-turn! + 验收 + monitor 决策。
 ;; 返回 (values decision st* m* delta-cost)。decision ∈ 'done | 'continue | 'stuck。
 ;; 摘要(DONE/STUCK/MAX-TURNS/BUDGET)由调用方(驱动)据 decision 打印——故 run-goal! 与 run-goal-dag! 共用。
 (define (goal-step! d st sess host goal until-cmds workdir turn max-turns spent m
-                    #:stuck-k [K 2] #:max-replans [max-replans 1] #:budget [budget #f] #:emit [emit displayln])
+                    #:stuck-k [K 2] #:max-replans [max-replans 1] #:budget [budget #f] #:emit [emit displayln]
+                    #:guard [g #f] #:review? [review? #f] #:review-model [review-model #f] #:max-reviews [max-reviews 2]
+                    #:base-commit [base-commit #f] #:flow [fl #f])
+  (define shown-cmds (append until-cmds (if fl (map step-cmd (flow-steps fl)) '())))   ; 给模型 / 审查看的验收命令
   (define tasks (parse-dag workdir))
   (define-values (pdone ptotal) (dag-counts tasks))
   (define pactive (dag-active tasks))
@@ -250,14 +265,55 @@
   (define st1
     (with-handlers ([exn:fail? (lambda (e) (emit f"[turn error] {(exn-message e)}") st)])
       (run-turn! st (text-msg 'user
-                     (goal-prompt goal until-cmds (mon-last-report m) first?
-                                  pdone ptotal pactive issues (mon-replan? m) (mon-regressed? m) (mon-best-commit m))) d)))
+                     (goal-prompt goal shown-cmds (mon-last-report m) first?
+                                  pdone ptotal pactive issues (mon-replan? m) (mon-regressed? m) (mon-best-commit m)
+                                  #:protected (if g (guard-paths g) '()) #:tampered (mon-tampered m) #:review-findings (mon-findings m))) d)))
   (bus-drain! (deps-bus d))
   (persist-goal-turn! sess st st1)
-  (define dcost (turn-cost st st1))
-  (define-values (pass? signal report) (run-oracle until-cmds workdir))
+  (define dcost0 (turn-cost st st1))
+  ;; a. 验收前：被保护的文件改了 / 删了 → 恢复原样（验收在恢复后的状态上跑），下一轮告诉模型
+  (define tampered (if g (guard-check+restore! g) '()))
+  (when (pair? tampered)
+    (emit (dim f"guard: restored {(length tampered)} protected file(s): {(string-join (map car tampered) ", ")}")))
+  (define-values (pass1? signal1 report1) (run-oracle until-cmds workdir))
+  ;; 工作区测试流程：逐步跑、解析成结构化结果（失败量用解析出的失败数）
+  (define flow-results (if fl (run-flow fl) '()))
+  (define flow-failing (filter (lambda (r) (not (hash-ref r 'ok))) flow-results))
+  (define pass0? (and pass1? (null? flow-failing)))
+  (define signal0 (+ signal1 (for/sum ([r (in-list flow-failing)]) (+ 1000000 (or (hash-ref r 'failed #f) 0)))))
+  (define report0 (string-join (filter non-empty-string?
+                                       (cons report1 (for/list ([r (in-list flow-failing)])
+                                                       f"$ {(hash-ref r 'cmd)}  (test flow step {(hash-ref r 'step)}, exit {(hash-ref r 'exit)})\n{(clip-tail (hash-ref r 'tail) 1500)}")))
+                               "\n\n"))
+  ;; b. 审查复现过的检查：每次都在副本里再跑（不在真实工作目录里跑审查给的命令）
+  (define check-results (run-checks-in-copy (map (lambda (f) (hash-ref f 'check)) (mon-findings m)) workdir))
+  (define failing-checks (filter (lambda (r) (not (eqv? (cadr r) 0))) check-results))
+  (define pass? (and pass0? (null? failing-checks)))
+  (define signal (+ signal0 (* 1000000 (length failing-checks))))
+  (define report (string-join (filter non-empty-string?
+                                      (cons report0 (for/list ([r (in-list failing-checks)]) f"$ {(car r)}  (review check, exit {(cadr r)})\n{(clip-tail (caddr r) 800)}")))
+                              "\n\n"))
+  (define m0 (struct-copy mon m [tampered tampered] [flow-results flow-results]))
+  ;; b. 验收过了、宣布完成之前：独立审查（最多 max-reviews 次）
+  (define-values (review-confirmed review-cost)
+    (cond
+      [(and pass? review? (< (mon-reviews m) max-reviews))
+       (emit (dim f"review #{(add1 (mon-reviews m))}: independent read-only reviewer is looking for evidence the goal is not done…"))
+       (define-values (yes no rs0 rs1)
+         (with-handlers ([exn:fail? (lambda (e) (emit (dim f"review failed: {(exn-message e)} — not counted")) (values '() '() st st))])
+           (run-review! d st1 goal shown-cmds workdir base-commit report0 #:model review-model)))
+       (for ([f (in-list no)]) (emit (dim f"  review: not reproduced (ignored): {(hash-ref f 'problem)}")))
+       (for ([f (in-list yes)]) (emit (dim f"  review: REPRODUCED: {(hash-ref f 'problem)}  $ {(hash-ref f 'check)}")))
+       (values yes (turn-cost rs0 rs1))]
+      [else (values '() 0.0)]))
+  (define dcost (+ dcost0 review-cost))
+  (define m* (if (and pass? review? (< (mon-reviews m) max-reviews)) (struct-copy mon m0 [reviews (add1 (mon-reviews m))]) m0))
   (cond
-    [pass? (values 'done st1 m dcost)]
+    [(and pass? (pair? review-confirmed))                                     ; 审查否决：问题进验收，接着干
+     (values 'continue st1 (struct-copy mon m* [findings (append (mon-findings m*) review-confirmed)] [noprog 0]
+                                       [last-report (string-join (for/list ([f review-confirmed]) f"$ {(hash-ref f 'check)}  (review check)\n{(hash-ref f 'output)}") "\n\n")])
+             dcost)]
+    [pass? (values 'done st1 m* dcost)]
     [else
      (define prev (mon-prev-signal m))
      (define progressed? (or (not prev) (< signal prev)))
@@ -267,7 +323,7 @@
        (if (or (not (mon-best-signal m)) (< signal (mon-best-signal m))) (values signal (git-head workdir))
            (values (mon-best-signal m) (mon-best-commit m))))
      (emit (dim f"verify: signal {signal} · {(cond [progressed? "progressing"] [regr? "REGRESSED"] [else "no progress"])} · stuck {noprog*}/{K}"))
-     (define base (struct-copy mon m [prev-signal signal] [last-report report]
+     (define base (struct-copy mon m* [prev-signal signal] [last-report report]
                                [best-signal best-signal*] [best-commit best-commit*] [regressed? regr?]))
      (cond
        [(>= noprog* K)
@@ -285,10 +341,56 @@
 
 ;; run-goal! : deps state session goal until-cmds max-turns host -> agent-state
 ;;   #:stuck-k / #:max-replans / #:budget / #:emit（见 goal-step!）。顺序驱动（无并行）。
-(define (run-goal! d st0 sess goal until-cmds max-turns host
+;;   验收加固（acceptance.rkt）：#:protect 'default | '() | (listof glob) —— 被保护的验收文件（缺省：常见测试文件 + 命令里引用的、git 跟踪的文件）；
+;;   #:review? —— 验收过了以后独立审查（缺省开；#:review-model 换模型更好）；#:tests-first? —— 没有 / 不用 until：先让出题 agent 写验收测试，
+;;   #:approve 确认后冻结（缺省用 deps 的 asker 问）。
+(define (run-goal! d st0 sess goal until-cmds0 max-turns host
                    #:stuck-k [K 2] #:max-replans [max-replans 1] #:budget [budget #f]
-                   #:emit [emit displayln])
+                   #:emit [emit displayln]
+                   #:protect [protect 'default] #:review? [review? #t] #:review-model [review-model #f] #:max-reviews [max-reviews 2]
+                   #:tests-first? [tests-first? #f] #:approve [approve #f])
   (define workdir (config-workdir (agent-state-config st0)))
+  (define (ask-user tool) (lambda (text detail) (parameterize ([current-permission-request (hasheq 'tool tool 'level "approve" 'input detail)]) ((deps-asker d) text))))
+  ;; 工作区测试流程（.pi/tests.rktd）：有就用（随仓库来的：第一次要用户确认信任）
+  (define-values (fl0 flow-err) (load-flow workdir))
+  (when flow-err (emit f"test flow: {flow-err}"))
+  (define fl1 (and fl0 (let ([tr (ensure-trusted fl0 #:mode (config-permission-mode (agent-state-config st0)) #:ask (or approve (ask-user "test_flow")))])
+                         (if (eq? tr #t) fl0 (begin (emit f"test flow not used: {tr}") #f)))))
+  ;; c. 先写验收（有测试流程且没给命令：直接用流程，不出题）
+  (define-values (until-cmds frozen)
+    (cond
+      [(or tests-first? (and (null? until-cmds0) (not fl1)))
+       (emit (dim "tests first: a separate read-only agent writes the acceptance tests…"))
+       (define-values (cmd files)
+         (with-handlers ([exn:fail? (lambda (e) (values #f (exn-message e)))])
+           (write-acceptance! d st0 goal workdir #:emit emit
+                              #:approve (or approve (lambda (text detail) (parameterize ([current-permission-request (hasheq 'tool "acceptance_tests" 'level "approve" 'input detail)])
+                                                                            ((deps-asker d) text)))))))
+       (if cmd (values (cons cmd until-cmds0) files) (begin (emit f"tests first: {files}") (values #f '())))]
+      [else (values until-cmds0 '())]))
+  ;; 确认过的验收测试并进工作区的测试流程（随项目共享）：之后的会话 / goal 都用它
+  (define-values (until-cmds* fl)
+    (cond
+      [(and until-cmds (pair? frozen) (not (equal? until-cmds until-cmds0)))
+       (define root (or (find-flow-root workdir) workdir))
+       (define new-cmd (car until-cmds))
+       (define id (string->symbol (format "goal-~a" (add1 (if fl1 (length (flow-steps fl1)) 0)))))
+       (define fl2 (with-handlers ([exn:fail? (lambda (e) (emit f"test flow: could not add the step: {(exn-message e)}") #f)])
+                     (append-step! root id new-cmd)))
+       (if fl2
+           (begin (emit (dim f"test flow: added step {id} to {FLOW-FILE} (shared with the project)")) (values (cdr until-cmds) fl2))
+           (values until-cmds fl1))]
+      [else (values until-cmds fl1)]))
+  (define has-acceptance? (and until-cmds* (or (pair? until-cmds*) fl)))
+  (define guard-dir (if fl (flow-root fl) workdir))
+  (define g (and has-acceptance? (not (and (list? protect) (null? protect))) (not (eq? protect 'none))
+                 (guard-add (make-guard guard-dir (append until-cmds* (if fl (map step-cmd (flow-steps fl)) '()))
+                                        #:protect (append (if (list? protect) protect DEFAULT-PROTECT) (if fl (cons FLOW-FILE (flow-protect fl)) '())))
+                            frozen)))
+  (when (and g (pair? (guard-paths g))) (emit (dim f"guard: {(length (guard-paths g))} protected acceptance file(s)")))
+  (define base-commit (let-values ([(code out) (run-verify "git rev-parse HEAD 2>/dev/null" workdir)]) (and (eqv? code 0) (non-empty-string? (string-trim out)) (string-trim out))))
+  (if (not has-acceptance?)
+      (begin (emit (goal-summary "NOT STARTED — no acceptance" st0 0 0.0)) st0)
   (let loop ([st st0] [turn 0] [m (fresh-mon st0)] [spent 0.0])
     (cond
       [(>= turn max-turns) (emit (goal-summary "MAX-TURNS reached (not done)" st turn spent)) st]
@@ -296,14 +398,25 @@
        (emit (goal-summary f"BUDGET reached (~{(format-cost spent)} ≥ {(format-cost budget)}), not done" st turn spent)) st]
       [else
        (define-values (decision st* m* dcost)
-         (goal-step! d st sess host goal until-cmds workdir turn max-turns spent m
-                     #:stuck-k K #:max-replans max-replans #:budget budget #:emit emit))
+         (goal-step! d st sess host goal until-cmds* workdir turn max-turns spent m
+                     #:stuck-k K #:max-replans max-replans #:budget budget #:emit emit
+                     #:guard g #:review? review? #:review-model review-model #:max-reviews max-reviews #:base-commit base-commit #:flow fl))
        (define spent* (+ spent dcost))
        (case decision
-         [(done) (emit (goal-summary "DONE ✓ acceptance passed" st* (add1 turn) spent*)) st*]
+         [(done)
+          ;; 验收报告：测试流程这一次的结果（刚跑的；必须跑）+ 改过的测试 / 被保护文件
+          (when fl
+            (define changed (changed-protected fl))
+            (history-append! fl "acceptance" (mon-flow-results m*))
+            (record! 'tests (hasheq 'kind "acceptance" 'ok #t 'summary (format "goal: ~a" goal) 'changed changed
+                                    'steps (map (lambda (r) (hash-remove r 'tail)) (mon-flow-results m*))))
+            (emit (format-report fl (mon-flow-results m*) #:title "Acceptance report" #:claim (format "goal: ~a" goal) #:changed changed)))
+          (emit (goal-summary (if (and review? (> (mon-reviews m*) 0)) "DONE ✓ acceptance passed · independent review found nothing reproducible" "DONE ✓ acceptance passed")
+                              st* (add1 turn) spent*)) st*]
          [(stuck) (emit (goal-summary "STUCK — no progress after escalation + replans" st* (add1 turn) spent*)) st*]
          [else (loop st* (add1 turn) m* spent*)])])
   ) ; end let loop
+  ) ; end if
 ) ; end define run-goal!
 
 ;; ------------------------------------------------ P4.1/P4.2：worktree 隔离的 worker

@@ -1,0 +1,8 @@
+Review the following Python function for correctness bugs. If you find any, state the exact failing input and the fix. If it is correct, say so.
+
+def truncate(s: str, limit: int = 20) -> str:
+    """Return s shortened to at most `limit` terminal columns.
+    If it must be shortened, the last kept column is replaced by the ellipsis '…'."""
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1] + "…"

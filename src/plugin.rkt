@@ -22,6 +22,7 @@
  (file "provider.rkt")
  (file "rktd.rkt")
  (file "tui/keys.rkt")
+ (file "adapt.rkt")                     ; 增强适配（按模型的特调规则，请求时应用）
 ) ; end require
 
 ;; ------------------------------------------------------------ 插件 SDK（供插件构造工具）
@@ -151,6 +152,11 @@
 (define (host-shortcut h key) (hash-ref (plugin-host-shortcuts h) key #f))
 (define (host-hooks h event) (reverse (hash-ref (plugin-host-hooks h) event '())))
 (define (host-plugins h) (unbox (plugin-host-plugins h)))
+;; 工具来源（会话记录 / 界面卡片上的标记）：插件注册的 → "plugin:<插件名>"；其余 → "builtin"
+(define (host-tool-source h name)
+  (or (for/first ([lp (in-list (host-plugins h))] #:when (member name (loaded-plugin-tools lp)))
+        (format "plugin:~a" (loaded-plugin-name lp)))
+      "builtin"))
 ;; 供应商实例名 "base[label]" → base（无方括号则原样）。供 provider 选用/分发按 base 解析工厂，
 ;; 而 label 只影响用哪套 token（token 装进 config 由上层 apply-provider-profile 处理）。
 ;; 此处仅做纯字符串剥离，避免依赖 providers.rkt（保持内核层次）。
@@ -171,6 +177,9 @@
 ;; 分发 provider：每次请求按 host 当前选用名解析真实 provider（惰性构建 + 缓存），委派其
 ;; stream!/cancel!。故 /provider 改选用名即运行时切换供应商。base-cfg 仅供工厂初始化
 ;; （provider 运行时读 current-config 取 live 值）。未知名 → 该请求以 error 事件返回。
+;; 分发覆盖：#f 或一个 provider；非 #f 时本次请求直接交给它，不看 host 的当前选择
+(define current-dispatch-override (make-parameter #f))
+
 (define (make-dispatch-provider host base-cfg)
   (define cache (make-hash))
   (define last (box #f))
@@ -190,9 +199,16 @@
                         (define ch (make-async-channel))
                         (async-channel-put ch (evt:error (now-ms) e #f))
                         ch)])
-       (define p (resolve (host-current-provider host)))
+       ;; 按请求覆盖（路由池：route.rkt 在轮线程里 parameterize；子 agent 继承同一 parameterization → 亲和父会话的帐号）
+       (define override (current-dispatch-override))
+       (define p (or override (resolve (host-current-provider host))))
        (set-box! last p)
-       (provider-stream! p msgs tool-specs)))
+       (cond
+         [override (provider-stream! p msgs tool-specs)]                  ; 路由 provider 按成员自己应用适配规则
+         [else
+          (define-values (cfg* msgs* tools* _applied)
+            (apply-adaptations (host-current-provider host) (or (current-config) base-cfg) msgs tool-specs))
+          (parameterize ([current-config cfg*]) (provider-stream! p msgs* tools*))])))
    (lambda () (when (unbox last) (provider-cancel! (unbox last)))))
 ) ; end define make-dispatch-provider
 
@@ -453,9 +469,10 @@
  ok-outcome err-outcome input-ref input-str input-int
  ;; 宿主
  (struct-out plugin-host) (struct-out loaded-plugin) (struct-out plugin-api) (struct-out plugin-ctx)
- make-plugin-host host-registry host-tools host-lookup host-commands host-command
+ make-plugin-host host-registry host-tools host-lookup host-commands host-command host-tool-source
  host-shortcut host-hooks host-plugins host-provider host-provider-names
  host-available-providers host-current-provider host-set-provider! make-dispatch-provider provider-base-name
+ current-dispatch-override
  host-skills host-prompts host-set-skills! host-set-prompts!
  host-set-notify! host-set-session! host-set-select! host-set-confirm! make-ctx
  make-plugin-api

@@ -1,0 +1,35 @@
+#!/usr/bin/env racket
+#lang racket/base
+;; fake-ssh — 测试用的 ssh 替身（放在 PATH 最前面）：解析 ssh 的参数，-R 127.0.0.1:R:127.0.0.1:L 用本机 TCP 中继实现，
+;; 远端命令交给 sh -c 在本机执行，stdin / stdout 原样接通。环境变量 FAKE_SSH_LOG 指向的文件记下收到的参数（检查引号与端口）。
+;; -R 端口已被占用：像 ExitOnForwardFailure 那样在 stderr 报 "remote port forwarding failed" 并以 255 退出。
+(require racket/tcp racket/port racket/string racket/list)
+(define args (vector->list (current-command-line-arguments)))
+(let ([log (getenv "FAKE_SSH_LOG")]) (when log (with-output-to-file log #:exists 'append (lambda () (write args) (newline)))))
+(define-values (fwd rest)
+  (let loop ([xs args] [fwd #f])
+    (cond [(null? xs) (values fwd '())]
+          [(equal? (car xs) "-T") (loop (cdr xs) fwd)]
+          [(equal? (car xs) "-o") (loop (cddr xs) fwd)]
+          [(equal? (car xs) "-R") (loop (cddr xs) (cadr xs))]
+          [else (values fwd xs)])))
+;; rest = (目标 远端命令)
+(define cmd (string-join (cdr rest) " "))
+(when fwd
+  (define m (regexp-match #rx"^127\\.0\\.0\\.1:([0-9]+):127\\.0\\.0\\.1:([0-9]+)$" fwd))
+  (define r (string->number (cadr m)))
+  (define l (string->number (caddr m)))
+  (define lst (with-handlers ([exn:fail:network? (lambda (_e) (eprintf "Warning: remote port forwarding failed for listen port ~a\n" r) (exit 255))])
+                (tcp-listen r 16 #f "127.0.0.1")))
+  (void (thread (lambda ()
+                  (let loop ()
+                    (define-values (ci co) (tcp-accept lst))
+                    (thread (lambda ()
+                              (define-values (si so) (tcp-connect "127.0.0.1" l))
+                              (thread (lambda () (copy-port ci so) (close-output-port so)))
+                              (copy-port si co) (close-output-port co)))
+                    (loop))))))
+(define-values (p pout pin perr) (subprocess (current-output-port) #f (current-error-port) "/bin/sh" "-c" cmd))
+(define up (thread (lambda () (copy-port (current-input-port) pin) (close-output-port pin))))
+(subprocess-wait p)
+(exit (subprocess-status p))

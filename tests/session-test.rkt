@@ -128,6 +128,46 @@
   (define st (session-replay new-path))
   (check-equal? (pvector-length (agent-state-history st)) 2)
   (check-equal? (message-text (pvector-ref (agent-state-history st) 0)) "你好 agent")
+  (check-equal? (session-info-title (read-session-info new-path)) "⑂ 你好 agent")   ; 分叉：标题带标记
+  (check-equal? (session-info-title (read-session-info src)) "你好 agent")
+) ; end test-case
+
+(test-case "session files never contain the api key (meta config is written with api-key #f)"
+  (define p (build-path tmpdir "k1.rktd"))
+  (define s (session-open! p (struct-copy config (default-config) [api-key "sk-secret-123"])))
+  (session-append-msg! s (text-msg 'user "hi"))
+  (session-close! s)
+  (check-false (regexp-match? #rx"sk-secret" (file->string p)))
+  (check-false (config-api-key (agent-state-config (session-replay p))))
+) ; end test-case
+
+(test-case "session-scrub-key! removes a key stored by older versions and keeps every other record"
+  (define p (build-path tmpdir "old-keyed.rktd"))
+  (with-output-to-file p
+    (lambda ()
+      (write (rec 'meta "2026-08-01T00:00:00" (list 'pi2 1 (struct-copy config (default-config) [api-key "sk-old-999"])))) (newline)
+      (write (rec 'msg "2026-08-01T00:00:01" (text-msg 'user "hello"))) (newline)))
+  (check-true (session-scrub-key! p))
+  (check-false (regexp-match? #rx"sk-old" (file->string p)))
+  (check-equal? (message-text (pvector-ref (agent-state-history (session-replay p)) 0)) "hello")
+  (check-false (session-scrub-key! p))                                          ; 再跑：无事可做
+) ; end test-case
+
+(test-case "diff records: kept out of replay, read back by id, copied by fork only up to the fork point"
+  (define p (build-path tmpdir "d1.rktd"))
+  (define s (session-open! p (default-config)))
+  (session-append-msg! s (message 'assistant (list (tool-use-block "t1" "write_file" (hasheq 'path "a")))))
+  (session-append-msg! s (message 'user (list (tool-result-block "t1" "ok" #f))))
+  (session-append-diff! s "t1" (hasheq 'path "a" 'added 1 'removed 0 'text "@@ -0,0 +1,1 @@\n+x" 'truncated #f))
+  (session-append-msg! s (message 'assistant (list (tool-use-block "t2" "write_file" (hasheq 'path "b")))))
+  (session-append-msg! s (message 'user (list (tool-result-block "t2" "ok" #f))))
+  (session-append-diff! s "t2" (hasheq 'path "b" 'added 2 'removed 0 'text "@@ -0,0 +1,2 @@\n+y\n+z" 'truncated #f))
+  (session-close! s)
+  (check-equal? (pvector-length (agent-state-history (session-replay p))) 4)      ; diff 不进历史
+  (check-equal? (sort (hash-keys (session-diffs p)) string<?) '("t1" "t2"))
+  (check-equal? (hash-ref (hash-ref (session-diffs p) "t2") 'added) 2)
+  (define f (session-fork! p tmpdir #:at 2))
+  (check-equal? (hash-keys (session-diffs f)) '("t1"))
 ) ; end test-case
 
 (delete-directory/files tmpdir)

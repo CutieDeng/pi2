@@ -576,3 +576,22 @@
   (tr2 'apply! (results 2 (res "h" "1 matching commit(s)")))
   (check-equal? (tr2 'tool-uis) '())
   (check-equal? (fill-count (render tr2 3000.0) FEAT) 0))
+
+(test-case "the 'back to bottom' pill wins over the tool card under it (topmost hit first)"
+  (define tr (new-tr))
+  (tr 'apply! (session-ev (append* (for/list ([i 40])
+                                     (define id (format "t~a" i))
+                                     (list (asst (* 3 i) (call id "bash" (hasheq 'command (format "ls ~a" i))))
+                                           (it (+ (* 3 i) 1) "tool" 'call_id id 'name "bash" 'ms 1.0 'error #f 'source "builtin" 'display 'null 'diff 'null)
+                                           (results (+ (* 3 i) 2) (res id "out")))))))
+  (render tr 200.0)
+  (define covered
+    (for/sum ([k 40])
+      (tr 'scroll! 7.0)
+      (render tr 200.0)
+      (define pt (tr 'hit-center 'to-bottom #t))
+      (check-true (pair? pt))
+      (check-equal? (tr 'hit (car pt) (cdr pt)) '(to-bottom))
+      ;; 这个点下面是不是压着工具卡片的命中区（没有就不算测到了）
+      (if (for/or ([dx '(-30.0 30.0)]) (equal? (car (or (tr 'hit (+ (car pt) dx 200.0) (cdr pt)) '(#f))) 'tool)) 1 0)))
+  (check-true (> covered 0) "some positions put the pill over a tool card"))

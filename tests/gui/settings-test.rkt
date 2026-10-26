@@ -35,7 +35,7 @@
   (check-false (s 'secret?))                                                   ; 先输帐号名：不是密钥
   (editor-insert! (s 'editor) "bad name")
   (check-false (s 'submit!))                                                   ; 帐号名不合法：留在这一步
-  (editor-command! (s 'editor) 'selectAll:)
+  (editor-command! (s 'editor) 'select-all)
   (editor-insert! (s 'editor) "team")
   (check-equal? (s 'submit!) '(none))
   (check-true (s 'secret?))
@@ -94,7 +94,7 @@
     (check-false (regexp-match #px"[一-鿿]" text) (format "~s" (regexp-match #px"[一-鿿].{0,10}" text)))
     (check-true (string-contains? text "Accounts & keys"))))
 
-(define (type! s str) (editor-command! (s 'editor) 'selectAll:) (editor-insert! (s 'editor) str))
+(define (type! s str) (editor-command! (s 'editor) 'select-all) (editor-insert! (s 'editor) str))
 
 (test-case "pools: add member (account → model, or Other… → typed id), move up, remove; last member asks to delete the pool; new pool"
   (define s (new-sv))
@@ -423,7 +423,7 @@
   (check-equal? (s 'submit!) '(memory-edit "m2" "run make test first"))
   (render s)
   (click s 'mem-edit "m1")
-  (editor-command! (s 'editor) 'selectAll:) (editor-insert! (s 'editor) " ")
+  (editor-command! (s 'editor) 'select-all) (editor-insert! (s 'editor) " ")
   (check-equal? (s 'submit!) '(memory-delete "m1")))
 
 (test-case "memory: nothing yet → a hint line"

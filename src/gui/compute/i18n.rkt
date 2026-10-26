@@ -3,6 +3,7 @@
 ;; 只管界面文字；发给模型的内容、内核协议、日志格式不翻译。语言在启动时由拼装层定一次（PI2_LANG > 系统首选语言）。
 ;; 新增界面文字：在 CATALOG 里加一行（两种语言都给），组件里用 (t 'key …)。tests/gui/i18n-test.rkt 检查两种语言齐全、参数个数一致。
 
+(require "keys.rkt" "keymap.rkt")                    ; 文字里的快捷键：{key:动作} / {chord:…} 按平台生成
 (define LANGS '(zh en))
 (define current-lang (make-parameter 'zh))
 
@@ -17,8 +18,8 @@
 (define CATALOG
   (hasheq
    ;; 输入框
-   'input.placeholder (hasheq 'zh "给 pi2 发消息 · Enter 发送 · ⇧Enter 换行 · 粘贴大段文本会折叠成 chip"
-                              'en "Message pi2 · Enter to send · ⇧Enter for a new line · large pastes fold into chips")
+   'input.placeholder (hasheq 'zh "给 pi2 发消息 · Enter 发送 · {chord:shift return} 换行 · 粘贴大段文本会折叠成 chip"
+                              'en "Message pi2 · Enter to send · {chord:shift return} for a new line · large pastes fold into chips")
    'input.peek-more   (hasheq 'zh "… 还有 ~a 行（共 ~a 行）" 'en "… ~a more lines (~a total)")
    'input.remove      (hasheq 'zh "移除" 'en "Remove")
    'input.to-text     (hasheq 'zh "转为文本" 'en "Convert to text")
@@ -69,7 +70,7 @@
    'mp.chip-route     (hasheq 'zh "@~a · ~a · ~a · 推理 ~a ▾" 'en "@~a · ~a · ~a · reasoning ~a ▾")
    'mp.chip-warn      (hasheq 'zh "~a · ⚠ ~a 个不可用" 'en "~a · ⚠ ~a unavailable")
    ;; 调试面板
-   'dbg.title         (hasheq 'zh "调试 · ⌘⌥D 关闭" 'en "Debug · ⌘⌥D to close")
+   'dbg.title         (hasheq 'zh "调试 · {key:debug-panel} 关闭" 'en "Debug · {key:debug-panel} to close")
    'dbg.journal       (hasheq 'zh "日志：~a" 'en "Journal: ~a")
    'dbg.memory-only   (hasheq 'zh "（只在内存，--no-journal）" 'en "(memory only, --no-journal)")
    'dbg.errors        (hasheq 'zh "内部错误 ~a" 'en "Internal errors: ~a")
@@ -132,7 +133,7 @@
    'set.secret-patterns (hasheq 'zh "自定义格式（正则，整串匹配；与内置的 sk- / AKIA / ghp_ 等一起用）：" 'en "Custom formats (regex, whole string; used together with the built-in sk- / AKIA / ghp_ …):")
    'set.add-secret-pattern (hasheq 'zh "＋ 添加格式" 'en "+ Add format")
    'set.field-secret-pattern (hasheq 'zh "正则（如 ^myco_[A-Za-z0-9]{32}$）：回车保存，Esc 取消" 'en "Regex (e.g. ^myco_[A-Za-z0-9]{32}$): Enter saves, Esc cancels")
-   'sc.secret-selection (hasheq 'zh "选中的文字标记为密钥（逐字手打的在标记前已进操作日志：密钥请用 ⌘⇧V 粘贴）" 'en "Mark the selected text as a secret (characters typed one by one are already in the journal: paste keys with ⌘⇧V)")
+   'sc.secret-selection (hasheq 'zh "选中的文字标记为密钥（逐字手打的在标记前已进操作日志：密钥请用 {key:paste-secret} 粘贴）" 'en "Mark the selected text as a secret (characters typed one by one are already in the journal: paste keys with {key:paste-secret})")
    'app.secret-marked (hasheq 'zh "已标记为密钥（操作日志里整段出现的原文已换成句柄）" 'en "Marked as a secret (whole occurrences in the journal replaced by the handle)")
    'app.secret-select-hint (hasheq 'zh "先在输入框里选中要标记的文字（不能含 chip）" 'en "Select the text to mark in the input box first (no chips)")
    'set.sec.hosts     (hasheq 'zh "主机" 'en "Hosts")
@@ -180,7 +181,7 @@
    'set.field-budget-combined (hasheq 'zh "合计每天上限（美元，如 10）：回车保存，Esc 取消" 'en "Combined daily cap in USD (e.g. 10): Enter saves, Esc cancels")
    'tr.budget-combined (hasheq 'zh "今天所有主机合计的估算花费 $~a 已到合计上限 $~a（按单价表估算，以供应商账单为准）。下一次请求要继续吗？" 'en "Today's estimated spend across all hosts $~a has reached the combined cap $~a (estimated from the price table; the provider's bill is authoritative). Continue with the next request?")
    'set.zoom          (hasheq 'zh "界面缩放（字号）" 'en "Zoom (text size)")
-   'set.zoom-note     (hasheq 'zh "快捷键 ⌘= 放大、⌘- 缩小、⌘0 复原；文字与版面一起缩放" 'en "Shortcuts: ⌘= larger, ⌘- smaller, ⌘0 reset; text and layout scale together")
+   'set.zoom-note     (hasheq 'zh "快捷键 {key:zoom-in} 放大、{key:zoom-out} 缩小、{key:zoom-reset} 复原；文字与版面一起缩放" 'en "Shortcuts: {key:zoom-in} larger, {key:zoom-out} smaller, {key:zoom-reset} reset; text and layout scale together")
    'sc.zoom           (hasheq 'zh "放大 / 缩小 / 复原" 'en "Zoom in / out / reset")
    'set.aliases-note  (hasheq 'zh "给子 agent 选模型用：spawn_agent 的 model 参数可以写别名（帐号跟父会话）" 'en "For sub-agents: spawn_agent's model argument accepts an alias (the account follows the parent session)")
    'set.aliases-none  (hasheq 'zh "还没有别名" 'en "No aliases yet")
@@ -198,7 +199,7 @@
    'set.new-rule      (hasheq 'zh "＋ 新建规则" 'en "+ New rule")
    'set.field-rule-name (hasheq 'zh "规则名（字母、数字、_ . -）：回车下一步，Esc 取消" 'en "Rule name (letters, digits, _ . -): Enter continues, Esc cancels")
    'set.field-rule-model (hasheq 'zh "~a 匹配的模型（正则，不分大小写；* = 所有模型）：回车下一步" 'en "Models ~a applies to (regex, case-insensitive; * = all): Enter continues")
-   'set.field-rule-text (hasheq 'zh "~a：追加到 system prompt 末尾的文字（⇧Enter 换行）：回车保存" 'en "~a: text appended to the system prompt (⇧Enter for a new line): Enter saves")
+   'set.field-rule-text (hasheq 'zh "~a：追加到 system prompt 末尾的文字（{chord:shift return} 换行）：回车保存" 'en "~a: text appended to the system prompt ({chord:shift return} for a new line): Enter saves")
    'set.rule-append   (hasheq 'zh "追加：~a" 'en "Appends: ~a")
    'set.bad-name      (hasheq 'zh "名字只能用字母、数字、_ . -（最多 40 个）" 'en "Use letters, digits, _ . - only (at most 40)")
    'set.bad-regex     (hasheq 'zh "不是合法的正则表达式" 'en "Not a valid regular expression")
@@ -209,7 +210,7 @@
    'set.secret-mode.off (hasheq 'zh "不识别" 'en "Off")
    'set.secret-mode.suggest (hasheq 'zh "只提示" 'en "Ask")
    'set.secret-mode.auto (hasheq 'zh "自动转成密钥" 'en "Automatic")
-   'set.secret-note   (hasheq 'zh "识别常见格式（sk-…、AKIA…、ghp_… 等）；⌘⇧V 总是以密钥粘贴" 'en "Detects common formats (sk-…, AKIA…, ghp_…); ⌘⇧V always pastes as a secret")
+   'set.secret-note   (hasheq 'zh "识别常见格式（sk-…、AKIA…、ghp_… 等）；{key:paste-secret} 总是以密钥粘贴" 'en "Detects common formats (sk-…, AKIA…, ghp_…); {key:paste-secret} always pastes as a secret")
    'set.journal-note  (hasheq 'zh "记录窗口事件与内核事件，用于排查与回放（--no-journal 关闭）" 'en "Window and kernel events, for debugging and replay (--no-journal turns it off)")
    'set.key-set       (hasheq 'zh "已设置 key" 'en "key set")
    'set.key-missing   (hasheq 'zh "未设置 key" 'en "no key")
@@ -252,7 +253,7 @@
    'app.running       (hasheq 'zh "运行中 · Esc 停止" 'en "Running · Esc to stop")
    'app.idle          (hasheq 'zh "空闲" 'en "Idle")
    'app.turns         (hasheq 'zh "~a 轮" 'en "~a turn(s)")
-   'app.internal-error (hasheq 'zh "内部错误已记录 · ⌘⌥D 查看" 'en "Internal error logged · ⌘⌥D to view")
+   'app.internal-error (hasheq 'zh "内部错误已记录 · {key:debug-panel} 查看" 'en "Internal error logged · {key:debug-panel} to view")
    'app.blocked-busy  (hasheq 'zh "运行中：先 Esc 停止当前轮" 'en "A turn is running: press Esc to stop it first")
    'app.after-turn    (hasheq 'zh "当前轮结束后生效" 'en "Takes effect after the current turn")
    'app.copied        (hasheq 'zh "已复制 ~a 字符" 'en "Copied ~a characters")
@@ -292,7 +293,7 @@
    'set.sidebar-side  (hasheq 'zh "会话侧栏的位置" 'en "Session sidebar position")
    'set.sidebar-left  (hasheq 'zh "左" 'en "Left")
    'set.sidebar-right (hasheq 'zh "右" 'en "Right")
-   'set.sidebar-note  (hasheq 'zh "宽度：拖侧栏与对话区之间的分隔线（180–480）；⌘B 显示 / 隐藏" 'en "Width: drag the line between the sidebar and the conversation (180–480); ⌘B shows / hides it")
+   'set.sidebar-note  (hasheq 'zh "宽度：拖侧栏与对话区之间的分隔线（180–480）；{key:toggle-sidebar} 显示 / 隐藏" 'en "Width: drag the line between the sidebar and the conversation (180–480); {key:toggle-sidebar} shows / hides it")
    'sb.m-open         (hasheq 'zh "打开" 'en "Open")
    'sb.m-rename       (hasheq 'zh "重命名…" 'en "Rename…")
    'sb.m-info         (hasheq 'zh "信息…" 'en "Info…")
@@ -441,7 +442,7 @@
    'ts.history (hasheq 'zh "运行历史" 'en "History")
    'tr.tests-run (hasheq 'zh "测试运行：~a（~a）" 'en "Test run: ~a (~a)")
    'tr.tests-acceptance (hasheq 'zh "验收报告：~a（~a）" 'en "Acceptance report: ~a (~a)")
-   'tr.tests-proposal (hasheq 'zh "模型提议修改测试流程：~a —— 打开「测试」面板（⌘⇧T）看 diff、批准" 'en "The agent proposes a test flow change: ~a — open the Tests panel (⌘⇧T) to review and approve")
+   'tr.tests-proposal (hasheq 'zh "模型提议修改测试流程：~a —— 打开「测试」面板（{key:tests-panel}）看 diff、批准" 'en "The agent proposes a test flow change: ~a — open the Tests panel ({key:tests-panel}) to review and approve")
    'tr.tests-decision (hasheq 'zh "测试流程的修改提议：~a（~a）" 'en "Test flow change ~a (~a)")
    'tr.level.trust (hasheq 'zh "信任" 'en "trust")
    'tr.level.approve (hasheq 'zh "确认" 'en "approve")
@@ -462,7 +463,7 @@
    'set.hix-error (hasheq 'zh "失败：~a" 'en "failed: ~a")
    'set.hix-pending (hasheq 'zh "待描述" 'en "waiting")
    'set.hix-regenerate (hasheq 'zh "重新生成" 'en "Regenerate")
-   'set.field-hix-desc (hasheq 'zh "「~a」的描述（names / short 用逗号分开；long: 下面一行一句；⇧Enter 换行，Enter 保存，保存后锁定）" 'en "Description of “~a” (names / short separated by commas; one sentence per line under long:; ⇧Enter for a new line, Enter to save; saving locks it)")
+   'set.field-hix-desc (hasheq 'zh "「~a」的描述（names / short 用逗号分开；long: 下面一行一句；{chord:shift return} 换行，Enter 保存，保存后锁定）" 'en "Description of “~a” (names / short separated by commas; one sentence per line under long:; {chord:shift return} for a new line, Enter to save; saving locks it)")
    'set.field-hix-model (hasheq 'zh "模型 id（空 = 端点上已加载的）" 'en "Model id (empty = whichever is loaded at the endpoint)")
    'sb.m-hix-auto (hasheq 'zh "项目索引：缺省" 'en "Project index: default")   ; 菜单 220 宽：长了会被截断（sidebar-test 查）
    'sb.m-hix-on (hasheq 'zh "项目索引：开" 'en "Project index: on")
@@ -486,7 +487,7 @@
    'set.mem-unpin (hasheq 'zh "取消置顶" 'en "Unpin")
    'set.mem-delete (hasheq 'zh "删除" 'en "Delete")
    'set.mem-none (hasheq 'zh "还没有记忆。在输入框里打「/remember 内容」记一条，或者让模型用 memory_note 记。" 'en "No memories yet. Type “/remember …” in the input box, or let the model save one with memory_note.")
-   'set.field-memory (hasheq 'zh "改这条记忆（⇧Enter 换行，Enter 保存；存空 = 删掉）" 'en "Edit this memory (⇧Enter for a new line, Enter to save; save empty to delete)")
+   'set.field-memory (hasheq 'zh "改这条记忆（{chord:shift return} 换行，Enter 保存；存空 = 删掉）" 'en "Edit this memory ({chord:shift return} for a new line, Enter to save; save empty to delete)")
    'mem.global (hasheq 'zh "全局" 'en "Global")
    'mem.src-user (hasheq 'zh "你记的" 'en "saved by you")
    'mem.src-model (hasheq 'zh "模型记的" 'en "saved by the model")
@@ -520,7 +521,7 @@
    'set.instr-empty (hasheq 'zh "没有指令" 'en "No instructions")
    'set.instr-preview (hasheq 'zh "「~a」· ~a 字节" 'en "“~a” · ~a bytes")
    'set.instr-no-entities (hasheq 'zh "目录里还没有项目或工作区（会话列表同步后出现）。" 'en "No projects or workspaces yet (they appear once the session list syncs).")
-   'set.field-instructions (hasheq 'zh "「~a」的指令（⇧Enter 换行，Enter 保存；存空 = 清掉）" 'en "Instructions for “~a” (⇧Enter for a new line, Enter to save; save empty to clear)")
+   'set.field-instructions (hasheq 'zh "「~a」的指令（{chord:shift return} 换行，Enter 保存；存空 = 清掉）" 'en "Instructions for “~a” ({chord:shift return} for a new line, Enter to save; save empty to clear)")
    'in.instructions (hasheq 'zh "注入的指令" 'en "Instructions injected")
    'in.instr-none (hasheq 'zh "还没有记录（第一轮开始时记）" 'en "Not recorded yet (recorded when the first turn starts)")
    'in.instr-empty (hasheq 'zh "没有（没有任何指令文件或设置）" 'en "None (no instruction files or settings)")
@@ -588,10 +589,19 @@
    'tr.partial        (hasheq 'zh "（被中断时流到一半的文字：模型上下文里没有）" 'en "(text cut off by an interrupt: not in the model's context)")))
 
 ;; 取文字；有参数时按 format 填（~a）
+;; 文字里的快捷键不写死：{key:动作}（应用键位表 keymap.rkt 里的第一个组合键）、{chord:修饰键… 键}（系统编辑键等不在键位表里的），
+;; 按 keys.rkt 的 current-key-platform 生成平台写法（⇧⌘T / Ctrl+Shift+T）
+(define (key-hint action) (let ([cs (keymap-chords APP-KEYMAP 'global action)]) (if (pair? cs) (chord-label (car cs)) (format "?~a" action))))
+(define (expand-keys s)
+  (regexp-replace* #px"\\{(key|chord):([^}]+)\\}" s
+                   (lambda (all kind body)
+                     (if (equal? kind "key")
+                         (key-hint (string->symbol body))
+                         (chord-label (map string->symbol (regexp-split #px"\\s+" body)))))))
 (define (t key . args)
   (define e (hash-ref CATALOG key #f))
-  (define s (or (and e (hash-ref e (current-lang) #f)) (and e (hash-ref e 'zh #f)) (symbol->string key)))
+  (define s (expand-keys (or (and e (hash-ref e (current-lang) #f)) (and e (hash-ref e 'zh #f)) (symbol->string key))))
   (if (null? args) s (apply format s args))
 ) ; end define t
 
-(provide LANGS current-lang lang-from-tag t CATALOG)
+(provide LANGS current-lang lang-from-tag t CATALOG key-hint)

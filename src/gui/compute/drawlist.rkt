@@ -28,8 +28,11 @@
 (define (drawlist-clear! dl) (set-drawlist-count! dl 0) (set-drawlist-clips! dl '()))
 
 ;; 此后写入的实例裁剪到 rect（point，原点左上）；#f = 不裁剪。渲染时每段一次 draw + scissor。
+;; 与当前的裁剪相同 → 不切段（视图平面每画完一块都把裁剪恢复成外层的，不该因此多出 draw）
 (define (drawlist-set-clip! dl rect)
-  (set-drawlist-clips! dl (cons (cons (drawlist-count dl) rect) (drawlist-clips dl)))
+  (define cur (let ([cs (drawlist-clips dl)]) (and (pair? cs) (cdar cs))))
+  (unless (equal? rect cur)
+    (set-drawlist-clips! dl (cons (cons (drawlist-count dl) rect) (drawlist-clips dl))))
 ) ; end define drawlist-set-clip!
 
 ;; → (listof (vector 起始 数量 rect-或-#f))，按绘制顺序，空段省略

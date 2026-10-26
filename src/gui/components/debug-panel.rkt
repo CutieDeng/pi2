@@ -6,7 +6,8 @@
 
 (require racket/list racket/string
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt"
+         "../compute/view.rkt")                                         ; 视图平面
 
 (define ERR '(0.95 0.50 0.45 1.0))
 (define HEAD '(0.55 0.70 1.0 1.0))
@@ -16,31 +17,32 @@
 
 (define (dp-render! open? jr rc dl x y w h scale stats)
   (when (unbox open?)
+    ;; 视图平面：一栏文字；最近的记录放得下多少放多少（先量出上半部分的高，剩下的高 ÷ 行高）
     (define lay (rich-ctx-layout rc))
-    (define at (rich-ctx-atlas rc))
     (define inner (- w (* 2 PAD)))
-    (drawlist-rect! dl x y w h 0.06 0.07 0.09 0.94 #:radius 8.0)
+    (define (line text font color) (ui-text text #:font font #:color color))
+    (define errs (jr 'errors))
+    (define head
+      (append
+       (list (line (t 'dbg.title) 'body HEAD))
+       (for/list ([st (in-list stats)]) (line st 'small DIM))
+       (list (line (t 'dbg.journal (or (jr 'path) (t 'dbg.memory-only))) 'small DIM)
+             (ui-box #:pad (vector 6.0 0.0 0.0 0.0) (line (t 'dbg.errors (length errs)) 'small (if (null? errs) DIM ERR))))
+       (append* (for/list ([e (in-list (take errs (min 3 (length errs))))])
+                  (cons (line (format "~a: ~a" (hash-ref e 'where "?") (hash-ref e 'message "?")) 'mono ERR)
+                        (for/list ([c (in-list (take (hash-ref e 'context '()) (min 3 (length (hash-ref e 'context '())))))])
+                          (line (format "    ~a" c) 'small DIM)))))
+       (list (ui-box #:pad (vector 6.0 0.0 0.0 0.0) (line (t 'dbg.recent) 'small DIM)))))
+    (define-values (_hw head-h) (measure lay (apply ui-box #:dir 'column head) inner))
+    (define lh (text-block-line-height (lay "M" 'mono 100.0 #f)))
+    (define n (max 0 (inexact->exact (floor (/ (- h (* 2 PAD) head-h) lh)))))
+    (define tree
+      (apply ui-box #:dir 'column #:pad PAD #:fill '(0.06 0.07 0.09 0.94) #:radius 8.0
+             (append head
+                     (for/list ([r (in-list (jr 'tail n))])
+                       (line (format "~a ~a ~a" (~ms (vector-ref r 0)) (vector-ref r 1) (vector-ref r 2)) 'mono (kind-color (vector-ref r 1)))))))
     (drawlist-set-clip! dl (vector x y w h))
-    (define (line! yy text font color)
-      (define tb (fit-line lay text font inner))
-      (paint-text! dl at tb (+ x PAD) yy color #:scale scale)
-      (+ yy (text-block-height tb)))
-    (define y-end (+ y h (- PAD)))
-    (let* ([yy (line! (+ y PAD) (t 'dbg.title) 'body HEAD)]
-           [yy (for/fold ([yy yy]) ([s (in-list stats)]) (line! yy s 'small DIM))]
-           [yy (line! yy (t 'dbg.journal (or (jr 'path) (t 'dbg.memory-only))) 'small DIM)]
-           [errs (jr 'errors)]
-           [yy (line! (+ yy 6.0) (t 'dbg.errors (length errs)) 'small (if (null? errs) DIM ERR))]
-           [yy (for/fold ([yy yy]) ([e (in-list (take errs (min 3 (length errs))))])
-                 (define yy1 (line! yy (format "~a: ~a" (hash-ref e 'where "?") (hash-ref e 'message "?")) 'mono ERR))
-                 (for/fold ([yy yy1]) ([c (in-list (take (hash-ref e 'context '()) (min 3 (length (hash-ref e 'context '())))))])
-                   (line! yy (format "    ~a" c) 'small DIM)))]
-           [yy (line! (+ yy 6.0) (t 'dbg.recent) 'small DIM)])
-      ;; 记录：从底部往上排，放得下多少画多少
-      (define lh (text-block-line-height (lay "M" 'mono 100.0 #f)))
-      (define n (max 0 (inexact->exact (floor (/ (- y-end yy) lh)))))
-      (for/fold ([yy yy]) ([r (in-list (jr 'tail n))])
-        (line! yy (format "~a ~a ~a" (~ms (vector-ref r 0)) (vector-ref r 1) (vector-ref r 2)) 'mono (kind-color (vector-ref r 1)))))
+    (render-view! rc dl tree x y w h scale #:clip (vector x y w h))
     (drawlist-set-clip! dl #f))
 ) ; end define dp-render!
 

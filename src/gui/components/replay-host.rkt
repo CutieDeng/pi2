@@ -14,7 +14,8 @@
 
 (struct rh ([queue #:mutable] total [consumed #:mutable] [sent #:mutable] expected clip))
 
-;; 队首连续的 kind 记录（跳过 send / error / note / start：它们是录制时的输出或元信息，不是输入）。
+;; 队首连续的 kind 记录。输入只有 win / core；别的（send script-send page plat error note start …）是录制时的输出或元信息，跳过——
+;; 按「不是输入就跳过」而不是列出要跳过的：新加的输出种类（2026-10-26 的 plat）不会再把回放卡死在队首。
 ;; 'frame 是录制时的一次重绘：命中区在重绘时才更新，所以窗口事件不能越过它合成一批——
 ;; 取窗口事件时遇到 'frame 就停下并消费掉它（这一批 = 录制时两次重绘之间的事件）；取内核事件时停下不消费。
 (define (take-run! r kind)
@@ -25,7 +26,7 @@
       [(eq? (third (car q)) 'frame)
        (when (eq? kind 'win) (set-rh-queue! r (cdr q)) (set-rh-consumed! r (add1 (rh-consumed r))))
        (reverse acc)]
-      [(memq (third (car q)) '(send script-send page error note start))
+      [(not (memq (third (car q)) '(win core)))
        (set-rh-queue! r (cdr q)) (set-rh-consumed! r (add1 (rh-consumed r))) (loop acc)]
       [(eq? (third (car q)) kind)
        (set-rh-queue! r (cdr q)) (set-rh-consumed! r (add1 (rh-consumed r)))
@@ -48,11 +49,13 @@
                            'pump! (lambda ()
                                     (define evs (take-run! r 'win))
                                     (if (and (null? evs) (null? (rh-queue r))) (list (ev:close)) evs))
-                           'set-text-input-state! noop 'discard-marked! noop 'on-live-resize! noop
-                           'set-content-size! noop 'close! noop 'set-cursor! noop 'glass? (lambda () #f) 'set-glass-rect! noop 'set-transparent! noop
-                           'capture (lambda (_h _b) #f) 'set-text-input-enabled! noop)
+                           ;; 回放没有真窗口：没有玻璃 / 输入法 / 截图；平台请求不执行（拼装层照样算、照样记）
+                           'caps (lambda () (hasheq 'glass #f 'transparent-window #f 'ime 'none 'capture 'none 'native-input-sim #f
+                                                    'precise-scroll #t 'pinch #f 'mouse-buttons 2))
+                           'apply! noop 'discard-marked! noop 'on-live-resize! noop 'close! noop
+                           'capture (lambda (_h _b) #f))
                 (implement window-input
-                           'post-mouse! noop 'post-mouse-ns! noop 'post-scroll! noop 'post-key! noop 'post-key-cg! noop 'post-paste! noop 'post-attach! noop 'simulate-ime! noop
+                           'post-mouse! noop 'post-mouse-ns! noop 'post-scroll! noop 'post-key! noop 'post-key-cg! noop 'post-chars! noop 'post-paste! noop 'post-attach! noop 'simulate-ime! noop
                            'ime-query (lambda () (values #f #f)) 'ime-diagnostics (lambda () "replay") 'key? (lambda () #t))
                 (implement clipboard
                            'get (lambda () (unbox (rh-clip r))) 'set! (lambda (s) (set-box! (rh-clip r) s))

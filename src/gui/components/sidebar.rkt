@@ -19,7 +19,8 @@
 
 (require racket/list racket/string
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt" "../compute/editor.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt"
+         "../compute/view.rkt" "../compute/widgets.rkt")                ; 视图平面
 
 (define WARN '(0.95 0.55 0.45 1.0))
 (define MENU-W 220.0)
@@ -33,11 +34,6 @@
 (define ROW-ICON-W 26.0)                                ; 悬停行上的图标按钮宽
 (define PREVIEW-LINK '(0.62 0.76 1.0 1.0))              ; 预览：归入项目
 (define PREVIEW-ADD '(0.55 0.85 0.62 1.0))              ; 预览：新标题
-
-;; 悬停的底：玻璃上用更亮的半透明（不透明侧栏上 0.17 就够）
-(define (hover-fill! s dl x y w h r)
-  (define c (if (sb-translucent s) HOVER-ON-GLASS '(0.17 0.18 0.22 1.0)))
-  (drawlist-rect! dl x y w h (car c) (cadr c) (caddr c) (cadddr c) #:radius r))
 
 ;; 横扫（§11.4 D）：右扫 ≥ SWIPE-ACT 置顶 / 取消；左扫 ≥ SWIPE-ACT 归档 / 取消、≥ SWIPE-DELETE 删除。松手（ended）时做
 (define SWIPE-ACT 60.0)
@@ -54,11 +50,6 @@
            (regexp-match? #rx"^\u0002archived\u0001" k)
            (and (regexp-match? #rx"^\u0002grp\u0001" k) (not (regexp-match? #rx"\u0001-$" k))))))
 
-;; 1.5 point 的描边（四条边）
-(define (outline! dl x y w h c)
-  (define-values (r g b a) (apply values c))
-  (drawlist-rect! dl x y w 1.5 r g b a) (drawlist-rect! dl x (+ y h -1.5) w 1.5 r g b a)
-  (drawlist-rect! dl x y 1.5 h r g b a) (drawlist-rect! dl (+ x w -1.5) y 1.5 h r g b a))
 (define BUSY '(0.55 0.70 1.0 1.0))
 (define PAD 12.0)
 
@@ -93,247 +84,226 @@
   (t 'sb.subtitle ts (j s 'messages 0) (j s 'model "?"))
 ) ; end define session-subtitle
 
-;; 虚线框：四边各画一串短横（2 point 粗、6 长、4 空）
-(define (dashed-outline! dl x y w h [a 0.9])
-  (define (hline! yy) (for ([xx (in-range (+ x 6.0) (- (+ x w) 6.0) 10.0)]) (drawlist-rect! dl xx yy (min 6.0 (- (+ x w -6.0) xx)) 1.0 0.45 0.55 0.75 a)))
-  (define (vline! xx) (for ([yy (in-range (+ y 6.0) (- (+ y h) 6.0) 10.0)]) (drawlist-rect! dl xx yy 1.0 (min 6.0 (- (+ y h -6.0) yy)) 0.45 0.55 0.75 a)))
-  (hline! y) (hline! (+ y h -1.0)) (vline! x) (vline! (+ x w -1.0)))
-
 ;; 慢闪烁：0..1 的余弦起伏，周期 PULSE-MS；时钟可换（测试）
 (define PULSE-MS 2400.0)
 (define sidebar-clock (make-parameter current-inexact-milliseconds))
 (define (pulse) (- 0.5 (* 0.5 (cos (* 2.0 3.141592653589793 (/ ((sidebar-clock)) PULSE-MS))))))
 
+;; 视图平面（compute/view.rkt）：侧栏是一棵元素树——底、头部按钮、可滚动的行、底部提示条，以及锚在点上的上下文菜单 / 分组菜单 / 拖行标签。
+;; 行内：横扫时后面露出的动作、内容跟着偏移、悬停的图标、键盘焦点描边，都是元素；坐标、裁剪、命中由布局推出。
+(define (with-alpha c a) (list (car c) (cadr c) (caddr c) a))
 (define (sb-render! s dl x y w h scale)
   (define rc (sb-rc s))
   (define lay (rich-ctx-layout rc))
-  (define at (rich-ctx-atlas rc))
-  (define hits '())
-  (define (hit! kind payload hx hy hw hh) (set! hits (cons (vector kind payload hx hy hw hh) hits)))
-  (define list-y (+ y HEAD-H))
   (define list-h (- h HEAD-H (if (sb-notice s) NOTICE-H 0.0)))
-  ;; 行的命中区裁剪到列表区：滚到头部下面的半行不能盖住头部按钮
-  (define (row-hit! kind payload hx hy hw hh)
-    (define y0 (max hy list-y))
-    (define y1 (min (+ hy hh) (+ list-y list-h)))
-    (when (> y1 y0) (hit! kind payload hx y0 hw (- y1 y0))))
   (set-sb-view-h! s list-h)
-  (set-sb-animating! s #f)
-  (if (sb-translucent s)                                                     ; 玻璃上：底由玻璃给，上面铺一层暗色保证字的对比度
-      (drawlist-rect! dl x y w h (car GLASS-SCRIM) (cadr GLASS-SCRIM) (caddr GLASS-SCRIM) (cadddr GLASS-SCRIM) #:radius (sb-translucent s))
-      (drawlist-rect! dl x y w h 0.11 0.11 0.13 1.0))
-  ;; 头部：新会话 / 分叉（当前会话还没有消息 → 分叉不可用）
-  (define cur (findf (lambda (se) (and (not (header? se)) (j se 'current #f))) (sb-sessions s)))
-  (define fork-ok? (and cur (> (let ([m (j cur 'messages 0)]) (if (real? m) m 0)) 0)))
-  (for/fold ([bx (+ x PAD)]) ([b (in-list (list (list 'new (t 'sb.new) #t) (list 'new-chat (t 'sb.chat) #t) (list 'fork (t 'sb.fork) fork-ok?)))])
-    (define tb (lay (cadr b) 'small 1000.0 #f))
-    (define bw (+ (text-block-width tb) 14.0))                                 ; 右端还要放 ⇅：英文界面 18 的内边距在 240 宽时和它挨上
-    (define by (+ y 9.0))
-    (define bh (- HEAD-H 18.0))
-    (define on? (caddr b))
-    (drawlist-rect! dl bx by bw bh (car BUTTON) (cadr BUTTON) (caddr BUTTON) (if on? 1.0 BUTTON-OFF-ALPHA) #:radius 6.0)   ; 玻璃上也要看得出（≥ 1.2）
-    (paint-text! dl at tb (+ bx 7.0) (+ by (/ (- bh (text-block-height tb)) 2)) (if on? TEXT TEXT-OFF) #:scale scale)
-    (when on? (hit! (car b) #t bx by bw bh))
-    (+ bx bw 6.0))
-  ;; 头部右端：分组方式（⇅）；不是「最近」时按钮亮
-  (let* ([gb (lay "⇅" 'body 100.0 #f)] [gw 26.0] [gx (- (+ x w) PAD gw)] [gy (+ y 9.0)] [gh (- HEAD-H 18.0)] [on? (not (eq? (sb-gmode s) 'recent))])
-    (drawlist-rect! dl gx gy gw gh (if on? 0.20 (car BUTTON)) (if on? 0.33 (cadr BUTTON)) (if on? 0.66 (caddr BUTTON)) 1.0 #:radius 6.0)
-    (paint-text! dl at gb (+ gx (/ (- gw (text-block-width gb)) 2)) (+ gy (/ (- gh (text-block-height gb)) 2)) TEXT #:scale scale)
-    (hit! 'group-button #t gx gy gw gh))
-  ;; 列表（按行滚动；裁剪到列表区）
   (define ss (sb-sessions s))
   (define max-scroll (max 0.0 (- (for/sum ([se (in-list ss)]) (item-h se)) list-h)))
   (set-sb-scroll! s (max 0.0 (min max-scroll (sb-scroll s))))
-  (drawlist-set-clip! dl (vector x list-y w list-h))
-  (for/fold ([ry (- list-y (sb-scroll s))]) ([se (in-list ss)])
+  ;; 临时会话的行在视区里（画出来了）→ 拼装层持续重绘（起伏）
+  (set-sb-animating! s (for/fold ([ry (- (sb-scroll s))] [any? #f] #:result any?) ([se (in-list ss)])
+                         (values (+ ry (item-h se)) (or any? (and (j se 'ephemeral #f) (< ry list-h) (> (+ ry (item-h se)) 0.0) #t)))))
+  (define hover-c (if (sb-translucent s) HOVER-ON-GLASS '(0.17 0.18 0.22 1.0)))   ; 悬停的底：玻璃上用更亮的半透明
+  (define (inset-fill c r) (ui-box #:pad (vector 2.0 6.0 2.0 6.0) (ui-box #:grow 1 #:fill c #:radius r)))
+  ;; 头部：新会话 / 聊天 / 分叉（当前会话还没有消息 → 分叉不可用）+ 右端分组方式（⇅；不是「最近」时亮）
+  (define cur (findf (lambda (se) (and (not (header? se)) (j se 'current #f))) ss))
+  (define fork-ok? (and cur (> (let ([m (j cur 'messages 0)]) (if (real? m) m 0)) 0)))
+  (define head
+    (apply ui-box #:dir 'row #:h HEAD-H #:align 'center #:gap 6.0 #:pad (vector 9.0 PAD 9.0 PAD)
+           (append
+            (for/list ([b (in-list (list (list 'new (t 'sb.new) #t) (list 'new-chat (t 'sb.chat) #t) (list 'fork (t 'sb.fork) fork-ok?)))])
+              (define on? (caddr b))
+              (ui-box #:dir 'row #:align 'center #:h (- HEAD-H 18.0) #:pad (vector 0.0 7.0 0.0 7.0) #:radius 6.0   ; 玻璃上也要看得出（≥ 1.2）
+                      #:fill (with-alpha BUTTON (if on? 1.0 BUTTON-OFF-ALPHA)) #:hit (and on? (cons (car b) #t))
+                      (ui-text (cadr b) #:font 'small #:color (if on? TEXT TEXT-OFF) #:fit? #f)))
+            (list (ui-spacer #:grow 1)
+                  (let ([on? (not (eq? (sb-gmode s) 'recent))])
+                    (ui-box #:dir 'stack #:w 26.0 #:h (- HEAD-H 18.0) #:radius 6.0 #:align 'center #:valign 'center
+                            #:fill (if on? '(0.20 0.33 0.66 1.0) (with-alpha BUTTON 1.0)) #:hit (cons 'group-button #t)
+                            (ui-text "⇅" #:font 'body #:color TEXT #:fit? #f #:w 14.0)))))))
+  ;; 一行
+  (define (row-el se)
     (define ih (item-h se))
-    (define sw (and (sb-swipe s) (equal? (vector-ref (sb-swipe s) 0) (key se)) (vector-ref (sb-swipe s) 1)))   ; 这一行在横扫：偏移
-    (when (and (< ry (+ list-y list-h)) (> (+ ry ih) list-y))
-      (when sw                                                                  ; 行后面露出的动作
-        (define act (swipe-action se sw))
-        (define c (case act [(pin unpin) '(0.20 0.33 0.66)] [(delete) '(0.55 0.18 0.15)] [(archive unarchive) '(0.30 0.33 0.40)] [else '(0.16 0.17 0.20)]))
-        (drawlist-rect! dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) (car c) (cadr c) (caddr c) 1.0 #:radius 7.0)
-        (define lb (lay (t (case (or act (if (> sw 0) 'pin 'archive)) [(pin) 'sb.m-pin] [(unpin) 'sb.m-unpin] [(archive) 'sb.m-archive]
-                                [(unarchive) 'sb.m-unarchive] [else 'sb.swipe-delete]))
-                        'small 200.0 #f))
-        (paint-text! dl at lb (if (> sw 0) (+ x PAD) (- (+ x w) PAD (text-block-width lb))) (+ ry (/ (- ih (text-block-line-height lb)) 2))
-                     (if act TEXT DIM-ON-ACCENT) #:scale scale))
-      (when (and (sb-drag s) (equal? (vector-ref (sb-drag s) 3) (key se)))  ; 拖放目标：描边
-        (outline! dl (+ x 4.0) (+ ry 1.0) (- w 8.0) (- ih 2.0) ACCENT))
-      (let ([x (if sw (+ x sw) x)])                                            ; 横扫的行：内容跟着手指走
+    (define k (key se))
+    (define sw (and (sb-swipe s) (equal? (vector-ref (sb-swipe s) 0) k) (vector-ref (sb-swipe s) 1)))   ; 这一行在横扫：偏移
+    (define drop? (and (sb-drag s) (equal? (vector-ref (sb-drag s) 3) k)))
+    (define behind                                                            ; 横扫时行后面露出的动作
+      (and sw
+           (let* ([act (swipe-action se sw)]
+                  [c (case act [(pin unpin) '(0.20 0.33 0.66 1.0)] [(delete) '(0.55 0.18 0.15 1.0)] [(archive unarchive) '(0.30 0.33 0.40 1.0)] [else '(0.16 0.17 0.20 1.0)])]
+                  [label (t (case (or act (if (> sw 0) 'pin 'archive)) [(pin) 'sb.m-pin] [(unpin) 'sb.m-unpin] [(archive) 'sb.m-archive]
+                              [(unarchive) 'sb.m-unarchive] [else 'sb.swipe-delete]))])
+             (ui-box #:pad (vector 2.0 6.0 2.0 6.0)
+                     (ui-box #:dir 'row #:grow 1 #:align 'center #:fill c #:radius 7.0 #:pad (vector 0.0 6.0 0.0 6.0)
+                             (if (> sw 0) #f (ui-spacer #:grow 1))
+                             (ui-text label #:font 'small #:color (if act TEXT DIM-ON-ACCENT) #:fit? #f))))))
+    (define content
       (cond
-        [(group? se)                                                               ; 分组行（已归档）：▸ / ▾ + 文字，整行可点
-         (define tb (fit-line lay (format "~a  ~a" (if (j se 'open #f) "▾" "▸") (j se 'label "")) 'small (- w (* 2 PAD))))
-         (when (equal? (sb-hover s) (key se))
-           (hover-fill! s dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) 6.0))
-         (paint-text! dl at tb (+ x PAD) (+ ry (/ (- ih (text-block-line-height tb)) 2)) DIM #:scale scale)
-         (row-hit! 'toggle-group (key se) x ry w ih)]
+        [(group? se)                                                            ; 分组行（已归档等）：▸ / ▾ + 文字，整行可点
+         (ui-box #:dir 'stack
+                 (and (equal? (sb-hover s) k) (ui-box #:pad (vector 2.0 6.0 2.0 6.0) (ui-box #:grow 1 #:fill hover-c #:radius 6.0)))
+                 (ui-box #:dir 'row #:align 'center #:pad (vector 0.0 PAD 0.0 PAD)
+                         (ui-text (format "~a  ~a" (if (j se 'open #f) "▾" "▸") (j se 'label "")) #:font 'small #:color DIM #:grow 1)))]
         [(header? se)
          ;; 主机标题：名字 + 状态；连着 → 右边「＋」新建会话；断开 → 整行「重新连接」
          (define connected? (j se 'connected #t))
-         (define pb (lay "＋" 'body 1000.0 #f))
-         (define pbw (+ (text-block-width pb) 14.0))
-         (define tb (fit-line lay (format "~a  ~a" (j se 'label "?") (j se 'status "")) 'small (- w (* 2 PAD) pbw 6.0)))
-         (paint-text! dl at tb (+ x PAD) (+ ry (/ (- ih (text-block-line-height tb)) 2))
-                      (case (j se 'level) [("warn") WARN] [("busy") BUSY] [else DIM]) #:scale scale)
-         (cond
-           [connected?
-            (define bx (- (+ x w) PAD pbw))
-            (drawlist-rect! dl bx (+ ry 4.0) pbw (- ih 8.0) (car BUTTON) (cadr BUTTON) (caddr BUTTON) 1.0 #:radius 5.0)
-            (paint-text! dl at pb (+ bx 7.0) (+ ry (/ (- ih (text-block-line-height pb)) 2)) TEXT #:scale scale)
-            (row-hit! 'host-new (j se 'host) bx (+ ry 4.0) pbw (- ih 8.0))]
-           [else (row-hit! 'host-reconnect (j se 'host) x ry w ih)])]
-        [else
-         (define path (key se))
-         (define current? (j se 'current #f))
-         (define ephemeral? (and (j se 'ephemeral #f) #t))
-         (define hover? (or (equal? (sb-hover s) path) (and (sb-menu s) (equal? (vector-ref (sb-menu s) 0) path))))
-         (define p (if ephemeral? (begin (set-sb-animating! s #t) (pulse)) 1.0))
-         (cond [ephemeral?                                                       ; 临时会话：虚线框（短横拼成）+ 淡底，一起慢慢明暗起伏
-                ;; 底的不透明度 0.50–0.75：起伏到最淡时与背景仍 ≥ 1.2（原来最淡 0.135；玻璃后面是白 / 橙时 0.36 也只有 1.18）
-                (drawlist-rect! dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) (car EPHEMERAL-FILL) (cadr EPHEMERAL-FILL) (caddr EPHEMERAL-FILL) (+ 0.50 (* 0.25 p)) #:radius 7.0)
-                (dashed-outline! dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) (+ 0.3 (* 0.65 p)))]
-               [current? (drawlist-rect! dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) 0.20 0.28 0.45 (if (sb-translucent s) 0.9 1.0) #:radius 7.0)]   ; 0.75 时在黑底的玻璃上只有 1.2
-               [hover? (hover-fill! s dl (+ x 6.0) (+ ry 2.0) (- w 12.0) (- ih 4.0) 7.0)])
-         (define text-w (- w (* 2 PAD)))
-         ;; 悬停的行：右边两个图标按钮（置顶、归档）；临时会话、菜单开着、改名中不出。悬停时角标让位
-         (define icons? (and hover? (not ephemeral?) (not (sb-menu s)) (not (and (sb-rename s) (equal? (car (sb-rename s)) path)))))
-         (define icons-w (if icons? (+ (* 2 ROW-ICON-W) 4.0) 0.0))
-         ;; 角标（运行中 / 等待权限）：标题行右边
-         (define badge (and (not icons?) (let ([b (j se 'badge)]) (and (string? b) (lay b 'small 1000.0 #f)))))
-         (define bw (if badge (+ (text-block-width badge) 12.0) 0.0))
-         (define t1 (fit-line lay (session-title se) 'body (- text-w (if badge (+ bw 6.0) 0.0) icons-w)))
-         (define t2 (fit-line lay (if ephemeral? (t 'sb.ephemeral) (session-subtitle se)) 'small text-w))
-         (define renaming (and (sb-rename s) (equal? (car (sb-rename s)) path) (cdr (sb-rename s))))
-         (cond
-           [renaming                                                              ; 改名输入框
-            (define-values (disp caret _m) (editor-display renaming))
-            (define tb (fit-line lay (if (string=? disp "") " " disp) 'body (- text-w 8.0)))
-            (define fh (+ (text-block-line-height t1) 4.0))
-            (drawlist-rect! dl (+ x PAD -4.0) (+ ry 4.0) (- w (* 2 PAD) -8.0) fh 0.30 0.40 0.62 1.0 #:radius 5.0)
-            (drawlist-rect! dl (+ x PAD -3.0) (+ ry 5.0) (- w (* 2 PAD) -6.0) (- fh 2.0) 0.09 0.09 0.11 1.0 #:radius 4.0)
-            (paint-text! dl at tb (+ x PAD) (+ ry 6.0) TEXT #:scale scale)
-            (define-values (_k cxp) (text-block-caret tb (min caret (string-length disp))))
-            (define crect (vector (+ x PAD cxp) (+ ry 6.0) 2.0 (text-block-line-height tb)))
-            (drawlist-rect! dl (vector-ref crect 0) (vector-ref crect 1) 1.5 (vector-ref crect 3) 0.55 0.70 1.0 1.0)
-            (set-sb-caret! s crect)]
-           [else (paint-text! dl at t1 (+ x PAD) (+ ry 6.0) (if ephemeral? DIM-ON-ACCENT TEXT) #:scale scale)])
-         (when badge
-           (define bx (- (+ x w) PAD bw))
-           (define warn? (equal? (j se 'badge_level) "warn"))
-           (define bc (if warn? BADGE-WARN BADGE-BUSY))
-           (drawlist-rect! dl bx (+ ry 7.0) bw (+ (text-block-line-height badge) 2.0) (car bc) (cadr bc) (caddr bc) 1.0 #:radius 5.0)
-           (paint-text! dl at badge (+ bx 6.0) (+ ry 8.0) (if warn? BADGE-WARN-TEXT BADGE-BUSY-TEXT) #:scale scale))
-         ;; 副标题：选中 / 临时 / 悬停的行（底比列表亮）→ 更亮的次要色；字不跟着起伏（起伏的是框与底，字一直看得清）
-         (define pv (let ([v (j se 'preview #f)]) (and (pair? v) v)))
-         (cond
-           [pv                                                                  ; 变更清单审阅中：副标题换成「会变成什么」
-            (define accent? (or ephemeral? current? hover?))
-            (for/fold ([tx (+ x PAD)]) ([tag (in-list pv)])
-              (define tb (lay (car tag) 'small 1000.0 #f))
-              (define c (if accent? TEXT (case (cdr tag) [(link) PREVIEW-LINK] [(rename) PREVIEW-ADD] [(delete) WARN] [(archive) DIM-ON-ACCENT] [else TEXT])))
-              (when (< tx (+ x w (- PAD)))
-                (paint-text! dl at tb tx (+ ry 6.0 (text-block-line-height t1)) c #:scale scale))
-              (+ tx (text-block-width tb) 10.0))]
-           [else
-            (paint-text! dl at t2 (+ x PAD) (+ ry 6.0 (text-block-line-height t1)) (if (or ephemeral? current? hover?) DIM-ON-ACCENT DIM) #:scale scale)])   ; 悬停的底更亮：DIM 只有 3.7
-         (row-hit! 'resume path x ry w ih)
-         (when (equal? (sb-focus s) path) (outline! dl (+ x 4.0) (+ ry 1.0) (- w 8.0) (- ih 2.0) ACCENT))   ; 键盘焦点
-         (when icons?                                                             ; 后登记的先命中：图标在行的命中之上
-           (for ([kind (in-list '(row-pin row-archive))] [k (in-naturals)])
-             (define bx (- (+ x w) PAD (* (- 2 k) ROW-ICON-W) (* (- 1 k) 4.0)))
-             ;; 蓝底的行（当前）上用深色按钮：浅灰按钮在蓝底上只有 1.19；一般的行用浅灰按钮
-             (define bc (if current? '(0.12 0.13 0.17) BUTTON))
-             (drawlist-rect! dl bx (+ ry 5.0) ROW-ICON-W 22.0 (car bc) (cadr bc) (caddr bc) 1.0 #:radius 5.0)
-             (define ib (lay (if (eq? kind 'row-pin) "📌" "🗄") 'small 100.0 #f))
-             (paint-text! dl at ib (+ bx (/ (- ROW-ICON-W (text-block-width ib)) 2)) (+ ry 7.0) TEXT #:scale scale)
-             (row-hit! kind path bx (+ ry 5.0) ROW-ICON-W 22.0)))])))
-    (+ ry ih))
-  (drawlist-set-clip! dl #f)                                                ; 与对话区之间的分隔线由拼装层画（侧栏可在左 / 右，可拖宽度）
-  ;; 拖行：光标旁边一块小标签（行的标题）
-  (when (sb-drag s)
-    (define d (sb-drag s))
-    (define se (findf (lambda (se) (equal? (key se) (vector-ref d 0))) (sb-sessions s)))
-    (define tb (fit-line lay (if se (session-title se) "…") 'small 160.0))
-    (define gx (+ (vector-ref d 1) 12.0)) (define gy (+ (vector-ref d 2) 6.0))
-    (drawlist-rect! dl (- gx 1.0) (- gy 1.0) (+ (text-block-width tb) 18.0) (+ (text-block-line-height tb) 10.0) 0.55 0.70 1.0 1.0 #:radius 6.0)
-    (drawlist-rect! dl gx gy (+ (text-block-width tb) 16.0) (+ (text-block-line-height tb) 8.0) 0.13 0.14 0.17 1.0 #:radius 5.0)
-    (paint-text! dl at tb (+ gx 8.0) (+ gy 4.0) TEXT #:scale scale))
-  ;; 底部提示条：「已删除 …」+「撤销」
-  (when (sb-notice s)
-    (define ny (+ list-y list-h 3.0))
-    (define ub (lay (t 'sb.undo) 'small 1000.0 #f))
-    (define ubw (+ (text-block-width ub) 18.0))
-    ;; 带边框的卡片：单一填充色没法同时和不透明侧栏（0.11）与最亮的玻璃（0.21）都拉开 1.2，靠浅色边框分出来（同上下文菜单）
-    (drawlist-rect! dl (+ x 5.0) (- ny 1.0) (- w 10.0) (- NOTICE-H 4.0) 0.36 0.38 0.46 1.0 #:radius 8.0)
-    (drawlist-rect! dl (+ x 6.0) ny (- w 12.0) (- NOTICE-H 6.0) 0.13 0.14 0.17 1.0 #:radius 7.0)
-    (define tb (fit-line lay (sb-notice s) 'small (- w 12.0 ubw 24.0)))
-    (paint-text! dl at tb (+ x PAD) (+ ny (/ (- NOTICE-H 6.0 (text-block-line-height tb)) 2)) TEXT #:scale scale)
-    (define bx (- (+ x w) 12.0 ubw))
-    (drawlist-rect! dl bx (+ ny 5.0) ubw (- NOTICE-H 16.0) (car BUTTON) (cadr BUTTON) (caddr BUTTON) 1.0 #:radius 5.0)
-    (paint-text! dl at ub (+ bx 9.0) (+ ny 5.0 (/ (- NOTICE-H 16.0 (text-block-line-height ub)) 2)) TEXT #:scale scale)
-    (hit! 'undo #t bx (+ ny 5.0) ubw (- NOTICE-H 16.0)))
-  ;; 上下文菜单（最后画、最后登记 = 最先命中）
-  (when (sb-menu s)
-    (define path (vector-ref (sb-menu s) 0))
-    (define se (findf (lambda (se) (equal? (key se) path)) (sb-sessions s)))
-    (define-values (icons items) (menu-items s se))
-    (define mh (+ 8.0 ICON-ROW-H 9.0 (for/sum ([it (in-list items)]) (if (eq? (vector-ref it 0) 'sep) 9.0 ITEM-H))))
-    (define mx (max (+ x 6.0) (min (vector-ref (sb-menu s) 1) (- (+ x w) MENU-W 6.0))))
-    (define my (max (+ y 6.0) (min (vector-ref (sb-menu s) 2) (- (+ y h) mh 6.0))))
-    (drawlist-rect! dl (- mx 1.0) (- my 1.0) (+ MENU-W 2.0) (+ mh 2.0) 0.30 0.31 0.36 1.0 #:radius 8.0)
-    (drawlist-rect! dl mx my MENU-W mh 0.16 0.17 0.20 1.0 #:radius 7.0)
-    (hit! 'menu #t mx my MENU-W mh)
-    ;; 第一行：四个图标格（图标 + 字 + 右上角的单键）
-    (define cw (/ (- MENU-W 8.0) (length icons)))
-    (for ([it (in-list icons)] [k (in-naturals)])
-      (define kind (vector-ref it 0)) (define on? (vector-ref it 2))
-      (define cx (+ mx 4.0 (* k cw))) (define cy (+ my 4.0))
-      (when (and on? (equal? (sb-hover s) (cons 'item kind)))
-        (drawlist-rect! dl (+ cx 2.0) cy (- cw 4.0) ICON-ROW-H 0.22 0.30 0.48 1.0 #:radius 6.0))
-      (define ib (lay (vector-ref it 3) 'body 100.0 #f))
-      (paint-text! dl at ib (+ cx (/ (- cw (text-block-width ib)) 2)) (+ cy 5.0) (if on? TEXT DIM) #:scale scale)
-      (define lb (fit-line lay (vector-ref it 1) 'small (- cw 6.0)))
-      (paint-text! dl at lb (+ cx (/ (- cw (text-block-width lb)) 2)) (+ cy 7.0 (text-block-line-height ib)) (if on? TEXT DIM) #:scale scale)
-      (define kb (lay (vector-ref it 4) 'small 100.0 #f))
-      (paint-text! dl at kb (- (+ cx cw) (text-block-width kb) 5.0) (+ cy 2.0)
-                   (if (and on? (equal? (sb-hover s) (cons 'item kind))) DIM-ON-ACCENT DIM) #:scale scale)   ; 悬停的蓝底上：DIM 只有 3.3
-      (when on? (hit! kind path (+ cx 2.0) cy (- cw 4.0) ICON-ROW-H)))
-    (drawlist-rect! dl (+ mx 10.0) (+ my 4.0 ICON-ROW-H 4.0) (- MENU-W 20.0) 1.0 0.26 0.27 0.31 1.0)
-    (for/fold ([iy (+ my 4.0 ICON-ROW-H 9.0)]) ([it (in-list items)])
-      (define kind (vector-ref it 0))
+         (ui-box #:dir 'row #:align 'center #:pad (vector 0.0 PAD 0.0 PAD) #:gap 6.0
+                 (ui-text (format "~a  ~a" (j se 'label "?") (j se 'status "")) #:font 'small #:grow 1
+                          #:color (case (j se 'level) [("warn") WARN] [("busy") BUSY] [else DIM]))
+                 (and connected?
+                      (ui-box #:dir 'row #:align 'center #:h (- ih 8.0) #:pad (vector 0.0 7.0 0.0 7.0) #:fill (with-alpha BUTTON 1.0) #:radius 5.0
+                              #:hit (cons 'host-new (j se 'host))
+                              (ui-text "＋" #:font 'body #:color TEXT #:fit? #f))))]
+        [else (session-row-el se k ih)]))
+    (ui-box #:dir 'stack #:h ih
+            #:hit (cond [(group? se) (cons 'toggle-group k)]
+                        [(header? se) (and (not (j se 'connected #t)) (cons 'host-reconnect (j se 'host)))]
+                        [else (cons 'resume k)])
+            behind
+            (and drop? (ui-box #:pad (vector 1.0 4.0 1.0 4.0) (outline ACCENT)))   ; 拖放目标：描边
+            (if sw (ui-box #:dir 'stack #:dx sw content) content)))             ; 横扫的行：内容跟着手指走
+  (define (session-row-el se path ih)
+    (define current? (j se 'current #f))
+    (define ephemeral? (and (j se 'ephemeral #f) #t))
+    (define hover? (or (equal? (sb-hover s) path) (and (sb-menu s) (equal? (vector-ref (sb-menu s) 0) path))))
+    (define p (if ephemeral? (pulse) 1.0))
+    ;; 悬停的行：右边两个图标按钮（置顶、归档）；临时会话、菜单开着、改名中不出。悬停时角标让位
+    (define renaming (and (sb-rename s) (equal? (car (sb-rename s)) path) (cdr (sb-rename s))))
+    (define icons? (and hover? (not ephemeral?) (not (sb-menu s)) (not renaming)))
+    (define icons-w (if icons? (+ (* 2 ROW-ICON-W) 4.0) 0.0))
+    (define badge (and (not icons?) (let ([b (j se 'badge)]) (and (string? b) b))))   ; 角标（运行中 / 等待权限）
+    (define warn? (equal? (j se 'badge_level) "warn"))
+    (define pv (let ([v (j se 'preview #f)]) (and (pair? v) v)))
+    (define accent? (or ephemeral? current? hover?))
+    (define title-line
       (cond
-        [(eq? kind 'sep) (drawlist-rect! dl (+ mx 10.0) (+ iy 4.0) (- MENU-W 20.0) 1.0 0.26 0.27 0.31 1.0) (+ iy 9.0)]
+        [renaming                                                             ; 改名输入框（编辑器是自画的叶子）
+         (ui-custom #:measure (lambda (_w) (text-block-line-height (lay "M" 'body 100.0 #f)))
+                    #:paint (lambda (dl tx ty tw th scale)
+                              (define-values (disp caret _m) (editor-display renaming))
+                              (define tb (fit-line lay (if (string=? disp "") " " disp) 'body (- tw 8.0)))
+                              (define fh (+ th 4.0))
+                              (drawlist-rect! dl (- tx 4.0) (- ty 2.0) (+ tw 8.0) fh 0.30 0.40 0.62 1.0 #:radius 5.0)
+                              (drawlist-rect! dl (- tx 3.0) (- ty 1.0) (+ tw 6.0) (- fh 2.0) 0.09 0.09 0.11 1.0 #:radius 4.0)
+                              (paint-text! dl (rich-ctx-atlas rc) tb tx ty TEXT #:scale scale)
+                              (define-values (_k cxp) (text-block-caret tb (min caret (string-length disp))))
+                              (define crect (vector (+ tx cxp) ty 2.0 (text-block-line-height tb)))
+                              (drawlist-rect! dl (vector-ref crect 0) (vector-ref crect 1) 1.5 (vector-ref crect 3) 0.55 0.70 1.0 1.0)
+                              (set-sb-caret! s crect)
+                              '()))]
         [else
-         (define label (vector-ref it 1))
-         (define on? (vector-ref it 2))
-         (define danger? (eq? kind 'delete))
-         (when (and on? (equal? (sb-hover s) (cons 'item kind)))
-           (drawlist-rect! dl (+ mx 4.0) iy (- MENU-W 8.0) ITEM-H (if danger? 0.45 0.22) (if danger? 0.16 0.30) (if danger? 0.14 0.48) 1.0 #:radius 5.0))
-         (define kb (lay (vector-ref it 3) 'small 100.0 #f))                    ; 快捷键提示（右对齐）
-         (define tb (fit-line lay label 'body (- MENU-W 32.0 (text-block-width kb))))
-         (paint-text! dl at tb (+ mx 12.0) (+ iy (/ (- ITEM-H (text-block-line-height tb)) 2))
-                      (cond [(not on?) DIM] [(and danger? (equal? (sb-hover s) (cons 'item kind))) '(1.0 0.92 0.90 1.0)] [danger? WARN] [else TEXT]) #:scale scale)
-         (paint-text! dl at kb (- (+ mx MENU-W) 12.0 (text-block-width kb)) (+ iy (/ (- ITEM-H (text-block-line-height kb)) 2)) DIM #:scale scale)
-         (when on? (hit! kind path (+ mx 4.0) iy (- MENU-W 8.0) ITEM-H))
-         (+ iy ITEM-H)])))
+         (ui-box #:dir 'row #:align 'start #:gap 6.0
+                 (ui-text (session-title se) #:font 'body #:color (if ephemeral? DIM-ON-ACCENT TEXT) #:grow 1)
+                 (and badge (ui-box #:dir 'row #:pad (vector 1.0 6.0 1.0 6.0) #:radius 5.0 #:fill (with-alpha (if warn? BADGE-WARN BADGE-BUSY) 1.0)
+                                    (ui-text badge #:font 'small #:color (if warn? BADGE-WARN-TEXT BADGE-BUSY-TEXT) #:fit? #f)))
+                 (and icons? (ui-spacer #:w icons-w)))]))
+    (define subtitle
+      (if pv                                                                  ; 变更清单审阅中：副标题换成「会变成什么」
+          (apply ui-box #:dir 'row #:gap 10.0 #:overflow 'hide
+                 (for/list ([tag (in-list pv)])
+                   (ui-text (car tag) #:font 'small #:fit? #f
+                            #:color (if accent? TEXT (case (cdr tag) [(link) PREVIEW-LINK] [(rename) PREVIEW-ADD] [(delete) WARN] [(archive) DIM-ON-ACCENT] [else TEXT])))))
+          ;; 选中 / 临时 / 悬停的行（底比列表亮）→ 更亮的次要色（DIM 在悬停底上只有 3.7）；字不跟着起伏
+          (ui-text (if ephemeral? (t 'sb.ephemeral) (session-subtitle se)) #:font 'small #:color (if accent? DIM-ON-ACCENT DIM))))
+    (ui-box #:dir 'stack
+            (cond [ephemeral?                                                 ; 临时会话：虚线框 + 淡底，一起慢慢明暗起伏（底 0.50–0.75：最淡时与背景仍 ≥ 1.2）
+                   (ui-box #:pad (vector 2.0 6.0 2.0 6.0)
+                           (ui-box #:dir 'stack #:grow 1 #:fill (with-alpha EPHEMERAL-FILL (+ 0.50 (* 0.25 p))) #:radius 7.0
+                                   (dashed-outline '(0.45 0.55 0.75) (+ 0.3 (* 0.65 p)))))]
+                  [current? (inset-fill (list 0.20 0.28 0.45 (if (sb-translucent s) 0.9 1.0)) 7.0)]   ; 0.75 时在黑底的玻璃上只有 1.2
+                  [hover? (inset-fill hover-c 7.0)]
+                  [else #f])
+            (ui-box #:dir 'column #:pad (vector 6.0 PAD 0.0 PAD) title-line subtitle)
+            (and (equal? (sb-focus s) path) (ui-box #:pad (vector 1.0 4.0 1.0 4.0) (outline ACCENT)))   ; 键盘焦点
+            (and icons?                                                       ; 后画的先命中：图标在行的命中之上
+                 (apply ui-box #:dir 'row #:align 'start #:gap 4.0 #:pad (vector 5.0 PAD 0.0 0.0)
+                        (ui-spacer #:grow 1)
+                        (for/list ([kind (in-list '(row-pin row-archive))])
+                          ;; 蓝底的行（当前）上用深色按钮：浅灰按钮在蓝底上只有 1.19
+                          (ui-box #:dir 'stack #:w ROW-ICON-W #:h 22.0 #:radius 5.0 #:align 'center #:valign 'center
+                                  #:fill (if current? '(0.12 0.13 0.17 1.0) (with-alpha BUTTON 1.0)) #:hit (cons kind path)
+                                  (ui-text (if (eq? kind 'row-pin) "📌" "🗄") #:font 'small #:color TEXT #:fit? #f #:w 16.0)))))))
+  ;; 底部提示条：「已删除 …」+「撤销」——带边框的卡片（单一填充色没法同时和不透明侧栏与最亮的玻璃都拉开 1.2）
+  (define notice
+    (and (sb-notice s)
+         (ui-box #:h NOTICE-H #:pad (vector 2.0 5.0 4.0 5.0)
+                 (ui-box #:grow 1 #:fill '(0.36 0.38 0.46 1.0) #:radius 8.0 #:pad 1.0
+                         (ui-box #:dir 'row #:grow 1 #:align 'center #:fill '(0.13 0.14 0.17 1.0) #:radius 7.0 #:pad (vector 0.0 6.0 0.0 6.0) #:gap 8.0
+                                 (ui-text (sb-notice s) #:font 'small #:color TEXT #:grow 1)
+                                 (ui-box #:dir 'row #:align 'center #:h (- NOTICE-H 16.0) #:pad (vector 0.0 9.0 0.0 9.0) #:fill (with-alpha BUTTON 1.0) #:radius 5.0
+                                         #:hit (cons 'undo #t)
+                                         (ui-text (t 'sb.undo) #:font 'small #:color TEXT #:fit? #f)))))))
+  ;; 上下文菜单（锚在点上，夹进侧栏）：第一行四个图标格（图标 + 字 + 右上角单键），下面是文字项（右边快捷键）
+  (define menu
+    (and (sb-menu s)
+         (let* ([path (vector-ref (sb-menu s) 0)]
+                [se (findf (lambda (se) (equal? (key se) path)) ss)])
+           (define-values (icons items) (menu-items s se))
+           (define mh (+ 8.0 ICON-ROW-H 9.0 (for/sum ([it (in-list items)]) (if (eq? (vector-ref it 0) 'sep) 9.0 ITEM-H))))
+           (define mx (max (+ x 6.0) (min (vector-ref (sb-menu s) 1) (- (+ x w) MENU-W 6.0))))
+           (define my (max (+ y 6.0) (min (vector-ref (sb-menu s) 2) (- (+ y h) mh 6.0))))
+           (define (sep) (ui-box #:h 9.0 #:pad (vector 4.0 6.0 4.0 6.0) (ui-box #:grow 1 #:fill '(0.26 0.27 0.31 1.0))))
+           (apply ui-box #:dir 'column #:at (vector (- mx x) (- my y)) #:w MENU-W #:h mh #:fill '(0.16 0.17 0.20 1.0) #:stroke '(0.30 0.31 0.36 1.0)
+                  #:radius 7.0 #:hit (cons 'menu #t) #:pad (vector 4.0 4.0 4.0 4.0)
+                  (apply ui-box #:dir 'row #:h ICON-ROW-H
+                         (for/list ([it (in-list icons)])
+                           (define kind (vector-ref it 0)) (define on? (vector-ref it 2))
+                           (define hov? (and on? (equal? (sb-hover s) (cons 'item kind))))
+                           (ui-box #:dir 'stack #:grow 1 #:hit (and on? (cons kind path))
+                                   (and hov? (ui-box #:pad (vector 0.0 2.0 0.0 2.0) (ui-box #:grow 1 #:fill '(0.22 0.30 0.48 1.0) #:radius 6.0)))
+                                   (ui-box #:dir 'column #:align 'center #:pad (vector 5.0 3.0 0.0 3.0) #:gap 2.0
+                                           (ui-text (vector-ref it 3) #:font 'body #:color (if on? TEXT DIM) #:fit? #f)
+                                           (ui-text (vector-ref it 1) #:font 'small #:color (if on? TEXT DIM) #:align 'center))
+                                   (ui-box #:dir 'row #:pad (vector 2.0 5.0 0.0 0.0)
+                                           (ui-spacer #:grow 1)
+                                           (ui-text (vector-ref it 4) #:font 'small #:fit? #f #:color (if hov? DIM-ON-ACCENT DIM))))))   ; 悬停的蓝底上：DIM 只有 3.3
+                  (sep)
+                  (for/list ([it (in-list items)])
+                    (define kind (vector-ref it 0))
+                    (cond
+                      [(eq? kind 'sep) (sep)]
+                      [else
+                       (define on? (vector-ref it 2))
+                       (define danger? (eq? kind 'delete))
+                       (define hov? (and on? (equal? (sb-hover s) (cons 'item kind))))
+                       (ui-box #:dir 'stack #:h ITEM-H #:hit (and on? (cons kind path))
+                               (and hov? (ui-box #:grow 1 #:fill (if danger? '(0.45 0.16 0.14 1.0) '(0.22 0.30 0.48 1.0)) #:radius 5.0))
+                               (ui-box #:dir 'row #:align 'center #:pad (vector 0.0 8.0 0.0 8.0) #:gap 8.0
+                                       (ui-text (vector-ref it 1) #:font 'body #:grow 1
+                                                #:color (cond [(not on?) DIM] [(and danger? hov?) '(1.0 0.92 0.90 1.0)] [danger? WARN] [else TEXT]))
+                                       (ui-text (vector-ref it 3) #:font 'small #:color DIM #:fit? #f)))]))))))
   ;; 分组方式菜单（头部 ⇅ 下面，右对齐）
-  (when (sb-gmenu s)
-    (define gw 210.0)
-    (define gx (- (+ x w) PAD gw))
-    (define gy (+ y HEAD-H -4.0))
-    (define modes '(recent project workspace super))
-    (define gh (+ 8.0 (* ITEM-H (length modes))))
-    (drawlist-rect! dl (- gx 1.0) (- gy 1.0) (+ gw 2.0) (+ gh 2.0) 0.30 0.31 0.36 1.0 #:radius 8.0)
-    (drawlist-rect! dl gx gy gw gh 0.16 0.17 0.20 1.0 #:radius 7.0)
-    (hit! 'gmenu #t gx gy gw gh)
-    (for ([m (in-list modes)] [k (in-naturals)])
-      (define iy (+ gy 4.0 (* k ITEM-H)))
-      (when (equal? (sb-hover s) (cons 'gitem m)) (drawlist-rect! dl (+ gx 4.0) iy (- gw 8.0) ITEM-H 0.22 0.30 0.48 1.0 #:radius 5.0))
-      (define tb (fit-line lay (string-append (if (eq? m (sb-gmode s)) "✓ " "   ") (t (string->symbol (format "sb.group-~a" m)))) 'body (- gw 20.0)))
-      (paint-text! dl at tb (+ gx 10.0) (+ iy (/ (- ITEM-H (text-block-line-height tb)) 2)) TEXT #:scale scale)
-      (hit! 'group-by m (+ gx 4.0) iy (- gw 8.0) ITEM-H)))
-  (set-sb-hits! s hits)                                                      ; 后登记的先命中（菜单盖在行上）
+  (define gmenu
+    (and (sb-gmenu s)
+         (let* ([gw 210.0] [modes '(recent project workspace super)] [gh (+ 8.0 (* ITEM-H (length modes)))])
+           (apply ui-box #:dir 'column #:at (vector (- w PAD gw) (- HEAD-H 4.0)) #:w gw #:h gh #:fill '(0.16 0.17 0.20 1.0) #:stroke '(0.30 0.31 0.36 1.0)
+                  #:radius 7.0 #:hit (cons 'gmenu #t) #:pad (vector 4.0 4.0 4.0 4.0)
+                  (for/list ([m (in-list modes)])
+                    (ui-box #:dir 'stack #:h ITEM-H #:hit (cons 'group-by m)
+                            (and (equal? (sb-hover s) (cons 'gitem m)) (ui-box #:grow 1 #:fill '(0.22 0.30 0.48 1.0) #:radius 5.0))
+                            (ui-box #:dir 'row #:align 'center #:pad (vector 0.0 6.0 0.0 6.0)
+                                    (ui-text (string-append (if (eq? m (sb-gmode s)) "✓ " "   ") (t (string->symbol (format "sb.group-~a" m))))
+                                             #:font 'body #:color TEXT #:grow 1))))))))
+  ;; 拖行：光标旁边一块小标签（行的标题）
+  (define ghost
+    (and (sb-drag s)
+         (let* ([d (sb-drag s)] [se (findf (lambda (se) (equal? (key se) (vector-ref d 0))) ss)])
+           (ui-box #:at (vector (- (vector-ref d 1) x -11.0) (- (vector-ref d 2) y -5.0)) #:fill '(0.55 0.70 1.0 1.0) #:radius 6.0 #:pad 1.0
+                   (ui-box #:fill '(0.13 0.14 0.17 1.0) #:radius 5.0 #:pad (vector 4.0 8.0 4.0 8.0)
+                           (ui-text (if se (session-title se) "…") #:font 'small #:color TEXT #:fit? #f #:w (min 160.0 (text-block-width (lay (if se (session-title se) "…") 'small 1000.0 #f)))))))))
+  (define tree
+    (ui-box #:dir 'stack
+            (if (sb-translucent s)                                            ; 玻璃上：底由玻璃给，上面铺一层暗色保证字的对比度
+                (ui-box #:fill GLASS-SCRIM #:radius (sb-translucent s))
+                (ui-box #:fill '(0.11 0.11 0.13 1.0)))
+            (ui-box #:dir 'column
+                    head
+                    (apply ui-scroll 'list #:offset (sb-scroll s) (for/list ([se (in-list ss)]) (row-el se)))
+                    notice)
+            ghost menu gmenu))
+  (define-values (hits _regions scrolls) (render-view! rc dl tree x y w h scale))
+  (set-sb-scroll! s (vector-ref (hash-ref scrolls 'list) 0))
+  (set-sb-hits! s (reverse hits))                                            ; 后画的先命中（菜单盖在行上）
 ) ; end define sb-render!
 
 ;; 一行的菜单：→ (values 图标格 文字项)
@@ -351,7 +321,7 @@
          (vector 'info (t 'sb.m-info-short) #t "ℹ️" "I"))
    (list (vector 'open (t 'sb.m-open) (not current?) "↩")
          (vector 'fork (t 'sb.m-fork) (and current? (> msgs 0)) "")
-         (vector 'tests (t 'sb.m-tests) current? "⌘⇧T")                       ; 工作区测试流程面板（当前会话的工作目录）
+         (vector 'tests (t 'sb.m-tests) current? (key-hint 'tests-panel))                       ; 工作区测试流程面板（当前会话的工作目录）
          (vector 'sep)
          (vector 'copy-path (t 'sb.m-copy-path) #t "")
          (vector 'reveal (t 'sb.m-reveal) (and se (j se 'local #f) #t) "")
@@ -440,7 +410,7 @@
 (define (start-rename! s k)
   (define se (findf (lambda (se) (equal? (key se) k)) (sb-sessions s)))
   (define ed (make-editor))
-  (let ([tt (and se (j se 'title))]) (when (string? tt) (editor-insert! ed tt) (editor-command! ed 'selectAll:)))
+  (let ([tt (and se (j se 'title))]) (when (string? tt) (editor-insert! ed tt) (editor-command! ed 'select-all)))
   (set-sb-rename! s (cons k ed)))
 
 ;; 键盘焦点在会话行之间移动 d 行（标题行、分组行跳过；没有焦点 → 当前会话或第一行），滚到看得见；→ 新的键

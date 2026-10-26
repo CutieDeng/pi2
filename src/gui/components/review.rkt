@@ -7,14 +7,13 @@
 
 (require racket/list racket/string
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt" "../compute/changeset.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt" "../compute/changeset.rkt"
+         "../compute/view.rkt" "../compute/widgets.rkt")                ; 视图平面：元素树 → 布局 → drawlist + 命中
 
 (define WARN '(0.95 0.55 0.45 1.0))
 (define ADD '(0.55 0.85 0.62 1.0))                      ; 新增（新标题、归入的项目）
 (define LINK '(0.62 0.76 1.0 1.0))
-(define PAD 18.0)
 (define FOOT-H 52.0)
-(define BOX 15.0)
 
 (struct rv (rc [data #:mutable] [checked #:mutable] [scroll #:mutable] [hits #:mutable] [content-h #:mutable] [view-h #:mutable]))
 
@@ -43,111 +42,73 @@
     [("delete") (list (cons (t 'rv.c-delete) WARN))]
     [else (list (cons (format "~a" (j it 'op)) DIM))]))
 
-(define (checkbox! dl x y on? enabled?)
-  (drawlist-rect! dl x y BOX BOX 0.45 0.47 0.55 (if enabled? 1.0 0.5) #:radius 4.0)
-  (drawlist-rect! dl (+ x 1.5) (+ y 1.5) (- BOX 3.0) (- BOX 3.0) (if on? 0.30 0.12) (if on? 0.45 0.13) (if on? 0.80 0.16) 1.0 #:radius 3.0))
-
+;; 视图平面：模态卡片（compute/widgets.rkt）；头里是谁提议、原话、摘要、计数；正文按组列项；脚是按钮（固定在底部）
 (define (render! s dl x y w h scale)
-  (define rc (rv-rc s))
-  (define lay (rich-ctx-layout rc))
-  (define at (rich-ctx-atlas rc))
   (define d (rv-data s))
-  (define hits '())
-  (define (hit! kind payload hx hy hw hh) (set! hits (cons (vector kind payload hx hy hw hh) hits)))
-  (hit! 'outside #t x y w h)
-  (define cw (min 720.0 (- w 40.0)))
-  (define cx (+ x (/ (- w cw) 2)))
-  (define cy (+ y 24.0))
-  (define ch (- h 72.0))                                                    ; 底下留出状态行
-  (drawlist-rect! dl (- cx 1.0) (- cy 1.0) (+ cw 2.0) (+ ch 2.0) 0.30 0.31 0.36 1.0 #:radius 11.0)
-  (drawlist-rect! dl cx cy cw ch 0.12 0.12 0.15 1.0 #:radius 10.0)
-  (hit! 'panel #t cx cy cw ch)
-  (define inner (- cw (* 2 PAD)))
-  ;; 头：标题 + 状态 + ✕；谁提议、何时；用户原话；摘要；计数
-  (define title (lay (t 'rv.title (j d 'id "?") (t (case (j d 'state 'proposed) [(applied) 'rv.s-applied] [(undone) 'rv.s-undone] [(discarded) 'rv.s-discarded] [else 'rv.s-proposed]))) 'title (- inner 40.0) #f))
-  (paint-text! dl at title (+ cx PAD) (+ cy 14.0) TEXT #:scale scale)
-  (define xb (lay "✕" 'body 100.0 #f))
-  (define xx (- (+ cx cw) PAD (text-block-width xb) 6.0))
-  (paint-text! dl at xb (+ xx 3.0) (+ cy 14.0) DIM #:scale scale)
-  (hit! 'close #t (- xx 6.0) (+ cy 6.0) (+ (text-block-width xb) 18.0) 30.0)
-  (define (line! yy text style color) (define tb (lay text style inner #f)) (paint-text! dl at tb (+ cx PAD) yy color #:scale scale) (+ yy (text-block-height tb) 4.0))
-  (define y1 (line! (+ cy 14.0 (text-block-height title) 6.0) (t 'rv.meta (j d 'by "?") (j d 'when "")) 'small DIM))
-  (define y2 (if (non-empty-string? (j d 'request "")) (line! y1 (t 'rv.request (j d 'request "")) 'body TEXT) y1))
-  (define y3 (if (non-empty-string? (j d 'summary "")) (line! y2 (j d 'summary "") 'small DIM) y2))
   (define its (items s))
   (define on (rv-checked s))
   (define groups (changeset-groups its))
+  (define ed? (editable? s))
   (define counts (string-join (for/list ([g (in-list groups)])
                                 (format "~a ~a/~a" (group-label (first g) (second g))
                                         (length (filter (lambda (it) (memv (j it 'n) on)) (third g))) (length (third g))))
                               " · "))
-  (define y4 (line! (+ y3 2.0) counts 'small DIM-ON-ACCENT))
-  ;; 列表（裁剪 + 滚动）
-  (define by (+ y4 6.0))
-  (define bh (- (+ cy ch) by FOOT-H))
-  (set-rv-view-h! s bh)
-  (drawlist-set-clip! dl (vector cx by cw bh))
-  (define ed? (editable? s))
-  (define y-end
-    (for/fold ([yy (- by (rv-scroll s))]) ([g (in-list groups)])
+  (define head
+    (filter values
+            (list (para (t 'rv.meta (j d 'by "?") (j d 'when "")) #:font 'small #:color DIM)
+                  (and (non-empty-string? (j d 'request "")) (para (t 'rv.request (j d 'request "")) #:font 'body #:color TEXT))
+                  (and (non-empty-string? (j d 'summary "")) (para (j d 'summary "") #:font 'small #:color DIM))
+                  (ui-box #:pad (vector 2.0 0.0 0.0 0.0) (para counts #:font 'small #:color DIM-ON-ACCENT)))))
+  (define (item-el it)
+    (define ok? (selectable? it))
+    (define c? (and (memv (j it 'n) on) #t))
+    (define head-text (let ([hd (if (equal? (j it 'op) "new-project") (j it 'project "") (j it 'title (t 'sb.untitled)))]) (if (string? hd) hd "?")))
+    (define note (if ok? (j it 'reason #f) (format "~a~a" (t (case (j it 'status) [("stale") 'rv.st-stale] [("noop") 'rv.st-noop] [else 'rv.st-invalid]))
+                                                   (let ([w (j it 'why #f)]) (if (string? w) (format "（~a）" w) "")))))
+    (ui-box #:dir 'row #:align 'start #:pad (vector 3.0 0.0 7.0 10.0) #:hit (and ed? ok? (cons 'toggle (j it 'n)))
+            (and ed? (ui-box #:w 24.0 #:pad (vector 2.0 0.0 0.0 0.0) (checkbox c? ok?)))
+            (ui-box #:dir 'column #:grow 1 #:gap 2.0
+                    (apply ui-box #:dir 'row #:align 'start #:gap 8.0
+                           (ui-text head-text #:font 'body #:color (if ok? TEXT DIM) #:grow 1 #:strike? (equal? (j it 'op) "rename"))   ; 改名：旧标题画删除线
+                           (for/list ([p (in-list (change-parts it))])
+                             (ui-box #:pad (vector 2.0 0.0 0.0 0.0) (ui-text (car p) #:font 'small #:color (if ok? (cdr p) DIM) #:fit? #f))))
+                    (and (string? note) (non-empty-string? note) (ui-text note #:font 'small #:color (if ok? DIM WARN))))))
+  (define body
+    (for/list ([g (in-list groups)])
       (define gkey (cons (first g) (second g)))
       (define sel (filter selectable? (third g)))
       (define all-on? (and (pair? sel) (andmap (lambda (it) (memv (j it 'n) on)) sel)))
-      (drawlist-rect! dl (+ cx 8.0) yy (- cw 16.0) 26.0 0.17 0.18 0.22 1.0 #:radius 5.0)
-      (when ed? (checkbox! dl (+ cx PAD) (+ yy 5.5) all-on? (pair? sel)))
-      (define gl (lay (format "~a（~a）" (group-label (first g) (second g)) (length (third g))) 'body (- inner 30.0) #f))
-      (paint-text! dl at gl (+ cx PAD (if ed? 24.0 0.0)) (+ yy 4.0) TEXT #:scale scale)
-      (when (and ed? (pair? sel)) (hit! 'toggle-group gkey (+ cx 8.0) yy (- cw 16.0) 26.0))
-      (for/fold ([ry (+ yy 32.0)]) ([it (in-list (third g))])
-        (define ok? (selectable? it))
-        (define c? (and (memv (j it 'n) on) #t))
-        (define tx (+ cx PAD (if ed? 24.0 0.0)))
-        (when ed? (checkbox! dl (+ cx PAD) (+ ry 2.0) c? ok?))
-        ;; 第一行：会话标题（新建项目：项目名）+ 右边「变成什么」
-        (define parts (change-parts it))
-        (define pw (for/sum ([p (in-list parts)]) (+ 8.0 (text-block-width (lay (car p) 'small 1000.0 #f)))))
-        (define head (if (equal? (j it 'op) "new-project") (j it 'project "") (j it 'title (t 'sb.untitled))))
-        (define hb (fit-line lay (if (string? head) head "?") 'body (max 60.0 (- inner (- tx cx PAD) pw 8.0))))
-        (paint-text! dl at hb tx ry (if ok? TEXT DIM) #:scale scale)
-        (when (equal? (j it 'op) "rename")                                       ; 改名：旧标题画删除线
-          (drawlist-rect! dl tx (+ ry (/ (text-block-line-height hb) 2)) (text-block-width hb) 1.0 0.62 0.64 0.69 1.0))
-        (for/fold ([px (- (+ cx cw) PAD pw)]) ([p (in-list parts)])
-          (define pb (lay (car p) 'small 1000.0 #f))
-          (paint-text! dl at pb (+ px 8.0) (+ ry 2.0) (if ok? (cdr p) DIM) #:scale scale)
-          (+ px 8.0 (text-block-width pb)))
-        ;; 第二行：理由（灰）或不能做的原因（警告色）
-        (define note (if ok? (j it 'reason #f) (format "~a~a" (t (case (j it 'status) [("stale") 'rv.st-stale] [("noop") 'rv.st-noop] [else 'rv.st-invalid]))
-                                                       (let ([w (j it 'why #f)]) (if (string? w) (format "（~a）" w) "")))))
-        (define nh (if (and (string? note) (non-empty-string? note))
-                       (let ([nb (fit-line lay note 'small (- inner (- tx cx PAD)))])
-                         (paint-text! dl at nb tx (+ ry (text-block-line-height hb) 2.0) (if ok? DIM WARN) #:scale scale)
-                         (+ 2.0 (text-block-line-height nb)))
-                       0.0))
-        (define rh (+ (text-block-line-height hb) nh 10.0))
-        (when (and ed? ok?) (hit! 'toggle (j it 'n) (+ cx 8.0) (- ry 3.0) (- cw 16.0) rh))
-        (+ ry rh))))
-  (drawlist-set-clip! dl #f)
-  (set-rv-content-h! s (+ (- y-end by) (rv-scroll s)))
-  (set-rv-scroll! s (max 0.0 (min (rv-scroll s) (max 0.0 (- (rv-content-h s) bh)))))
-  ;; 脚：按钮
-  (define fy (+ cy ch (- FOOT-H) 10.0))
-  (drawlist-rect! dl (+ cx 10.0) (- fy 8.0) (- cw 20.0) 1.0 0.26 0.27 0.31 1.0)
+      (apply ui-box #:dir 'column #:pad (vector 0.0 0.0 0.0 0.0)
+             (ui-box #:dir 'row #:h 26.0 #:align 'center #:fill '(0.17 0.18 0.22 1.0) #:radius 5.0 #:pad (vector 0.0 10.0 0.0 10.0)
+                     #:hit (and ed? (pair? sel) (cons 'toggle-group gkey))
+                     (and ed? (ui-box #:w 24.0 (checkbox all-on? (pair? sel))))
+                     (ui-text (format "~a（~a）" (group-label (first g) (second g)) (length (third g))) #:font 'body #:color TEXT #:grow 1))
+             (ui-spacer #:h 6.0)
+             (for/list ([it (in-list (third g))]) (item-el it)))))
   (define buttons
     (case (j d 'state 'proposed)
       [(proposed) (list (list 'apply (t 'rv.apply (length on)) (pair? on) #t) (list 'discard (t 'rv.discard) #t #f))]
       [(applied) (list (list 'undo (t 'rv.undo) #t #f) (list 'close (t 'rv.close) #t #f))]
       [else (list (list 'close (t 'rv.close) #t #f))]))
-  (for/fold ([bx (- (+ cx cw) PAD)]) ([b (in-list (reverse buttons))])
-    (define tb (lay (second b) 'body 1000.0 #f))
-    (define bw (+ (text-block-width tb) 24.0))
-    (define x0 (- bx bw))
-    (define primary? (fourth b))
-    ;; 主按钮的蓝：0.25/0.40/0.75 上白字只有 4.42
-    (drawlist-rect! dl x0 fy bw 30.0 (if primary? 0.20 (car BUTTON)) (if primary? 0.33 (cadr BUTTON)) (if primary? 0.66 (caddr BUTTON)) (if (third b) 1.0 0.5) #:radius 6.0)
-    (paint-text! dl at tb (+ x0 12.0) (+ fy (/ (- 30.0 (text-block-line-height tb)) 2)) (if (third b) TEXT TEXT-OFF) #:scale scale)
-    (when (third b) (hit! (first b) #t x0 fy bw 30.0))
-    (- x0 10.0))
-  (set-rv-hits! s hits)
+  (define footer
+    (ui-box #:dir 'column #:h FOOT-H
+            (ui-box #:h 1.0 #:fill '(0.26 0.27 0.31 1.0))
+            (apply ui-box #:dir 'row #:gap 10.0 #:align 'center #:pad (vector 9.0 0.0 0.0 0.0)
+                   (ui-spacer #:grow 1)
+                   (for/list ([b (in-list buttons)])
+                     ;; 主按钮的蓝：0.25/0.40/0.75 上白字只有 4.42
+                     (button (second b) (and (third b) (cons (first b) #t)) #:font 'body #:h 30.0 #:color (if (third b) TEXT TEXT-OFF)
+                             #:fill (if (fourth b) (list 0.20 0.33 0.66 (if (third b) 1.0 0.5)) (list (car BUTTON) (cadr BUTTON) (caddr BUTTON) (if (third b) 1.0 0.5))))))))
+  (define-values (hits regions scrolls)
+    (render-view! (rv-rc s) dl
+                  (modal-card #:title (t 'rv.title (j d 'id "?") (t (case (j d 'state 'proposed) [(applied) 'rv.s-applied] [(undone) 'rv.s-undone] [(discarded) 'rv.s-discarded] [else 'rv.s-proposed])))
+                              #:head-extra head #:body body #:offset (rv-scroll s) #:max-w 720.0 #:top 24.0 #:bottom 48.0 #:footer footer #:body-gap 6.0)
+                  x y w h scale))
+  (define sc (hash-ref scrolls 'body))
+  (set-rv-scroll! s (vector-ref sc 0))
+  (set-rv-content-h! s (vector-ref sc 1))
+  (set-rv-view-h! s (vector-ref sc 2))
+  (set-rv-hits! s (reverse hits))                                         ; 找命中时从最上面（后画的）找起
 ) ; end define render!
 
 ;; → 动作或 #f（点在卡片上的空处）

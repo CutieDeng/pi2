@@ -1,6 +1,8 @@
 #lang racket/base
 ;; journal-format.rkt — GUI 操作日志的文件格式（G6）：一行一个 datum，write / read 往返。
-;;   首行：(pi2-gui-journal 1 头信息hash)          头信息：w h scale argv started
+;;   首行：(pi2-gui-journal 版本 头信息hash)        头信息：w h scale argv started
+;;   版本 2（2026-10-26）：窗口事件是逻辑的（keys.rkt：逻辑键 / primary 修饰键 / 中性编辑命令）；版本 1 是 macOS 原生的，
+;;     读出的头信息里带 'journal_version，拼装层据此在回放前升级（mac-keys.rkt mac-upgrade-event）
 ;;   其后：(毫秒 序号 kind payload)                kind ∈ start win core send script-send page frame error note
 ;;   script-send：冒烟脚本直接发给内核的请求（不是界面操作产生的，回放不比对）
 ;;   page：对话区按视口发的请求（items / item / index_summary / select_lines；回放不比对）
@@ -9,7 +11,7 @@
 
 (require racket/list racket/string)
 
-(define JOURNAL-VERSION 1)
+(define JOURNAL-VERSION 2)
 
 (define (journal-header-datum header) (list 'pi2-gui-journal JOURNAL-VERSION header))
 
@@ -27,7 +29,7 @@
             (if (or (eof-object? d) (not (and (list? d) (= (length d) 4))))
                 (reverse acc)
                 (loop (cons d acc)))))
-        (values (third head) recs))))
+        (values (let ([h (third head)]) (if (hash? h) (hash-set h 'journal_version (cadr head)) h)) recs))))
 ) ; end define read-journal
 
 ;; 一条记录的单行摘要（调试面板 / 打印）

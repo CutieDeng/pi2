@@ -24,6 +24,10 @@
          "../compute/event.rkt" "../compute/drawlist.rkt" "../compute/png.rkt" "../compute/text-backend.rkt"
          "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt" "../compute/fold.rkt" "../compute/editor.rkt"
          "../compute/mac-objc.rkt" "../compute/mac-coretext.rkt" "../compute/mac-inputsource.rkt"
+         "../compute/keymap.rkt" "../compute/mac-keys.rkt"   ; 键位表；旧日志升级（mac-upgrade-event）
+         "../compute/platform.rkt"                            ; 能力、平台请求
+         "../compute/gesture.rkt"                             ; 交互识别（按下 / 滚轮 / 横扫 / 拖起；常数来自平台交互配置）
+         "../compute/softraster.rkt" "../compute/conformance.rkt" "../compute/atlas.rkt"   ; 渲染器一致性（--conformance）
          "../components/mac-renderer.rkt" "../components/mac-window.rkt" "../components/text-system.rkt"
          "../components/input.rkt" "../components/transcript.rkt" "../components/kernels.rkt"
          "../components/sidebar.rkt" "../components/model-picker.rkt"
@@ -270,6 +274,59 @@
     (first c))
 ) ; end define selftest
 
+;; ---------------------------------------------------------------- --conformance
+;; 渲染器一致性（GUI 元数据平面 4）：同一组 drawlist 交给本机渲染器（Metal）与参考光栅器（compute/softraster.rkt），逐像素比。
+;; 参考光栅器在哪个平台都能跑——新平台的渲染器拿它对照，不需要 Mac。阈值见 compute/conformance.rkt。
+(define (conformance)
+  (define env (configure 'offscreen))
+  (define g (env-ref env gpu-port))
+  (define tl (env-ref env text-layout))
+  (define cases '())
+  (define (case! name pw ph scale build)
+    (define dl (make-drawlist))
+    (build dl)
+    (set! cases (cons (list name dl pw ph scale) cases)))
+  ;; 1. 矩形：不透明 / 半透明 / 圆角 0 6 30 / 小数坐标 / 很小的矩形，scale 1 与 2
+  (for ([scale (in-list '(1.0 2.0))])
+    (case! (format "rects@~a" scale) (inexact->exact (round (* 300 scale))) (inexact->exact (round (* 160 scale))) scale
+           (lambda (dl)
+             (drawlist-rect! dl 10.25 10.5 100 50 1.0 0.2 0.1 1.0)
+             (drawlist-rect! dl 130 10 80 80 0.1 0.8 0.3 0.5 #:radius 30.0)
+             (drawlist-rect! dl 220.5 10.25 60 40 0.3 0.4 0.9 0.8 #:radius 6.0)
+             (drawlist-rect! dl 10 80 1 1 1.0 1.0 1.0 1.0)
+             (drawlist-rect! dl 20.5 80.5 3.5 1.5 1.0 1.0 0.0 1.0)
+             (drawlist-rect! dl 40 70 200 60 0.9 0.9 0.9 0.25 #:radius 12.0))))
+  ;; 2. 裁剪段 + 挖洞
+  (case! "clip+hole" 300 200 1.0
+         (lambda (dl)
+           (drawlist-set-clip! dl (vector 0.0 0.0 100.5 200.0))
+           (drawlist-rect! dl 0 150 200 40 0.0 0.0 1.0 1.0)
+           (drawlist-set-clip! dl #f)
+           (drawlist-rect! dl 250 150 20 20 0.0 0.0 1.0 1.0)
+           (drawlist-hole! dl 200 20 80 80 1.0 1.0 1.0 1.0 #:radius 30.0)))
+  ;; 3. 文字：拉丁 + CJK（回退）+ 彩色 emoji，scale 2（单色字形最近邻、彩色字形）
+  (define tb (tl 'layout "Hello 你好 🚀 ⌘⇧T" 'title 380.0))
+  (define tdl (make-drawlist))
+  (tl 'build-frame! tdl (lambda () (paint-text! tdl (tl 'atlas) tb 10.0 10.0 '(0.9 0.91 0.93 1.0) #:scale 2.0)))
+  (set! cases (cons (list "text@2" tdl 800 120 2.0) cases))
+  ;; 4. 界面里常见的组合：菜单底板 + 描边 + 选中行 + 芯片
+  (case! "ui-chips@2" 640 240 2.0
+         (lambda (dl)
+           (drawlist-rect! dl 9 9 302 102 0.26 0.27 0.32 1.0 #:radius 9.0)
+           (drawlist-rect! dl 10 10 300 100 0.14 0.15 0.18 1.0 #:radius 8.0)
+           (drawlist-rect! dl 18 20 200 26 0.20 0.28 0.45 1.0 #:radius 5.0)
+           (for ([i 6]) (drawlist-rect! dl (+ 18 (* i 48)) 60 42 20 0.18 0.30 0.24 0.9 #:radius 5.0))))
+  (upload-atlas! g tl)
+  (define at (tl 'atlas))
+  (for/list ([c (in-list (reverse cases))])
+    (define-values (name dl pw ph scale) (apply values c))
+    (define metal (g 'render-offscreen dl CLEAR pw ph scale))
+    (define soft (rasterize-drawlist dl pw ph scale CLEAR #:atlas (cons (atlas-buf at) (atlas-size at))))
+    (define-values (mx frac) (image-diff metal soft CONFORMANCE-CHANNEL-TOLERANCE))
+    (printf "CONFORMANCE ~a: ~ax~a max-diff ~a, pixels over ~a: ~a%\n" name pw ph mx CONFORMANCE-CHANNEL-TOLERANCE
+            (/ (round (* 10000 frac)) 100.0))
+    (list name mx frac)))
+
 ;; ---------------------------------------------------------------- --snapshot
 
 ;; 典型一屏：用户消息（带报错栈 chip）→ 助手 → 工具卡片（42 行输出，折叠）→ 助手 → 权限卡片（待答）；
@@ -443,7 +500,7 @@
   (if (and (string? s) (regexp-match? #rx"^⟦secret:[0-9a-f]+⟧$" s)) s (secret-text s)))
 
 (define (secret-input-event? ev)
-  (or (ev:text? ev) (ev:marked? ev) (ev:paste? ev) (and (ev:key? ev) (not (memq 'cmd (ev:key-mods ev))))))
+  (or (ev:text? ev) (ev:marked? ev) (ev:paste? ev) (and (ev:key? ev) (not (memq 'primary (ev:key-mods ev))))))
 
 ;; 界面语言设置 → 语言：'system 看系统首选语言列表
 (define (resolve-lang setting)
@@ -465,7 +522,14 @@
    (lambda (name reason) (eprintf "pi2 GUI abort: uncaught NSException ~a: ~a\n" name reason)))
   ;; 回放：日志的 'start 记录给出录制时的窗口尺寸
   (define-values (replay-header replay-records)
-    (if replay-path (read-journal replay-path) (values #f '())))
+    (if replay-path
+        (let-values ([(h recs) (read-journal replay-path)])
+          ;; 版本 1 的日志（2026-10-26 前）：窗口事件是 macOS 原生的 → 先升级成逻辑事件（键、primary、中性命令）
+          (values h (if (and (hash? h) (eqv? (hash-ref h 'journal_version 1) 1))
+                        (for/list ([r (in-list recs)])
+                          (if (eq? (third r) 'win) (list (first r) (second r) 'win (mac-upgrade-event (fourth r))) r))
+                        recs)))
+        (values #f '())))
   (define replay-start (for/first ([r (in-list replay-records)] #:when (eq? (third r) 'start)) (fourth r)))
   ;; 界面语言影响文字宽度 → 命中位置：回放用录制时的语言
   (let ([l (and replay-start (hash-ref replay-start 'lang #f))])
@@ -490,6 +554,11 @@
   (define rs (and replay-path (env-ref env replay-source)))
   (define g (env-ref env gpu-port))
   (define win (env-ref env window-port))
+  (define caps (win 'caps))                            ; 平台能力（compute/platform.rkt）：只按能力分支，不按平台名
+  ;; 交互配置（compute/interaction.rkt）：拼装层选了 mac-* 组件，所以用 macOS 的配置；识别常数（滚轮一格、横扫 / 拖起阈值）从那里来
+  (define gc (consts-for 'macos))
+  ;; 平台状态：已执行的（初值里玻璃位置是哨兵——第一帧一定发一次，#f 也发：启动时把玻璃面板藏起来）
+  (define plat-applied (hash-set STATE-DEFAULTS 'glass-rect 'unset))
   (define clip (env-ref env clipboard))
   (define wi (env-ref env window-input))
   (define tl (env-ref env text-layout))
@@ -605,9 +674,7 @@
   (define material (let ([m (gsetting 'sidebar-material 'glass)]) (if (memq m '(glass desktop opaque)) m 'glass)))
   (define replay-glass? (and replay-start (hash-ref replay-start 'glass #f) #t))   ; 录制时是否用了液态玻璃（影响侧栏排版 → 命中位置）
   (define sdl (make-drawlist))
-  (define last-glass-rect 'none)
   (define last-grect #f)                                ; 这一帧的玻璃位置（截图用；#f = 没用玻璃）
-  (define window-transparent? #f)
   (define test-under #f)                                ; 显示检查：透出桌面时侧栏那一列下面画的颜色（截图截不到窗口后面的东西，见 §28）
   ;; 逐帧的显示检查（冒烟流程里、或 PI2_LINT=1）：每 3 帧查一次对比度，不合格的按位置 + 颜色去重，退出时打印
   (define lint-active? #f)
@@ -659,7 +726,6 @@
   (define toast #f)                                    ; (cons 文本 截止毫秒)：状态行短暂提示
   ;; 侧栏少操作（design-workspace.md §11 A）：键盘焦点在侧栏（单键操作，按键不进输入法）；可撤销的会话操作；底部提示条
   (define sidebar-focus? #f)
-  (define text-input-on? #t)
   (define undo-stack '())                              ; (listof (cons 说明 撤销的 thunk))，最近的在前，最多 30 个
   (define notice-until #f)
   (define last-session-op 0.0)                          ; 最近一次可撤销的会话操作 / 文字编辑的时刻：⌘Z 撤销最近的那一种
@@ -786,25 +852,30 @@
              (tr 'turns) (if (busy?) (t 'app.busy) (t 'app.idle)))
           (t 'app.dbg-wire (or last-wire "?"))))
   (define (caret-on?) (even? (inexact->exact (floor (/ (- (current-inexact-milliseconds) last-edit) BLINK-MS)))))
+  ;; 平台请求（GUI 元数据平面 2）：想要的状态（键的子集）→ 与已执行的比较 → 变了的交给窗口 'apply!，并记进操作日志（kind 'plat）。
+  ;; 材质还要告诉渲染层（主层是否不透明）
+  (define (apply-plat! wanted)
+    (define reqs (state-diff plat-applied wanted))
+    (unless (null? reqs)
+      (win 'apply! reqs)
+      (for ([r (in-list reqs)] #:when (eq? (req-key r) 'material)) (g 'set-opaque! (eq? (req-value r) 'opaque)))
+      (jr 'record! 'plat reqs)
+      (set! plat-applied (state-apply plat-applied reqs))))
   (define (render!)
     (define rt0 (current-inexact-milliseconds))
     (jr 'record! 'frame frames)
     ;; 侧栏有键盘焦点（且不在改名）→ 按键不进输入法（单键操作）
-    (let ([on? (or (not (or sidebar-focus? (sbp 'context-open?))) (sbp 'editing?) (svp 'open?))])
-      (unless (eq? on? text-input-on?) (set! text-input-on? on?) (win 'set-text-input-enabled! on?)))                       ; 回放按重绘分批：命中区在重绘时更新
+    (apply-plat! (hasheq 'text-input (and (or (not (or sidebar-focus? (sbp 'context-open?))) (sbp 'editing?) (svp 'open?)) #t)))   ; 回放按重绘分批：命中区在重绘时更新
     (mdp 'begin-frame!)
     ;; 液态玻璃：侧栏显示且材质是玻璃 → 侧栏画进覆盖层的 drawlist，玻璃面板放到侧栏的位置。
     ;; 覆盖层在主层上面：设置页 / 调试面板（画在主层、可能盖住侧栏）打开时不用玻璃
     (define sb-shown? (let-values ([(_x sbw _m _w _d) (columns)]) (> sbw 0.0)))
-    (define glass-now? (and (memq material '(glass desktop)) (win 'glass?) sb-shown? (not (svp 'open?)) (not (dv 'open?)) #t))
+    (define glass-now? (and (memq material '(glass desktop)) (cap caps 'glass) sb-shown? (not (svp 'open?)) (not (dv 'open?)) #t))
     (define desktop-now? (and glass-now? (eq? material 'desktop)))
     (define glass-layout? (and sb-shown? (if replay-path replay-glass? (and glass-now? (not desktop-now?)))))   ; 回放：按录制时的排
     (sbp 'set-translucent! (or glass-layout? desktop-now?) (if glass-layout? GLASS-RADIUS 0.0))
     ;; 两种玻璃都透出桌面：窗口透明、主层清成透明，玻璃那块留洞（面板：内缩圆角；整列：侧栏那一列）
-    (unless (eq? glass-now? window-transparent?)
-      (set! window-transparent? glass-now?)
-      (win 'set-transparent! glass-now?)
-      (g 'set-opaque! (not glass-now?)))
+    (apply-plat! (hasheq 'material (if glass-now? 'transparent 'opaque)))
     (define grect (and glass-now? (let-values ([(sbx sbw _m _w _d) (columns)])
                                     (if desktop-now?
                                         (vector sbx 0.0 sbw h 0.0)
@@ -815,7 +886,7 @@
                                                   #:sidebar-dl (and glass-now? sdl) #:glass-layout? glass-layout? #:hole grect #:under (and glass-now? test-under)
                                                   #:debug dv #:debug-stats (debug-stats) #:settings svp #:inspector insp #:review rvp #:tests tpp)))
     (set! last-grect grect)
-    (unless (equal? grect last-glass-rect) (set! last-glass-rect grect) (win 'set-glass-rect! (and grect (for/vector ([v grect]) (* v zoom)))))
+    (apply-plat! (hasheq 'glass-rect (and grect (for/vector ([v grect]) (* v zoom)))))
     (for ([rq (in-list (tr 'wanted))]) (page-send! rq))   ; 对话区要的翻页（视口附近没装载的记录）
     (define m0 (objc-msg-count))
     (upload-atlas! g tl mdp)
@@ -829,7 +900,7 @@
     (define-values (cr cur) (cond [(svp 'editing?) (values (svp 'caret-rect) (editor-cursor (svp 'editor)))]
                                   [(sbp 'editing?) (values (sbp 'caret-rect) (editor-cursor (sbp 'editor)))]   ; 侧栏改名
                                   [else (values (ib 'caret-rect) (editor-cursor e))]))
-    (when cr (win 'set-text-input-state! (for/vector ([v (in-vector cr)]) (* v zoom)) cur)))
+    (when cr (apply-plat! (hasheq 'caret (vector (* zoom (vector-ref cr 0)) (* zoom (vector-ref cr 1)) (* zoom (vector-ref cr 2)) (* zoom (vector-ref cr 3)) cur)))))
   (define (snapshot-now! path)
     (define pw (inexact->exact (round (* w scale))))
     (define ph (inexact->exact (round (* h scale))))
@@ -1073,28 +1144,62 @@
   ;; 侧栏有键盘焦点时的按键（原始按键：输入法已关）→ 处理了吗。↑↓ 移动焦点行，回车打开，P 置顶 / 取消，E 归档 / 取消，
   ;; R 改名，I 信息，⌫ 删除（可撤销），Esc 先关菜单、再把焦点还给输入框；别的键：焦点还给输入框（这个键不进输入框）
   (define (sidebar-key! ev)
-    (define code (ev:key-code ev))
-    (define ch (string-downcase (or (ev:key-chars ev) "")))
+    (define mods (ev:key-mods ev))
+    (define act (keymap-lookup APP-KEYMAP 'sidebar-focus (ev:key-key ev) mods))   ; 键位表（compute/keymap.rkt）
     (define menu-k (sbp 'context-key))                                           ; 菜单开着：单键作用于菜单的那一行，并关菜单
     (define k (or menu-k (sbp 'focus)))
-    (when (and menu-k (not (memv code '(53 126 125))) (not (memq 'cmd (ev:key-mods ev)))) (sbp 'close-context!))
+    (when (and menu-k (not (memq act '(sidebar-escape focus-up focus-down))) (not (memq 'primary mods))) (sbp 'close-context!))
     (define row (and k (findf (lambda (se) (equal? (hash-ref se 'key (hash-ref se 'path #f)) k)) (sbp 'sessions))))
     (cond
-      [(memq 'cmd (ev:key-mods ev)) #f]                                            ; ⌘ 组合键照常（⌘Z 走菜单 → undo:）
-      [(eqv? code 53) (if (sbp 'context-open?) (sbp 'close-context!) (set-sidebar-focus! #f)) #t]
-      [(and menu-k (memv code '(126 125))) #t]                                     ; 菜单开着：上下键不动
-      [(eqv? code 126) (sbp 'move-focus! -1) #t]
-      [(eqv? code 125) (sbp 'move-focus! 1) #t]
+      [(memq 'primary mods) #f]                                                    ; primary 组合键照常（⌘Z 走菜单 → undo）
+      [(eq? act 'sidebar-escape) (if (sbp 'context-open?) (sbp 'close-context!) (set-sidebar-focus! #f)) #t]
+      [(and menu-k (memq act '(focus-up focus-down))) #t]                          ; 菜单开着：上下键不动
+      [(eq? act 'focus-up) (sbp 'move-focus! -1) #t]
+      [(eq? act 'focus-down) (sbp 'move-focus! 1) #t]
       [(not row) (set-sidebar-focus! #f) #t]
-      [(eqv? code 36) (session-action! (list 'resume k)) (set-sidebar-focus! #f) #t]   ; 打开 → 回输入框接着打字
-      [(memv code '(51 117)) (session-action! (list 'delete k)) #t]
-      [(and (member ch '("p" "e")) (eq? (hash-ref row 'ephemeral #f) #t)) #t]       ; 临时会话不能置顶 / 归档（同菜单）
-      [(equal? ch "p") (session-action! (list (if (hash-ref row 'pinned #f) 'unpin 'pin) k)) #t]
-      [(equal? ch "e") (session-action! (list (if (hash-ref row 'archived #f) 'unarchive 'archive) k)) #t]
-      [(equal? ch "r") (sbp 'start-rename! k) #t]
-      [(equal? ch "i") (session-action! (list 'info k)) #t]
+      [(eq? act 'open) (session-action! (list 'resume k)) (set-sidebar-focus! #f) #t]   ; 打开 → 回输入框接着打字
+      [(eq? act 'delete) (session-action! (list 'delete k)) #t]
+      [(and (memq act '(pin archive)) (eq? (hash-ref row 'ephemeral #f) #t)) #t]    ; 临时会话不能置顶 / 归档（同菜单）
+      [(eq? act 'pin) (session-action! (list (if (hash-ref row 'pinned #f) 'unpin 'pin) k)) #t]
+      [(eq? act 'archive) (session-action! (list (if (hash-ref row 'archived #f) 'unarchive 'archive) k)) #t]
+      [(eq? act 'rename) (sbp 'start-rename! k) #t]
+      [(eq? act 'info) (session-action! (list 'info k)) #t]
       [menu-k #t]                                                                  ; 菜单开着时别的键：只关菜单
       [else (set-sidebar-focus! #f) #t]))
+  ;; 全局快捷键：键位表（compute/keymap.rkt，逻辑组合键）→ 动作；动作做不了（如设置页开着）返回 #f → 照常往下分派
+  (define (global-key! ev)
+    (case (keymap-lookup APP-KEYMAP 'global (ev:key-key ev) (ev:key-mods ev))
+      [(sidebar-keyboard)                                                          ; 侧栏键盘模式（从当前会话开始）开 / 关
+       (and (not (svp 'open?))
+            (begin (if sidebar-focus?
+                       (set-sidebar-focus! #f)
+                       (set-sidebar-focus! (let ([c (findf (lambda (se) (hash-ref se 'current #f)) (sbp 'sessions))])
+                                             (and c (hash-ref c 'key (hash-ref c 'path #f))))))
+                   #t))]
+      [(debug-panel) (dv 'toggle!) #t]
+      [(tests-panel) (and (not (svp 'open?)) (begin (if (tpp 'open?) (tests-action! (list 'close)) (open-tests!)) #t))]
+      [(settings) (if (svp 'open?) (svp 'close!) (open-settings!)) #t]
+      [(paste-secret)
+       ;; 以密钥粘贴（不看格式）。日志在这条按键之后补记句柄，回放时据此插 chip（回放没有剪贴板）
+       (and (not (svp 'open?))
+            (let ([txt (clip 'get)])
+              (when (and (string? txt) (not (string=? (string-trim txt) "")))
+                (insert-secret-chip! txt #f)
+                (jr 'record! 'win (ev:secret (secret-or-handle (string-trim txt)) "chat")))
+              #t))]
+      [(mark-secret)
+       ;; 选中的文字 → 密钥 chip；操作日志里整段出现的原文换成句柄（逐字手打的那些按键补不回来）
+       (and (not (svp 'open?))
+            (let ([r (editor-secret-selection! e)])
+              (cond [r (jr 'redact! (string-trim (cdr r)) (secret-text (string-trim (cdr r))))
+                       (set! toast (cons (t 'app.secret-marked) (+ (current-inexact-milliseconds) 2500.0)))]
+                    [else (set! toast (cons (t 'app.secret-select-hint) (+ (current-inexact-milliseconds) 2500.0)))])
+              #t))]
+      [(toggle-sidebar) (set! sidebar? (not sidebar?)) #t]
+      [(zoom-in) (set-zoom! (zoom-step zoom 1)) #t]
+      [(zoom-out) (set-zoom! (zoom-step zoom -1)) #t]
+      [(zoom-reset) (set-zoom! 1.0) #t]
+      [else #f]))
   ;; ---- 变更清单（design-workspace.md §11.7 C）：agent 提议 → 记进目录 → 审阅面板 → 应用 / 放弃 / 撤销；面板开着时侧栏预览结果
   (define last-prompts (make-hash))                    ; 主机 → 最近一次发的提示（清单里的「你说」）
   (define review-id #f)                                ; 审阅面板开着的清单
@@ -1417,15 +1522,14 @@
       [(sbp 'swiping?)
        (define a (sbp 'swipe! #f dx (if (eq? ph 'ended) 'ended 'changed)))
        (when a (session-action! a))]
-      [(and (ev:scroll-precise? ev) (eq? ph 'began)) (set! swipe-cand (vector (sbp 'row-at sx sy) 0.0 0.0)) (sbp 'scroll! dy)]
-      [(and swipe-cand (eq? ph 'changed))
-       (define c (vector (vector-ref swipe-cand 0) (+ (vector-ref swipe-cand 1) dx) (+ (vector-ref swipe-cand 2) dy)))
-       (cond [(and (string? (vector-ref c 0)) (not (regexp-match? #rx"^\u0002" (vector-ref c 0)))
-                   (> (abs (vector-ref c 1)) 6.0) (> (abs (vector-ref c 1)) (* 1.5 (abs (vector-ref c 2)))))
-              (set! swipe-cand #f) (sbp 'swipe! (vector-ref c 0) 0.0 'began) (sbp 'swipe! #f (vector-ref c 1) 'changed)]
-             [(> (abs (vector-ref c 2)) 6.0) (set! swipe-cand #f) (sbp 'scroll! dy)]
-             [else (set! swipe-cand c) (sbp 'scroll! dy)])]
-      [else (when (eq? ph 'ended) (set! swipe-cand #f)) (sbp 'scroll! dy)]))
+      [else
+       ;; 横扫识别（compute/gesture.rkt）：began 时记下指针下可横扫的行（会话行；分组行不行）
+       (define row (and (ev:scroll-precise? ev) (eq? ph 'began)
+                        (let ([k (sbp 'row-at sx sy)]) (and (string? k) (not (regexp-match? #rx"^\u0002" k)) k))))
+       (define-values (cand r) (swipe-step gc swipe-cand ph (ev:scroll-precise? ev) row dx dy))
+       (set! swipe-cand cand)
+       (cond [(pair? r) (sbp 'swipe! (cadr r) 0.0 'began) (sbp 'swipe! #f (caddr r) 'changed)]
+             [else (sbp 'scroll! dy)])]))
   ;; 拖行：按住行、移动 > 6 point → 拖；松手在分组行上 → 置顶（「置顶」段）/ 归档（「已归档」）/ 归入项目（按项目分组时的项目组）；可撤销
   (define drag-cand #f)                                 ; #f | (vector 行键 x y)
   (define (drop-action! k dest)                          ; dest：分组行的键（不叫 target：那是「键 → 主机 + 路径」的函数）
@@ -1743,19 +1847,19 @@
     (define fe (svp 'editor))
     (cond
       [(not fe)
-       (when (and (ev:command? ev) (eq? (ev:command-name ev) 'cancelOperation:)) (svp 'close!))]
-      [(ev:secret? ev) (editor-command! fe 'selectAll:) (editor-insert! fe (ev:secret-text ev))]   ; 回放：句柄填进输入框
+       (when (and (ev:command? ev) (eq? (ev:command-name ev) 'cancel)) (svp 'close!))]
+      [(ev:secret? ev) (editor-command! fe 'select-all) (editor-insert! fe (ev:secret-text ev))]   ; 回放：句柄填进输入框
       [(ev:text? ev) (editor-insert! fe (ev:text-str ev))]
       [(ev:marked? ev) (if (string=? (ev:marked-str ev) "") (editor-unmark! fe) (editor-set-marked! fe (ev:marked-str ev) (ev:marked-sel-start ev)))]
       [(ev:paste? ev) (when (ev:paste-text ev) (editor-insert! fe (string-trim (ev:paste-text ev))))]   ; 不折叠成 chip
       [(ev:command? ev)
        (case (ev:command-name ev)
-         [(insertNewline:) (if (and (svp 'multiline?) (or (memq 'shift last-mods) (memq 'alt last-mods)))
+         [(insert-newline) (if (and (svp 'multiline?) (or (memq 'shift last-mods) (memq 'alt last-mods)))
                                (editor-insert! fe "\n")                                   ; ⇧Enter：多行输入里换行
                                (let ([a (svp 'submit!)]) (when a (settings-action! a))))]
-         [(insertNewlineIgnoringFieldEditor: insertLineBreak:) (when (svp 'multiline?) (editor-insert! fe "\n"))]
-         [(cancelOperation:) (svp 'cancel-edit!)]
-         [(copy: cut:) (unless (svp 'secret?) (editor-command! fe (ev:command-name ev)))]   ; key 不进剪贴板
+         [(insert-line-break) (when (svp 'multiline?) (editor-insert! fe "\n"))]
+         [(cancel) (svp 'cancel-edit!)]
+         [(copy cut) (unless (svp 'secret?) (editor-command! fe (ev:command-name ev)))]   ; key 不进剪贴板
          [else (editor-command! fe (ev:command-name ev))])])
     #t)
   ;; 侧栏行上的改名输入框
@@ -1767,26 +1871,26 @@
       [(ev:paste? ev) (when (ev:paste-text ev) (editor-insert! fe (regexp-replace* #rx"[\r\n\t]+" (ev:paste-text ev) " ")))]
       [(ev:command? ev)
        (case (ev:command-name ev)
-         [(insertNewline:) (let ([a (sbp 'submit!)]) (when a (session-action! a)))]
-         [(cancelOperation:) (sbp 'cancel-edit!)]
+         [(insert-newline) (let ([a (sbp 'submit!)]) (when a (session-action! a)))]
+         [(cancel) (sbp 'cancel-edit!)]
          [else (editor-command! fe (ev:command-name ev))])]
       [else (void)])
     #t)
   ;; 窗口编辑事件 → 编辑器 / 内核
   (define (handle-edit! ev)
     (set! last-edit (current-inexact-milliseconds))
-    (unless (and (ev:command? ev) (memq (ev:command-name ev) '(undo: redo:))) (set! last-text-op (current-inexact-milliseconds)))
+    (unless (and (ev:command? ev) (memq (ev:command-name ev) '(undo redo))) (set! last-text-op (current-inexact-milliseconds)))
     (cond
       ;; 设置页开着：键盘归它（输入框在编辑 → 编辑器；否则只认 Esc 关闭）
       [(svp 'open?) (settings-edit! ev)]
       [(sbp 'editing?) (sidebar-edit! ev)]                                        ; 侧栏改名
       ;; ⌘Z：侧栏有焦点，或最近的是会话操作（提示条还在、之后没打过字）→ 撤销会话操作；否则撤销文字
-      [(and (ev:command? ev) (eq? (ev:command-name ev) 'undo:) (pair? undo-stack)
+      [(and (ev:command? ev) (eq? (ev:command-name ev) 'undo) (pair? undo-stack)
             (or sidebar-focus? (and notice-until (> last-session-op last-text-op))))
        (undo!)]
-      [(and (insp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancelOperation:)) (insp 'close!)]   ; Esc：关信息面板
-      [(and (rvp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancelOperation:)) (review-action! (list 'close))]   ; Esc：关审阅面板
-      [(and (tpp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancelOperation:)) (tests-action! (list 'close))]    ; Esc：关测试面板
+      [(and (insp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancel)) (insp 'close!)]   ; Esc：关信息面板
+      [(and (rvp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancel)) (review-action! (list 'close))]   ; Esc：关审阅面板
+      [(and (tpp 'open?) (ev:command? ev) (eq? (ev:command-name ev) 'cancel)) (tests-action! (list 'close))]    ; Esc：关测试面板
       [(ev:text? ev) (editor-insert! e (ev:text-str ev)) (set! ime-log (cons (list 'text (ev:text-str ev)) ime-log))]
       [(ev:marked? ev)
        (set! ime-log (cons (list 'marked (ev:marked-str ev)) ime-log))
@@ -1800,28 +1904,28 @@
       [(ev:command? ev)
        (define c (ev:command-name ev))
        (case c
-         [(insertNewline:) (if (or (memq 'shift last-mods) (memq 'alt last-mods)) (editor-insert! e "\n") (submit!))]
-         [(moveUp: moveUpAndModifySelection:)
-          (when (eq? 'top (ib 'move-vertical! -1 (eq? c 'moveUpAndModifySelection:))) (editor-history-prev! e))]
-         [(moveDown: moveDownAndModifySelection:)
-          (when (eq? 'bottom (ib 'move-vertical! 1 (eq? c 'moveDownAndModifySelection:))) (editor-history-next! e))]
+         [(insert-newline) (if (or (memq 'shift last-mods) (memq 'alt last-mods)) (editor-insert! e "\n") (submit!))]
+         [(move-up select-up)
+          (when (eq? 'top (ib 'move-vertical! -1 (eq? c 'select-up))) (editor-history-prev! e))]
+         [(move-down select-down)
+          (when (eq? 'bottom (ib 'move-vertical! 1 (eq? c 'select-down))) (editor-history-next! e))]
          [else
           ;; ⌘C：对话区有选区时复制对话区（按看到的文字），否则交给编辑器
-          (define tsel (and (eq? c 'copy:) (tr 'selection-text)))
-          (define menu-esc? (and (eq? c 'cancelOperation:) (or (mpp 'open?) (sbp 'context-open?))))
+          (define tsel (and (eq? c 'copy) (tr 'selection-text)))
+          (define menu-esc? (and (eq? c 'cancel) (or (mpp 'open?) (sbp 'context-open?))))
           (when menu-esc? (mpp 'close!) (sbp 'close-context!))                          ; Esc：先关菜单（模型菜单 / 侧栏上下文菜单）
           (define r (cond [menu-esc? 'handled] [tsel (cons 'copy tsel)] [else (editor-command! e c)]))
           (cond
             [(and (pair? r) (eq? (car r) 'copy))
              (clip 'set! (cdr r))
              (when tsel (set! toast (cons (t 'app.copied (string-length tsel)) (+ (current-inexact-milliseconds) 1500.0))))]
-            [(and (eq? r 'ignored) (eq? c 'cancelOperation:)) (interrupt!)])])])     ; Esc：无可取消的编辑状态时停止当前轮
+            [(and (eq? r 'ignored) (eq? c 'cancel)) (interrupt!)])])])     ; Esc：无可取消的编辑状态时停止当前轮
     #t)
   ;; P5：拖动缩放时 AppKit 在嵌套 run loop 里回调 windowDidResize:，这里同步重绘一帧（内核在独立 place，不受影响）
   (win 'on-live-resize! (lambda (nw nh ns) (apply-size! nw nh ns) (render!)))
   (apply-size! w h scale)
   (jr 'record! 'start (hasheq 'w pw 'h ph 'scale ps 'zoom zoom 'lang (symbol->string (current-lang))
-                              'glass (and (eq? material 'glass) (win 'glass?) #t)   ; 内缩排版（透出桌面是整列，与不透明同排）
+                              'glass (and (eq? material 'glass) (cap caps 'glass) #t)   ; 内缩排版（透出桌面是整列，与不透明同排）
                               'catalog (catalog-snapshot cat)                        ; 目录的当前状态（置顶 / 归档影响侧栏的行 → 命中）
                               'memory (memory-snapshot mem)                          ; 记忆库的当前状态（推给内核的视图要一致）
                               'host-index (hix-snapshot hix) 'host-index-active hix-active?   ; 项目描述库（同上）；录制时扫不扫（回放照做）
@@ -1834,9 +1938,9 @@
   (define synth-check #f)
   (define ime-query #f)
   (define paste-path #f)                               ; menu：真 ⌘V 经 Edit 菜单；direct：无 key 窗口时直接投递
-  (define (post-text! s) (for ([c (in-string s)]) (wi 'post-key! (string c) 0)))
-  (define (enter!) (wi 'post-key! "\r" 36))
-  (define (quit!) (wi 'post-key! "q" 12 '(cmd)))
+  (define (post-text! s) (wi 'post-chars! s))                    ; 打字（逐字合成按键，进输入上下文）
+  (define (enter!) (wi 'post-key! 'return))
+  (define (quit!) (wi 'post-key! 'q '(primary)))
   (define (after ms) (lambda () (>= (- (current-inexact-milliseconds) t0) ms)))
   (define (click-at! pt) (wi 'post-mouse! 'down (* zoom (car pt)) (* zoom (cdr pt))) (wi 'post-mouse! 'up (* zoom (car pt)) (* zoom (cdr pt))))
   ;; 脚本步骤条件：上一步之后至少过了一整轮（合成事件已处理、已重绘）。fire 会连续执行条件为真的步骤，
@@ -1853,7 +1957,7 @@
                    (lambda () (click-at! (tr 'hit-center 'perm (cons (car (tr 'pending-permissions)) "yes")))))
              (cons (lambda () (>= (tr 'turns) 1)) (lambda () (post-text! "now hang") (enter!)))
              (cons (lambda () (and (busy?) (let ([s (tr 'last-assistant-text)]) (and s (regexp-match? #rx"partial" s)))))
-                   (lambda () (wi 'post-key! (string (integer->char 27)) 53)))                    ; Esc → 停止
+                   (lambda () (wi 'post-key! 'escape)))                    ; Esc → 停止
              (cons (lambda () (>= (tr 'turns) 2)) (lambda () (script-send! (hasheq 'type "history"))))
              (cons (lambda () kernel-history) snapshot-and-quit!))]
       [synth-reattach?
@@ -1938,7 +2042,7 @@
                    (lambda () (log! 'local-model (st 'model)) (click-mp! 'toggle #t)))          ; 再点芯片：关
              (cons (lambda () (not (mpp 'open?)))
                    (lambda () (log! 'chip-closed #t) (click-mp! 'toggle #t)))                    ; 再打开，试 Esc
-             (cons (lambda () (mpp 'open?)) (lambda () (wi 'post-key! (string (integer->char 27)) 53)))
+             (cons (lambda () (mpp 'open?)) (lambda () (wi 'post-key! 'escape)))
              (cons (lambda () (not (mpp 'open?)))
                    (lambda () (log! 'esc-closed (list (not (mpp 'open?)) (busy?))) (snapshot-and-quit!))))]
       [synth-secret?
@@ -1954,7 +2058,7 @@
                    (lambda ()
                      (set! secret-mode 'suggest)
                      (clip 'set! KEY)
-                     (cond [(wi 'key?) (wi 'post-key! "v" 9 '(cmd))] [else (wi 'post-paste!)])))
+                     (cond [(wi 'key?) (wi 'post-key! 'v '(primary))] [else (wi 'post-paste!)])))
              (cons (lambda () (find-input-button 'confirm))
                    (lambda () (log! 'pending-chip #t) (click-at! (find-input-button 'confirm))))
              (cons (lambda () (and (next-iteration?) (not (find-input-button 'confirm))))
@@ -1976,7 +2080,7 @@
              (cons (lambda () (let ([ids (tr 'pending-permissions)]) (and (pair? ids) (tr 'hit-center 'perm (cons (car ids) "yes")))))
                    (lambda () (click-at! (tr 'hit-center 'perm (cons (car (tr 'pending-permissions)) "yes")))))
              (cons (lambda () (answered? 5))
-                   (lambda () (log! 'visual (visual-check "unicode")) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'visual (visual-check "unicode")) (wi 'post-key! 'comma '(primary))))
              ;; 高级设置：隐藏文字送给模型时 → 原样（推给内核；回放比对这次发送）→ 换回标出
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'advanced))) (lambda () (click-at! (svp 'hit-center 'section 'advanced))))
              (cons (lambda () (svp 'hit-center 'hidden-text-mode 'raw)) (lambda () (click-at! (svp 'hit-center 'hidden-text-mode 'raw))))
@@ -2012,7 +2116,7 @@
        (define (step pred act) (cons pred (lambda () (act) (set! frames-at frames))))
        (define (answered? n) (and (not (busy?)) (let ([c (cur)]) (and c (>= (hash-ref c 'messages 0) n)))))
        (define (td k [d #f]) (let ([v (tpp 'data)]) (if (hash? v) (hash-ref v k d) d)))
-       (define (cmd-shift-t!) (wi 'post-key! "t" 17 '(cmd shift)))
+       (define (cmd-shift-t!) (wi 'post-key! 't '(primary shift)))
        (list (step (lambda () (and ready (cur))) (lambda () (cmd-shift-t!)))
              (step (lambda () (and (tpp 'open?) (td 'exists) (tpp 'hit-center 'trust)))
                    (lambda () (log! 'opened (list (map (lambda (s) (hash-ref s 'id)) (td 'steps '())) (td 'trusted)))
@@ -2022,7 +2126,7 @@
              (step (lambda () (pair? (td 'history '())))
                    (lambda () (log! 'ran (for/list ([r (hash-ref (car (td 'history)) 'steps '())]) (list (hash-ref r 'step) (hash-ref r 'ok))))
                               (lclick! (tpp 'hit-center 'toggle "check"))))
-             (step (after 4) (lambda () (log! 'visual-output (visual-check "tests-output")) (wi 'post-key! (string (integer->char 27)) 53)))
+             (step (after 4) (lambda () (log! 'visual-output (visual-check "tests-output")) (wi 'post-key! 'escape)))
              (step (lambda () (not (tpp 'open?))) (lambda () (post-text! "propose tests") (enter!)))
              (step (lambda () (answered? 4)) (lambda () (cmd-shift-t!)))
              (step (lambda () (and (tpp 'open?) (pair? (td 'proposals '())) (tpp 'hit-center 'approve (hash-ref (car (td 'proposals)) 'id))))
@@ -2049,13 +2153,13 @@
              (step (lambda () (answered? 2)) (lambda () (post-text! "two") (enter!)))
              (step (lambda () (answered? 4)) (lambda () (post-text! "three") (enter!)))
              (step (lambda () (answered? 6))
-                   (lambda () (log! 'off-nothing (and (null? (texts)) (zero? (hash-count (memory-processed mem))))) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'off-nothing (and (null? (texts)) (zero? (hash-count (memory-processed mem))))) (wi 'post-key! 'comma '(primary))))
              (step (lambda () (and (svp 'open?) (svp 'hit-center 'section 'memory))) (lambda () (lclick! (svp 'hit-center 'section 'memory))))
              (step (lambda () (svp 'hit-center 'mem-auto #t)) (lambda () (lclick! (svp 'hit-center 'mem-auto #t))))
              (step (lambda () (and (= (hash-count (memory-processed mem)) 1) (not mem-flight)))
                    (lambda () (log! 'learned (list (texts) (texts "pending")
                                                    (map (lambda (e) (list (hash-ref e 'source) (and (hash-ref e 'evidence #f) #t))) (memory-entries mem))))))
-             (step (after 4) (lambda () (log! 'visual (visual-check "memory-auto")) (wi 'post-key! (string (integer->char 27)) 53)))
+             (step (after 4) (lambda () (log! 'visual (visual-check "memory-auto")) (wi 'post-key! 'escape)))
              (step (lambda () (not (svp 'open?))) (lambda () (post-text! "four") (enter!)))
              (step (lambda () (answered? 8))
                    (lambda () (log! 'not-again (list (hash-count (memory-processed mem)) (length (texts)) (not mem-flight)))
@@ -2096,7 +2200,7 @@
              (step (lambda () (eq? (catalog-session-attr cat (session-id active (path0)) 'host_index 'unset) #f))
                    (lambda () (log! 'switch-off #t) (post-text! "find projects shop") (enter!)))
              (step (lambda () (answered? 8))
-                   (lambda () (log! 'refused (regexp-match? #rx"turned off for this session" (answer))) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'refused (regexp-match? #rx"turned off for this session" (answer))) (wi 'post-key! 'comma '(primary))))
              (step (lambda () (and (svp 'open?) (svp 'hit-center 'section 'projects))) (lambda () (lclick! (svp 'hit-center 'section 'projects))))
              (step (lambda () (svp 'hit-center 'hix-edit (k-of "shop")))
                    (lambda () (log! 'visual (visual-check "projects-settings")) (lclick! (svp 'hit-center 'hix-edit (k-of "shop")))))
@@ -2134,13 +2238,13 @@
                    (lambda () (log! 'injected-order (let ([a (answer)]) (and (pos a "GLOBAL-MEM") (pos a "WS-MEM") (< (pos a "GLOBAL-MEM") (pos a "WS-MEM")))))
                               (post-text! "note pref") (enter!)))
              (step (lambda () (and (answered? 4) (pair? (memory-pending mem))))
-                   (lambda () (log! 'pending (map (lambda (e) (hash-ref e 'text)) (memory-pending mem))) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'pending (map (lambda (e) (hash-ref e 'text)) (memory-pending mem))) (wi 'post-key! 'comma '(primary))))
              (step (lambda () (and (svp 'open?) (svp 'hit-center 'section 'memory))) (lambda () (lclick! (svp 'hit-center 'section 'memory))))
              (step (lambda () (let ([p (memory-pending mem)]) (and (pair? p) (svp 'hit-center 'mem-accept (hash-ref (car p) 'id)))))
                    (lambda () (log! 'visual (visual-check "memory-settings"))
                               (lclick! (svp 'hit-center 'mem-accept (hash-ref (car (memory-pending mem)) 'id)))))
              (step (lambda () (null? (memory-pending mem)))
-                   (lambda () (log! 'accepted (and (member "MODEL-MEM: indent with tabs" (texts)) #t)) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'accepted (and (member "MODEL-MEM: indent with tabs" (texts)) #t)) (wi 'post-key! 'escape)))
              (step (lambda () (and (not (svp 'open?)) (sbp 'hit-center 'resume (path0)))) (lambda () (rclick! (sbp 'hit-center 'resume (path0)))))
              (step (lambda () (sbp 'hit-center 'mem-write (path0))) (lambda () (lclick! (sbp 'hit-center 'mem-write (path0)))))
              (step (lambda () (eq? (catalog-session-attr cat (session-id active (path0)) 'mem_write #t) #f))
@@ -2175,15 +2279,15 @@
        (define (answered? n) (and (not (busy?)) (let ([c (cur)]) (and c (>= (hash-ref c 'messages 0) n)))))
        ;; 先说一句：有消息的会话才进目录（工作区实体在第一次同步时建）
        (list (step (lambda () (and ready (cur))) (lambda () (post-text! "hello") (enter!)))
-             (step (lambda () (and (answered? 2) (ws-id))) (lambda () (wi 'post-key! "," 43 '(cmd))))
+             (step (lambda () (and (answered? 2) (ws-id))) (lambda () (wi 'post-key! 'comma '(primary))))
              (step (lambda () (and (svp 'open?) (svp 'hit-center 'section 'instructions))) (lambda () (lclick! (svp 'hit-center 'section 'instructions))))
              (step (lambda () (svp 'hit-center 'instr-edit (ws-id))) (lambda () (lclick! (svp 'hit-center 'instr-edit (ws-id)))))
              (step (lambda () (svp 'editing?)) (lambda () (post-text! "WS-RULE-ONE")))
-             (step (after 3) (lambda () (wi 'post-key! "\r" 36 '(shift))))
+             (step (after 3) (lambda () (wi 'post-key! 'return '(shift))))
              (step (after 3) (lambda () (post-text! "WS-RULE-TWO")))
              (step (after 6) (lambda () (log! 'field (editor-flatten (svp 'editor))) (log! 'visual (visual-check "instructions-field")) (enter!)))
              (step (lambda () (or (ws-text) ((after 60))))
-                   (lambda () (log! 'saved (ws-text)) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'saved (ws-text)) (wi 'post-key! 'escape)))
              (step (lambda () (not (svp 'open?))) (lambda () (post-text! "show instructions") (enter!)))
              (step (lambda () (answered? 4))
                    (lambda () (define a (or (tr 'last-assistant-text) ""))
@@ -2247,13 +2351,13 @@
                                         (define to (sbp 'hit-center 'toggle-group (string-append "\u0002grp\u0001\u0001" (demo))))
                                         (ns! 'down from) (ns! 'drag (cons (car from) (+ (cdr from) 20.0))) (ns! 'drag to) (ns! 'up to)))
              (step (lambda () (or (in-project? (demo) (session-id active dragged)) ((after 30))))
-                   (lambda () (log! 'drag-to-project (in-project? (demo) (session-id active dragged))) (wi 'post-key! "z" 6 '(cmd))))
+                   (lambda () (log! 'drag-to-project (in-project? (demo) (session-id active dragged))) (wi 'post-key! 'z '(primary))))
              (step (lambda () (or (not (in-project? (demo) (session-id active dragged))) ((after 30))))
                    (lambda () (log! 'undo-drag (not (in-project? (demo) (session-id active dragged))))
                               (lclick! (sbp 'hit-center 'group-button #t))))
              (step (lambda () (sbp 'hit-center 'group-by 'recent)) (lambda () (lclick! (sbp 'hit-center 'group-by 'recent))))
              (step (after 3) (lambda () (log! 'back-to-recent (and (for/or ([r (in-list (sbp 'sessions))]) (hash-ref r 'section #f)) #t))
-                                        (wi 'post-key! "z" 6 '(cmd))))
+                                        (wi 'post-key! 'z '(primary))))
              (step (lambda () (not (demo)))
                    (lambda () (define cs (car (catalog-changesets-list cat)))
                               (log! 'undone (list (not (demo)) (catalog-session-attr cat oldest 'archived #f)
@@ -2262,7 +2366,7 @@
                                                   (length (hash-ref (hash-ref cs 'applied) 'results))
                                                   (hash-ref (hash-ref (hash-ref cs 'proposal) 'source) 'request)))
                               (log! 'auto-title (for/list ([r (in-list (sbp 'sessions))] #:when (>= (hash-ref r 'messages 0) 6)) (list (hash-ref r 'title #f) (hash-ref r 'titled #f))))
-                              (wi 'post-key! "," 43 '(cmd))))
+                              (wi 'post-key! 'comma '(primary))))
              ;; 变更记录：设置页 →「变更记录」→「查看」→ 审阅面板（只读、已撤销）
              (step (lambda () (and (svp 'open?) (svp 'hit-center 'section 'changes))) (lambda () (lclick! (svp 'hit-center 'section 'changes))))
              (step (lambda () (let ([cs (car (catalog-changesets-list cat))]) (svp 'hit-center 'open-changeset (hash-ref (hash-ref cs 'proposal) 'id))))
@@ -2285,7 +2389,7 @@
        (define (eph-path) (let ([r (findf (lambda (se) (hash-ref se 'ephemeral #f)) (sbp 'sessions))]) (and r (hash-ref r 'path #f))))
        (define (row-of p) (findf (lambda (se) (equal? (hash-ref se 'path #f) p)) (sbp 'sessions)))
        (define (item! kind k) (let ([c (sbp 'hit-center kind k)]) (if c (lclick! c) (log! (list 'missing-item kind) #t))))
-       (define (esc!) (wi 'post-key! (string (integer->char 27)) 53))
+       (define (esc!) (wi 'post-key! 'escape))
        (define (step pred act) (cons pred (lambda () (act) (mark!))))
        (define (round-for m)
          (list (step (lambda () (next-iteration?)) (lambda () (settings-action! (list 'sidebar-material m))))
@@ -2321,7 +2425,7 @@
                (step (lambda () (let ([r (row-of first-path)]) (or (and r (equal? (hash-ref r 'title #f) (format "renamed ~a" m))) ((after 60)))))
                      (lambda () (log! (list m 'renamed) (hash-ref (row-of first-path) 'title #f))))))
        ;; §11 A（少操作，真实 AppKit 事件）：悬停图标置顶 → 提示条撤销；双击改名 → ⌘Z 撤销；键盘 ↓ P E ⌫ + 撤销；Esc 回输入框
-       (define (key! chars code [mods '()]) (wi 'post-key! chars code mods))
+       (define (key! key [mods '()]) (wi 'post-key! key mods))
        (define (title-of p) (let ([r (row-of p)]) (and r (hash-ref r 'title #f))))
        (define (in-list? p) (and (row-of p) #t))
        (define second-path #f)
@@ -2346,22 +2450,22 @@
                                        (ns! 'down c) (ns! 'up c)
                                        (wi 'post-mouse-ns! 'down (* zoom (car c)) (* zoom (cdr c)) 0 '() 2) (wi 'post-mouse-ns! 'up (* zoom (car c)) (* zoom (cdr c)) 0 '() 2))))
           (step (lambda () (or (sbp 'editing?) ((after 30)))) (lambda () (log! 'double-click-rename (sbp 'editing?)) (post-text! "quick name") (enter!)))
-          (step (lambda () (or (equal? (title-of first-path) "quick name") ((after 60)))) (lambda () (log! 'renamed-quick (title-of first-path)) (key! "z" 6 '(cmd))))
+          (step (lambda () (or (equal? (title-of first-path) "quick name") ((after 60)))) (lambda () (log! 'renamed-quick (title-of first-path)) (key! 'z '(primary))))
           (step (lambda () (or (equal? (title-of first-path) "renamed opaque") ((after 60)))) (lambda () (log! 'cmd-z-undo-rename (title-of first-path))))
           ;; 3. 点行（不拿键盘焦点）→ 打字进输入框；右键 → P（菜单里的单键）置顶、输入框不出现 p；⌘⇧E 键盘模式 → E 归档 → ⌘Z → ↓ → ⌫ → 提示条撤销
           (step (after 4) (lambda () (lclick! (sbp 'hit-center 'resume first-path))))
           (step (after 6) (lambda () (post-text! "q")))
           ;; 清输入框的按键与右键分两步：窗口在前台时按键走应用的事件队列（晚到），鼠标是立即的——同一步里 ⌫ 会落在菜单开着时（= 删这一行）
-          (step (after 4) (lambda () (log! 'row-click-keeps-typing (editor-flatten e)) (key! "a" 0 '(cmd)) (key! "\u007F" 51)))
+          (step (after 4) (lambda () (log! 'row-click-keeps-typing (editor-flatten e)) (key! 'a '(primary)) (key! 'backspace)))
           (step (after 6) (lambda () (rclick! (sbp 'hit-center 'resume first-path))))
-          (step (after 6) (lambda () (log! 'menu-open-before-p (sbp 'context-open?)) (key! "p" 35)))
+          (step (after 6) (lambda () (log! 'menu-open-before-p (sbp 'context-open?)) (key! 'p)))
           (step (lambda () (let ([r (row-of first-path)]) (or (and r (hash-ref r 'pinned #f)) ((after 30)))))
                 (lambda () (log! 'menu-key-p (list (hash-ref (row-of first-path) 'pinned #f) (editor-flatten e) (sbp 'context-open?)))
-                           (key! "e" 14 '(cmd shift))))
-          (step (after 4) (lambda () (log! 'cmd-shift-e-keyboard-mode sidebar-focus?) (key! "e" 14)))
+                           (key! 'e '(primary shift))))
+          (step (after 4) (lambda () (log! 'cmd-shift-e-keyboard-mode sidebar-focus?) (key! 'e)))
           ;; 当前会话归档后照样显示（设计如此）：看行上的 archived
           (step (lambda () (let ([r (row-of first-path)]) (or (and r (hash-ref r 'archived #f)) ((after 30)))))
-                (lambda () (log! 'key-e-archived (hash-ref (row-of first-path) 'archived #f)) (key! "z" 6 '(cmd))))
+                (lambda () (log! 'key-e-archived (hash-ref (row-of first-path) 'archived #f)) (key! 'z '(primary))))
           (step (lambda () (let ([r (row-of first-path)]) (or (and r (not (hash-ref r 'archived #f))) ((after 30)))))
                 (lambda () (log! 'cmd-z-unarchive (not (hash-ref (row-of first-path) 'archived #f)))
                            (set! second-path (for/first ([se (in-list (sbp 'sessions))]
@@ -2372,25 +2476,25 @@
                            (define keys (for/list ([se (in-list (sbp 'sessions))] #:when (hash-ref se 'path #f)) (hash-ref se 'path)))
                            (define d (and second-path (- (index-of keys second-path) (index-of keys (sbp 'focus)))))
                            (log! 'has-second (and second-path #t))
-                           (when d (for ([_ (in-range (abs d))]) (key! (if (> d 0) "\uF701" "\uF700") (if (> d 0) 125 126))))))
-          (step (after 4) (lambda () (log! 'focus-on-second (equal? (sbp 'focus) second-path)) (key! "\u007F" 51)))
+                           (when d (for ([_ (in-range (abs d))]) (key! (if (> d 0) 'down 'up))))))
+          (step (after 4) (lambda () (log! 'focus-on-second (equal? (sbp 'focus) second-path)) (key! 'backspace)))
           (step (lambda () (or (not (and second-path (in-list? second-path))) ((after 60))))
                 (lambda () (log! 'key-delete (and second-path (not (in-list? second-path)))) (let ([u (sbp 'hit-center 'undo #t)]) (when u (lclick! u)))))
           (step (lambda () (or (and second-path (in-list? second-path)) ((after 60))))
-                (lambda () (log! 'undo-delete (and second-path (in-list? second-path))) (key! "\u001B" 53)))
+                (lambda () (log! 'undo-delete (and second-path (in-list? second-path))) (key! 'escape)))
           ;; 4. Esc 退出键盘模式；⌘Z 跟着最近的操作：右键菜单删除（鼠标）后马上 ⌘Z → 恢复（之后没打字）
           (step (after 4) (lambda () (log! 'esc-unfocus (not sidebar-focus?)) (rclick! (sbp 'hit-center 'resume second-path))))
           (step (after 4) (lambda () (item! 'delete second-path)))
-          (step (lambda () (or (not (in-list? second-path)) ((after 60)))) (lambda () (log! 'menu-delete (not (in-list? second-path))) (key! "z" 6 '(cmd))))
+          (step (lambda () (or (not (in-list? second-path)) ((after 60)))) (lambda () (log! 'menu-delete (not (in-list? second-path))) (key! 'z '(primary))))
           (step (lambda () (or (in-list? second-path) ((after 60)))) (lambda () (log! 'cmd-z-after-mouse-delete (in-list? second-path)) (post-text! "x")))
-          (step (after 4) (lambda () (log! 'typing-after (editor-flatten e)) (key! "a" 0 '(cmd)) (key! "\u007F" 51)))
+          (step (after 4) (lambda () (log! 'typing-after (editor-flatten e)) (key! 'a '(primary)) (key! 'backspace)))
           ;; §11.4 D 手势：右扫 → 置顶；左扫 → 归档 → ⌘Z；竖着的手势不横扫；拖行到「置顶」段 → 置顶
           (step (after 4) (lambda () (gesture! second-path '(0.0 30.0 30.0 30.0) '(0.0 0.0 0.0 0.0))))
           (step (lambda () (let ([r (row-of second-path)]) (or (and r (hash-ref r 'pinned #f)) ((after 30)))))
                 (lambda () (log! 'swipe-right-pin (hash-ref (row-of second-path) 'pinned #f))
                            (gesture! second-path '(0.0 -30.0 -30.0 -30.0) '(0.0 0.0 0.0 0.0))))
           (step (lambda () (or (attr? second-path 'archived) ((after 30))))                ; 归档了：行收进「已归档」，看目录
-                (lambda () (log! 'swipe-left-archive (attr? second-path 'archived)) (key! "z" 6 '(cmd))))
+                (lambda () (log! 'swipe-left-archive (attr? second-path 'archived)) (key! 'z '(primary))))
           (step (lambda () (or (not (attr? second-path 'archived)) ((after 30))))
                 (lambda () (log! 'undo-archive (not (attr? second-path 'archived)))
                            (gesture! first-path '(0.0 2.0 2.0 2.0) '(0.0 15.0 15.0 15.0))))
@@ -2470,8 +2574,8 @@
              (cons (lambda () (and (next-iteration?) (sbp 'hit-center 'info (hash-ref (cur) 'path)))) (lambda () (click-at! (sbp 'hit-center 'info (hash-ref (cur) 'path)))))
              (cons (lambda () (insp 'open?))
                    (lambda () (log! 'info (list (hash-ref (insp 'data) 'chat #f) (real? (hash-ref (insp 'data) 'workdir_bytes #f))))
-                              (wi 'post-key! (string (integer->char 27)) 53)))
-             (cons (lambda () (and (not (insp 'open?)) (next-iteration?))) (lambda () (wi 'post-key! "," 43 '(cmd))))
+                              (wi 'post-key! 'escape)))
+             (cons (lambda () (and (not (insp 'open?)) (next-iteration?))) (lambda () (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'chat))) (lambda () (click-at! (svp 'hit-center 'section 'chat))))
              (cons (lambda () (and (svp 'hit-center 'chat-cleanup #f) (next-iteration?)))
                    (lambda () (click-at! (svp 'hit-center 'chat-cleanup #f))))
@@ -2501,7 +2605,7 @@
              (cons (lambda () (and (next-iteration?) (sbp 'hit-center 'info first-path))) (lambda () (item! 'info first-path)))
              (cons (lambda () (insp 'open?))
                    (lambda () (log! 'info (list (hash-ref (insp 'data) 'title #f) (hash-ref (insp 'data) 'messages #f) (hash-ref (insp 'data) 'requests #f)))
-                              (wi 'post-key! (string (integer->char 27)) 53)))
+                              (wi 'post-key! 'escape)))
              (cons (lambda () (and (not (insp 'open?)) (next-iteration?))) (lambda () (log! 'info-closed #t) (ctx! first-path)))
              (cons (lambda () (and (next-iteration?) (sbp 'hit-center 'rename first-path))) (lambda () (item! 'rename first-path)))
              (cons (lambda () (and (next-iteration?) (sbp 'editing?))) (lambda () (post-text! "renamed one") (enter!)))
@@ -2531,7 +2635,7 @@ first question" c)))
              (cons (lambda () (and (next-iteration?) (sbp 'hit-center 'info first-path))) (lambda () (item! 'info first-path)))
              (cons (lambda () (insp 'open?))
                    (lambda () (log! 'groups (let ([g (hash-ref (insp 'data) 'groups (hasheq))]) (regexp-match? #rx" @ local$" (hash-ref g 'workspace ""))))
-                              (wi 'post-key! (string (integer->char 27)) 53)))
+                              (wi 'post-key! 'escape)))
              (cons (lambda () (and (not (insp 'open?)) (next-iteration?))) (lambda () (ctx! first-path)))
              (cons (lambda () (and (next-iteration?) (sbp 'hit-center 'unarchive first-path))) (lambda () (item! 'unarchive first-path)))
              (cons (lambda () (let ([r (row first-path)]) (and r (not (hash-ref r 'archived #f)))))
@@ -2559,11 +2663,11 @@ first question" c)))
        (define (cur-row) (findf (lambda (se) (hash-ref se 'current #f)) (sbp 'sessions)))
        (list (cons (lambda () (and ready (cur-row))) (lambda () (log! 'initial (geom)) (drag! (+ sidebar-w 1.0) 320.0)))
              (cons (lambda () (and (next-iteration?) (not drag-divider?) (= sidebar-w 320.0)))
-                   (lambda () (log! 'dragged (list (geom) (gsetting 'sidebar-width #f))) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'dragged (list (geom) (gsetting 'sidebar-width #f))) (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'general))) (lambda () (click-at! (svp 'hit-center 'section 'general))))
              (cons (lambda () (svp 'hit-center 'sidebar-side 'right)) (lambda () (click-at! (svp 'hit-center 'sidebar-side 'right))))
              (cons (lambda () (and (next-iteration?) sidebar-right?))
-                   (lambda () (log! 'right (list (geom) (gsetting 'sidebar-side #f))) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'right (list (geom) (gsetting 'sidebar-side #f))) (wi 'post-key! 'escape)))
              (cons (lambda () (and (not (svp 'open?)) (next-iteration?) (sbp 'hit-center 'new #t)))
                    (lambda () (log! 'new-button-x (car (sbp 'hit-center 'new #t))) (click-at! (sbp 'hit-center 'new #t))))
              (cons (lambda () (let ([c (cur-row)]) (and c (hash-ref c 'ephemeral #f) (next-iteration?))))
@@ -2604,7 +2708,7 @@ first question" c)))
        (define V2 "myco_ab12cd34")
        (define (log! k v) (set! sessions-log (cons (cons k v) sessions-log)))
        (define (click-sv! kind payload) (click-at! (svp 'hit-center kind payload)))
-       (define (paste! s) (clip 'set! s) (cond [(wi 'key?) (wi 'post-key! "v" 9 '(cmd))] [else (wi 'post-paste!)]))
+       (define (paste! s) (clip 'set! s) (cond [(wi 'key?) (wi 'post-key! 'v '(primary))] [else (wi 'post-paste!)]))
        (define (find-input-button kind)
          (for*/first ([y (in-range 0 (inexact->exact (round h)) 3)] [x (in-range 0 (inexact->exact (round w)) 6)]
                       #:when (let ([r (ib 'hit (exact->inexact x) (exact->inexact y))]) (and r (eq? (car r) 'button) (eq? (cadr r) kind))))
@@ -2612,31 +2716,31 @@ first question" c)))
        (define turns0 0)
        (define (rule-ml) (findf (lambda (r) (equal? (hash-ref r 'name #f) "ml")) (or (hs-rules (A)) '())))
        (list (cons (lambda () ready) (lambda () (set! secret-mode 'suggest) (paste! V1)))
-             (cons (lambda () (and (next-iteration?) (regexp-match? #rx"zz-Private" (editor-text e)))) (lambda () (wi 'post-key! "a" 0 '(cmd))))
-             (cons (lambda () (and (next-iteration?) (has-selection? e))) (lambda () (wi 'post-key! "K" 40 '(cmd shift))))
+             (cons (lambda () (and (next-iteration?) (regexp-match? #rx"zz-Private" (editor-text e)))) (lambda () (wi 'post-key! 'a '(primary))))
+             (cons (lambda () (and (next-iteration?) (has-selection? e))) (lambda () (wi 'post-key! 'k '(primary shift))))
              (cons (lambda () (and (next-iteration?) (= (length (editor-chips e)) 1)))
                    (lambda () (log! 'marked (list (fold-kind (editor-fold e (car (editor-chips e)))) (regexp-match? #rx"zz-Private" (editor-text e))))
                               (set! turns0 (tr 'turns)) (post-text! " ok") (enter!)))
              (cons (lambda () (and (> (tr 'turns) turns0) (not (busy?))))
                    (lambda () (define a (or (tr 'last-assistant-text) ""))
                               (log! 'answer (list (regexp-match? #rx"⟦secret:[0-9a-f]+⟧ ok" a) (regexp-match? #rx"zz-Private" a)))
-                              (wi 'post-key! "," 43 '(cmd))))
+                              (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'general))) (lambda () (click-sv! 'section 'general)))
              (cons (lambda () (svp 'hit-center 'add-secret-pattern #f)) (lambda () (click-sv! 'add-secret-pattern #f)))
              (cons (lambda () (and (next-iteration?) (svp 'editing?))) (lambda () (post-text! "^myco_[a-z0-9]{8}$") (enter!)))
              (cons (lambda () (and (next-iteration?) (member "^myco_[a-z0-9]{8}$" secret-patterns)))
-                   (lambda () (log! 'pattern-saved #t) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'pattern-saved #t) (wi 'post-key! 'escape)))
              (cons (lambda () (and (not (svp 'open?)) (next-iteration?))) (lambda () (paste! V2)))
              (cons (lambda () (find-input-button 'confirm))
-                   (lambda () (log! 'custom-detected #t) (click-at! (find-input-button 'confirm)) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'custom-detected #t) (click-at! (find-input-button 'confirm)) (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'rules))) (lambda () (click-sv! 'section 'rules)))
              (cons (lambda () (svp 'hit-center 'new-rule #f)) (lambda () (click-sv! 'new-rule #f)))
              (cons (lambda () (and (next-iteration?) (svp 'editing?))) (lambda () (post-text! "ml") (enter!)))
              (cons (lambda () (next-iteration?)) (lambda () (post-text! "*") (enter!)))
              (cons (lambda () (and (next-iteration?) (svp 'multiline?)))
-                   (lambda () (post-text! "line one") (wi 'post-key! "\r" 36 '(shift)) (post-text! "line two") (enter!)))
+                   (lambda () (post-text! "line one") (wi 'post-key! 'return '(shift)) (post-text! "line two") (enter!)))
              (cons (lambda () (rule-ml))
-                   (lambda () (log! 'rule-text (hash-ref (rule-ml) 'system_append #f)) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'rule-text (hash-ref (rule-ml) 'system_append #f)) (wi 'post-key! 'escape)))
              (cons (lambda () (not (svp 'open?))) (lambda () (snapshot-and-quit!))))]
       [synth-spend?
        ;; 跨主机费用合计（两台的内核各预置一笔今天的花费：local $0.25、srv $0.5）：状态行显示合计 → 设置页设合计上限 $0.5
@@ -2651,13 +2755,13 @@ first question" c)))
        (list (cons (lambda () (and (H "srv") (hs-ready (H "local")) (hs-ready (H "srv"))
                                    (let ([a (spent "local")] [b (spent "srv")]) (and a b (> a 0) (> b 0)))))
                    (lambda () (log! 'spend (list (spent "local") (spent "srv") (money2 (spend-total)) (status)))
-                              (wi 'post-key! "," 43 '(cmd))))
+                              (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'budget))) (lambda () (click-sv! 'section 'budget)))
              (cons (lambda () (svp 'hit-center 'budget-edit 'combined)) (lambda () (click-sv! 'budget-edit 'combined)))
              (cons (lambda () (and (next-iteration?) (svp 'editing?))) (lambda () (post-text! "0.5") (enter!)))
              (cons (lambda () (let ([m (hash-ref pushed-external "local" #f)]) (and m (equal? (hash-ref m 'combined_cap_usd #f) 0.5))))
                    (lambda () (log! 'pushed (list (hash-ref (hash-ref pushed-external "local") 'others_usd) (hash-ref (hash-ref pushed-external "srv") 'others_usd)))
-                              (wi 'post-key! (string (integer->char 27)) 53)))
+                              (wi 'post-key! 'escape)))
              (cons (lambda () (and (not (svp 'open?)) (next-iteration?))) (lambda () (set! turns0 (tr 'turns)) (post-text! "hello") (enter!)))
              (cons (lambda () (and (card-scope) (tr 'hit-center 'perm (cons (car (tr 'pending-permissions)) "no"))))
                    (lambda () (log! 'card (card-scope)) (perm! "no")))
@@ -2703,19 +2807,19 @@ first question" c)))
              (cons (lambda () (or (and (equal? active "srv") (next-iteration?))
                                   (and (> loop-iter (+ last-fire-iter 30)) (row-key "srv") (sbp 'hit-center 'resume (row-key "srv"))
                                        (begin (click-row! "srv") (set! last-fire-iter loop-iter) #f))))
-                   (lambda () (log! 'srv-draft (editor-text e)) (wi 'post-key! "," 43 '(cmd))))
+                   (lambda () (log! 'srv-draft (editor-text e)) (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'hosts))) (lambda () (click-sv! 'section 'hosts)))
              (cons (lambda () (svp 'hit-center 'host-disconnect "srv")) (lambda () (click-sv! 'host-disconnect "srv") (set! t-disc (current-inexact-milliseconds))))
              (cons (lambda () (and t-disc (> (- (current-inexact-milliseconds) t-disc) 2500.0)))
                    (lambda () (log! 'manual-stays-disconnected (list (host-status "srv") (and (hs-retry-at (H "srv")) #t)))
-                              (wi 'post-key! (string (integer->char 27)) 53)))
+                              (wi 'post-key! 'escape)))
              (cons (lambda () (not (svp 'open?))) (lambda () (log! 'closed #t) (snapshot-and-quit!))))]
       [synth-hosts?
        ;; 设置页「主机」：断开 srv（侧栏显示断开）→ 连接（重新补齐）→ 添加连不上的 ssh 主机（.invalid：ssh 立刻失败 → 断开，原因在 stderr）→ 移除 → Esc
        (define (log! k v) (set! sessions-log (cons (cons k v) sessions-log)))
        (define (click-sv! kind payload) (click-at! (svp 'hit-center kind payload)))
        (define BAD "nobody@pi2-test.invalid")
-       (list (cons (lambda () (and (H "local") (H "srv") (hs-ready (H "local")) (hs-ready (H "srv")))) (lambda () (wi 'post-key! "," 43 '(cmd))))
+       (list (cons (lambda () (and (H "local") (H "srv") (hs-ready (H "local")) (hs-ready (H "srv")))) (lambda () (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'hosts))) (lambda () (click-sv! 'section 'hosts)))
              (cons (lambda () (svp 'hit-center 'host-disconnect "srv")) (lambda () (click-sv! 'host-disconnect "srv")))
              (cons (lambda () (and (equal? (host-status "srv") "disconnected") (svp 'hit-center 'host-connect "srv")))
@@ -2729,7 +2833,7 @@ first question" c)))
                    (lambda () (log! 'bad-host (list (host-status BAD) (hs-attempts (H BAD)) (pair? (ks 'stderr-tail BAD 3)))) (click-sv! 'ask-host-remove BAD)))
              (cons (lambda () (svp 'hit-center 'host-remove BAD)) (lambda () (click-sv! 'host-remove BAD)))
              (cons (lambda () (not (H BAD)))
-                   (lambda () (log! 'removed host-order) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'removed host-order) (wi 'post-key! 'escape)))
              (cons (lambda () (not (svp 'open?))) (lambda () (log! 'closed #t) (snapshot-and-quit!))))]
       [synth-multihost?
        ;; 一窗多主机（主机 local + srv，都是脚本化内核）：local 上发一轮挂住的 → 切到 srv（标题行「＋」新会话）→ srv 上一轮带权限的跑完
@@ -2759,7 +2863,7 @@ first question" c)))
                    (lambda () (click-row! "local")))
              (cons (lambda () (and (equal? active "local") (next-iteration?) (row-of "srv") (hash-ref (row-of "srv") 'badge #f)))
                    (lambda () (log! 'srv-badge (hash-ref (row-of "srv") 'badge #f))
-                              (wi 'post-key! (string (integer->char 27)) 53)))                       ; Esc：停 local 那轮
+                              (wi 'post-key! 'escape)))                       ; Esc：停 local 那轮
              (cons (lambda () (and (not (host-busy? "local")) (sbp 'hit-center 'resume (row-key "srv"))))
                    (lambda () (log! 'local-stopped (tr 'summary)) (click-row! "srv")))
              (cons (lambda () (and (equal? active "srv") (pair? (tr 'pending-permissions)) (tr 'hit-center 'perm (cons (car (tr 'pending-permissions)) "yes"))))
@@ -2774,7 +2878,7 @@ first question" c)))
        (define (pool-members) (let ([r (and last-providers (findf (lambda (r) (equal? (hash-ref r 'name #f) "pool")) (hash-ref last-providers 'routes '())))])
                                 (and r (for/list ([m (in-list (hash-ref r 'members '()))]) (format "~a/~a" (hash-ref m 'instance) (hash-ref m 'model))))))
        (define n0 #f)
-       (list (cons (lambda () ready) (lambda () (wi 'post-key! "," 43 '(cmd))))
+       (list (cons (lambda () ready) (lambda () (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (and (svp 'open?) (svp 'hit-center 'section 'pools))) (lambda () (click-sv! 'section 'pools)))
              (cons (lambda () (and (pool-members) (svp 'hit-center 'add-member "pool")))
                    (lambda () (set! n0 (length (pool-members))) (log! 'members0 (pool-members)) (click-sv! 'add-member "pool")))
@@ -2804,15 +2908,15 @@ first question" c)))
              (cons (lambda () (svp 'hit-center 'zoom 1.25)) (lambda () (click-sv! 'zoom 1.25)))
              (cons (lambda () (and (= zoom 1.25) (next-iteration?) (svp 'hit-center 'section 'shortcuts)))
                    (lambda () (log! 'zoom (list zoom (/ (round (* 10 w)) 10.0) (/ (round (* 10 pw)) 10.0))) (click-sv! 'section 'shortcuts)))   ; 缩放后的点击
-             (cons (lambda () (eq? (svp 'section) 'shortcuts)) (lambda () (log! 'zoomed-click 'shortcuts) (wi 'post-key! "0" 29 '(cmd))))
-             (cons (lambda () (= zoom 1.0)) (lambda () (log! 'zoom-reset zoom) (wi 'post-key! (string (integer->char 27)) 53)))
+             (cons (lambda () (eq? (svp 'section) 'shortcuts)) (lambda () (log! 'zoomed-click 'shortcuts) (wi 'post-key! 'digit-0 '(primary))))
+             (cons (lambda () (= zoom 1.0)) (lambda () (log! 'zoom-reset zoom) (wi 'post-key! 'escape)))
              (cons (lambda () (not (svp 'open?))) (lambda () (log! 'closed #t) (snapshot-and-quit!))))]
       [synth-settings?
        ;; 设置页（⌘,）：帐号与密钥里给 grok 添加帐号 team 并输入 key（真按键）→ 列表里出现 grok[team]；
        ;; 权限改成 read-only（内核 state 回报）→ Esc 关闭。日志里不得出现 key 原文（冒烟测试检查日志文件）
        (define (log! k v) (set! sessions-log (cons (cons k v) sessions-log)))
        (define (click-sv! kind payload) (click-at! (svp 'hit-center kind payload)))
-       (list (cons (lambda () ready) (lambda () (wi 'post-key! "," 43 '(cmd))))
+       (list (cons (lambda () ready) (lambda () (wi 'post-key! 'comma '(primary))))
              (cons (lambda () (svp 'open?)) (lambda () (log! 'opened #t) (click-sv! 'section 'accounts)))
              (cons (lambda () (svp 'hit-center 'new-account "grok")) (lambda () (click-sv! 'new-account "grok")))
              (cons (lambda () (svp 'editing?)) (lambda () (post-text! "team") (enter!)))
@@ -2821,7 +2925,7 @@ first question" c)))
                    (lambda () (log! 'account-added "grok[team]") (click-sv! 'section 'permissions)))
              (cons (lambda () (svp 'hit-center 'permission "read-only")) (lambda () (click-sv! 'permission "read-only")))
              (cons (lambda () (equal? last-permission "read-only"))
-                   (lambda () (log! 'permission last-permission) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'permission last-permission) (wi 'post-key! 'escape)))
              (cons (lambda () (not (svp 'open?))) (lambda () (log! 'closed #t) (snapshot-and-quit!))))]
       [synth-route?
        ;; 路由池（G6，脚本化内核预置 @pool = fa(总是 429) / fb）：菜单选 @pool → 发一条 → fa 限流、自动切到 fb、
@@ -2842,7 +2946,7 @@ first question" c)))
                      (click-mp! 'toggle #t)))
              (cons (lambda () (menu-ready? 'member 0)) (lambda () (click-mp! 'member 0)))   ; 手动固定 fa（冷却中）
              (cons (lambda () (equal? (st 'model) "m1"))
-                   (lambda () (log! 'pinned (st 'model)) (wi 'post-key! (string (integer->char 27)) 53)))
+                   (lambda () (log! 'pinned (st 'model)) (wi 'post-key! 'escape)))
              (cons (lambda () (not (mpp 'open?))) (lambda () (snapshot-and-quit!))))]
       [live-prompt
        ;; 真实模型验收：权限卡片只对「bash 且命令匹配 allow-rx」点允许，其余拒绝；同一张卡片只决定一次
@@ -2867,7 +2971,7 @@ first question" c)))
        (list (cons (after 600.0) (lambda () (post-text! "a")))
              (cons (after 700.0) (lambda ()
                                    (clip 'set! TRACE-SAMPLE)
-                                   (cond [(wi 'key?) (set! paste-path 'menu) (wi 'post-key! "v" 9 '(cmd))]
+                                   (cond [(wi 'key?) (set! paste-path 'menu) (wi 'post-key! 'v '(primary))]
                                          [else (set! paste-path 'direct) (wi 'post-paste!)])))
              (cons (after 800.0) (lambda () (post-text! " fix")))
              (cons (after 900.0) (lambda () (wi 'simulate-ime! '((mark "n" 1) (mark "ni" 2)))))
@@ -2875,7 +2979,7 @@ first question" c)))
                                     (define-values (r marked?) (wi 'ime-query))
                                     (set! ime-query (list r marked?))
                                     (wi 'simulate-ime! '((insert "你")))))
-             (cons (after 1100.0) (lambda () (wi 'post-key! "\r" 36 '(shift))))           ; ⇧Enter → 换行
+             (cons (after 1100.0) (lambda () (wi 'post-key! 'return '(shift))))           ; ⇧Enter → 换行
              (cons (after 1150.0) (lambda () (post-text! "x")))
              (cons (after 1200.0) enter!)                                                ; Enter → 发送
              (cons (after 1400.0) (lambda ()
@@ -2884,10 +2988,10 @@ first question" c)))
       [ime-real
        ;; 真实输入法（P4）：五笔 86 二级简码 wq → 你，vb → 好；按键必须带 CGEvent（post-key-cg!）
        (list (cons (after 650.0) (lambda () (eprintf "ime diag: ~a\n" (wi 'ime-diagnostics))))
-             (cons (after 700.0) (lambda () (wi 'post-key-cg! 13) (wi 'post-key-cg! 12)))
-             (cons (after 1100.0) (lambda () (wi 'post-key-cg! 49)))
-             (cons (after 1500.0) (lambda () (wi 'post-key-cg! 9) (wi 'post-key-cg! 11)))
-             (cons (after 1900.0) (lambda () (wi 'post-key-cg! 49)))
+             (cons (after 700.0) (lambda () (wi 'post-key-cg! 'w) (wi 'post-key-cg! 'q)))
+             (cons (after 1100.0) (lambda () (wi 'post-key-cg! 'space)))
+             (cons (after 1500.0) (lambda () (wi 'post-key-cg! 'v) (wi 'post-key-cg! 'b)))
+             (cons (after 1900.0) (lambda () (wi 'post-key-cg! 'space)))
              (cons (after 2400.0) quit!))]
       [else '()]))
   (set! lint-active? (and (not replay-path) (or (pair? synth-steps) (and (getenv "PI2_LINT") #t))))   ; 逐帧显示检查
@@ -3043,39 +3147,7 @@ first question" c)))
             [(ev:key? ev)
              (when (ev:key-down? ev) (set! last-mods (ev:key-mods ev)) (set! keys (cons (ev:key-chars ev) keys)))
              (cond [(and (ev:key-down? ev) (or sidebar-focus? (sbp 'context-open?)) (not (svp 'open?)) (not (sbp 'editing?)) (sidebar-key! ev)) #t]   ; 侧栏单键
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memq 'shift (ev:key-mods ev)) (eqv? (ev:key-code ev) 14) (not (svp 'open?)))
-                    ;; ⌘⇧E：侧栏键盘模式（从当前会话开始）开 / 关
-                    (if sidebar-focus?
-                        (set-sidebar-focus! #f)
-                        (set-sidebar-focus! (let ([c (findf (lambda (se) (hash-ref se 'current #f)) (sbp 'sessions))])
-                                              (and c (hash-ref c 'key (hash-ref c 'path #f))))))
-                    #t]
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memq 'alt (ev:key-mods ev)) (eqv? (ev:key-code ev) 2))
-                    (dv 'toggle!) #t]                                                     ; ⌘⌥D：调试面板（按 keyCode：⌥ 会改字符）
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memq 'shift (ev:key-mods ev)) (eqv? (ev:key-code ev) 17) (not (svp 'open?)))
-                    (if (tpp 'open?) (tests-action! (list 'close)) (open-tests!)) #t]        ; ⌘⇧T：工作区测试流程面板
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (equal? (ev:key-chars ev) ","))
-                    (if (svp 'open?) (svp 'close!) (open-settings!)) #t]                 ; ⌘,：设置页
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memq 'shift (ev:key-mods ev)) (member (ev:key-chars ev) '("v" "V"))
-                         (not (svp 'open?)))
-                    ;; ⌘⇧V：以密钥粘贴（不看格式）。日志在这条按键之后补记句柄，回放时据此插 chip（回放没有剪贴板）
-                    (define txt (clip 'get))
-                    (when (and (string? txt) (not (string=? (string-trim txt) "")))
-                      (insert-secret-chip! txt #f)
-                      (jr 'record! 'win (ev:secret (secret-or-handle (string-trim txt)) "chat")))
-                    #t]
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memq 'shift (ev:key-mods ev)) (eqv? (ev:key-code ev) 40) (not (svp 'open?)))
-                    ;; ⌘⇧K：选中的文字 → 密钥 chip；操作日志里整段出现的原文换成句柄（逐字手打的那些按键补不回来）
-                    (define r (editor-secret-selection! e))
-                    (cond [r (jr 'redact! (string-trim (cdr r)) (secret-text (string-trim (cdr r))))
-                             (set! toast (cons (t 'app.secret-marked) (+ (current-inexact-milliseconds) 2500.0)))]
-                          [else (set! toast (cons (t 'app.secret-select-hint) (+ (current-inexact-milliseconds) 2500.0)))])
-                    #t]
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (equal? (ev:key-chars ev) "b"))
-                    (set! sidebar? (not sidebar?)) #t]                                    ; ⌘B：侧栏开 / 关
-                   [(and (ev:key-down? ev) (memq 'cmd (ev:key-mods ev)) (memv (ev:key-code ev) '(24 27 29)))
-                    ;; ⌘= / ⌘+ 放大，⌘- 缩小，⌘0 复原（按 keyCode：⇧ 会改字符）
-                    (set-zoom! (case (ev:key-code ev) [(24) (zoom-step zoom 1)] [(27) (zoom-step zoom -1)] [else 1.0])) #t]
+                   [(and (ev:key-down? ev) (global-key! ev)) #t]                    ; 全局快捷键（键位表）
                    [else d])]
             [(or (ev:text? ev) (ev:marked? ev) (ev:paste? ev) (ev:command? ev) (ev:secret? ev) (ev:attach? ev)) (handle-edit! ev)]
             [(ev:scroll? ev)
@@ -3083,7 +3155,7 @@ first question" c)))
              ;; 非像素级滚轮（普通鼠标）给的是行数，换成 point
              (define sx (ev:scroll-x ev))
              (define sy (ev:scroll-y ev))
-             (define dy (if (ev:scroll-precise? ev) (ev:scroll-dy ev) (* 20.0 (ev:scroll-dy ev))))
+             (define dy (scroll-points gc (ev:scroll-precise? ev) (ev:scroll-dy ev)))
              (set! mouse-x sx)
              (cond [(svp 'open?) (svp 'scroll! sx sy dy)]                               ; 设置页：模态
                    [(mpp 'scroll! sx sy dy) (void)]
@@ -3116,13 +3188,14 @@ first question" c)))
                (set! drag-divider? #f) (save-setting! 'sidebar-width sidebar-w) #t]
               [(and (eq? (ev:mouse-kind ev) 'move) (not (eq? (on-divider? x) divider-hot?)))
                (set! divider-hot? (on-divider? x))
-               (win 'set-cursor! (if divider-hot? 'resize-h 'arrow))
+               (apply-plat! (hasheq 'cursor (if divider-hot? 'resize-h 'arrow)))
                #t]
               [else
              (case (ev:mouse-kind ev)
                [(down)
                 ;; 右键 / ctrl-点击：只开侧栏行的上下文菜单（或关掉已开的菜单），不做别的
-                (define context? (or (eqv? (ev:mouse-button ev) 1) (memq 'ctrl (ev:mouse-mods ev))))
+                (define press (press-intent (ev:mouse-button ev) (ev:mouse-mods ev) (ev:mouse-clicks ev)))   ; compute/gesture.rkt
+                (define context? (eq? press 'context))
                 (define ctx-done?
                   (and context?
                        (begin (cond [(mpp 'open?) (mpp 'close!)]
@@ -3139,7 +3212,7 @@ first question" c)))
                 (define sh (and (not ctx-done?) (not ip) (not ph) (or (sbp 'context-open?) (in-sidebar? x)) (sbp 'hit x y)))
                 ;; 双击行 = 改名（第一下已经打开了它）
                 ;; 点行：松手时才打开（按下后拖动 = 拖行，不切会话）；双击 = 改名
-                (cond [(and sh (eq? (car sh) 'resume) (>= (ev:mouse-clicks ev) 2)) (sbp 'start-rename! (cadr sh)) (set! drag-cand #f)]
+                (cond [(and sh (eq? (car sh) 'resume) (eq? press 'activate-double)) (sbp 'start-rename! (cadr sh)) (set! drag-cand #f)]
                       [(and sh (eq? (car sh) 'resume)) (set! drag-cand (vector (cadr sh) x y))]
                       [sh (set! drag-cand #f) (session-action! sh)]
                       [else (set! drag-cand #f)])
@@ -3174,7 +3247,7 @@ first question" c)))
                      [(confirm) (editor-confirm-secret! e (caddr ih))]                 ; 待选密钥 → 作为密钥
                      [else (editor-remove-chip! e (caddr ih))])]
                   [(and ih (eq? (car ih) 'chip))
-                   (if (>= (ev:mouse-clicks ev) 2) (editor-unfold! e (cadr ih)) (editor-toggle-expand! e (cadr ih)))]
+                   (if (eq? press 'activate-double) (editor-unfold! e (cadr ih)) (editor-toggle-expand! e (cadr ih)))]
                   [(and ih (eq? (car ih) 'text))
                    (unless (editor-marked e)
                      (editor-move-to! e (cadr ih) #:extend? (and (memq 'shift (ev:mouse-mods ev)) #t))
@@ -3186,7 +3259,7 @@ first question" c)))
                 #t]
                [(drag)
                 (cond [(sbp 'dragging?) (sbp 'drag-move! x y) #t]
-                      [(and drag-cand (> (+ (abs (- x (vector-ref drag-cand 1))) (abs (- y (vector-ref drag-cand 2)))) 6.0))
+                      [(and drag-cand (drag-started? gc (vector-ref drag-cand 1) (vector-ref drag-cand 2) x y))
                        (sbp 'drag-start! (vector-ref drag-cand 0) x y) (set! drag-cand #f) (sbp 'drag-move! x y) #t]
                       [drag-minimap? (tr 'minimap-jump! y) #t]
                       [drag-transcript? (tr 'select-extend! x y) #t]
@@ -3209,7 +3282,7 @@ first question" c)))
             [else d])))))
       (when (and resize-at (>= (current-inexact-milliseconds) resize-at))
         (set! resize-at #f)
-        (win 'set-content-size! (car resize-to) (cdr resize-to)))
+        (apply-plat! (hasheq 'content-size (cons (car resize-to) (cdr resize-to)))))
       (define blink* (caret-on?))
       (define notice-expired? (and notice-until (>= (current-inexact-milliseconds) notice-until)))   ; 侧栏提示条 10 s 后收起
       (when notice-expired? (set! notice-until #f) (sbp 'set-notice! #f))
@@ -3341,6 +3414,7 @@ first question" c)))
 
 (module+ main
   (define selftest? #f)
+  (define conformance? #f)
   (define png #f)
   (define snapshot-path #f)
   (define size (cons 900.0 720.0))
@@ -3396,6 +3470,7 @@ first question" c)))
     (command-line
      #:once-each
      [("--selftest") "offscreen render + pixel readback, no window" (set! selftest? #t)]
+     [("--conformance") "renderer conformance: the same drawlists through Metal and the reference rasterizer (compute/softraster.rkt)" (set! conformance? #t)]
      [("--png") path "selftest: also write the text render to <path>" (set! png path)]
      [("--snapshot") path "render a typical scene offscreen to <path> (PNG, scale 2)" (set! snapshot-path path)]
      [("--size") wxh "snapshot size in points (default 900x720)" (set! size (parse-size wxh))]
@@ -3456,6 +3531,11 @@ first question" c)))
   (current-lang (or (lang-from-tag lang-flag) (lang-from-tag (getenv "PI2_LANG"))
                     (resolve-lang (hash-ref (load-gui-settings) 'lang 'system))))   ; 设置页存的 > 系统首选语言 > zh
   (cond
+    [conformance?
+     (define rs (conformance))
+     (define bad (for/list ([r (in-list rs)] #:unless (conformance-pass? (second r) (third r))) (first r)))
+     (cond [(null? bad) (printf "CONFORMANCE ok\n")]
+           [else (printf "CONFORMANCE FAIL: ~a\n" bad) (exit 1)])]
     [selftest?
      (define failures (selftest png))
      (cond [(null? failures) (printf "SELFTEST ok\n")]

@@ -50,7 +50,7 @@
 
 ;; ---------------------------------------------------------------- 粘贴进编辑器
 
-(test-case "paste: big text becomes one atomic chip between typed instructions"
+(test-case "paste big text becomes one atomic chip between typed instructions"
   (define e (make-editor))
   (type! e "看下这个报错 ")
   (define f (editor-paste! e TRACE))
@@ -60,7 +60,7 @@
   (check-equal? (editor-chips e) (list (fold-id f)))
   (check-equal? (editor-flatten e) (string-append "看下这个报错 " TRACE " 怎么修？")))
 
-(test-case "paste: short snippet is inserted as editable text"
+(test-case "paste short snippet is inserted as editable text"
   (define e (make-editor))
   (check-false (editor-paste! e SHORT))
   (check-equal? (editor-text e) SHORT)
@@ -71,13 +71,13 @@
   (type! e "a")
   (editor-paste! e TRACE)
   (type! e "b")
-  (cmd! e 'moveLeft:)
-  (cmd! e 'deleteBackward:)
+  (cmd! e 'move-left)
+  (cmd! e 'delete-backward)
   (check-equal? (editor-text e) "ab")
   (check-equal? (editor-chips e) '())
-  (cmd! e 'undo:)
+  (cmd! e 'undo)
   (check-equal? (editor-flatten e) (string-append "a" TRACE "b"))
-  (cmd! e 'redo:)
+  (cmd! e 'redo)
   (check-equal? (editor-text e) "ab"))
 
 (test-case "cursor steps over a chip in one move; selection across chips flattens on copy"
@@ -87,11 +87,11 @@
   (editor-paste! e LOG)
   (type! e "y")
   (editor-move-to! e 1)
-  (cmd! e 'moveRight:)
+  (cmd! e 'move-right)
   (check-equal? (editor-cursor e) 2)
-  (cmd! e 'moveRightAndModifySelection: 'moveRightAndModifySelection:)
-  (check-equal? (editor-command! e 'copy:) (cons 'copy (string-append LOG "y")))
-  (check-equal? (editor-command! e 'cut:) (cons 'copy (string-append LOG "y")))
+  (cmd! e 'select-right 'select-right)
+  (check-equal? (editor-command! e 'copy) (cons 'copy (string-append LOG "y")))
+  (check-equal? (editor-command! e 'cut) (cons 'copy (string-append LOG "y")))
   (check-equal? (editor-flatten e) (string-append "x" DIFF)))
 
 (test-case "multiple chips keep their order through deletes in the middle"
@@ -115,7 +115,7 @@
   (check-equal? (editor-text e) (string-append "see: " LOG))
   (check-equal? (editor-chips e) '())
   (check-false (editor-expanded e))
-  (cmd! e 'undo:)
+  (cmd! e 'undo)
   (check-equal? (editor-text e) (string-append "see: " OBJ-STR)))
 
 ;; ---------------------------------------------------------------- 打字 / 撤销合并
@@ -123,18 +123,18 @@
 (test-case "consecutive typing is one undo step; a cursor move breaks it"
   (define e (make-editor))
   (for ([c "hello"]) (type! e (string c)))
-  (cmd! e 'moveLeft:)
+  (cmd! e 'move-left)
   (for ([c "XY"]) (type! e (string c)))
   (check-equal? (editor-text e) "hellXYo")
-  (cmd! e 'undo:)
+  (cmd! e 'undo)
   (check-equal? (editor-text e) "hello")
-  (cmd! e 'undo:)
+  (cmd! e 'undo)
   (check-equal? (editor-text e) ""))
 
 (test-case "typing replaces the selection"
   (define e (make-editor))
   (type! e "hello world")
-  (cmd! e 'moveWordLeftAndModifySelection:)
+  (cmd! e 'select-word-left)
   (type! e "racket")
   (check-equal? (editor-text e) "hello racket"))
 
@@ -144,34 +144,34 @@
   (define e (make-editor))
   (define fam "👨‍👩‍👧")
   (type! e (string-append "e" (string (integer->char #x301)) fam "z"))
-  (cmd! e 'moveLeft:)
-  (cmd! e 'deleteBackward:)
+  (cmd! e 'move-left)
+  (cmd! e 'delete-backward)
   (check-equal? (editor-text e) (string-append "e" (string (integer->char #x301)) "z"))
-  (cmd! e 'deleteBackward:)
+  (cmd! e 'delete-backward)
   (check-equal? (editor-text e) "z"))
 
 (test-case "word moves: Latin words, CJK one char per step, chip one step"
   (define e (make-editor))
   (type! e "foo bar 你好")
   (editor-paste! e LOG)
-  (check-equal? (begin (cmd! e 'moveWordLeft:) (editor-cursor e)) 10)
-  (check-equal? (begin (cmd! e 'moveWordLeft:) (editor-cursor e)) 9)
-  (check-equal? (begin (cmd! e 'moveWordLeft:) (editor-cursor e)) 8)
-  (check-equal? (begin (cmd! e 'moveWordLeft:) (editor-cursor e)) 4)
-  (cmd! e 'deleteWordBackward:)
+  (check-equal? (begin (cmd! e 'move-word-left) (editor-cursor e)) 10)
+  (check-equal? (begin (cmd! e 'move-word-left) (editor-cursor e)) 9)
+  (check-equal? (begin (cmd! e 'move-word-left) (editor-cursor e)) 8)
+  (check-equal? (begin (cmd! e 'move-word-left) (editor-cursor e)) 4)
+  (cmd! e 'delete-word-backward)
   (check-equal? (editor-text e) (string-append "bar 你好" OBJ-STR)))
 
 (test-case "line commands on multi-line text"
   (define e (make-editor))
   (type! e "first\nsecond line\nthird")
   (editor-move-to! e 9)                                   ; second 里
-  (cmd! e 'moveToBeginningOfLine:)
+  (cmd! e 'move-line-start)
   (check-equal? (editor-cursor e) 6)
-  (cmd! e 'moveToEndOfLine:)
+  (cmd! e 'move-line-end)
   (check-equal? (editor-cursor e) 17)
-  (cmd! e 'deleteToBeginningOfLine:)
+  (cmd! e 'delete-to-line-start)
   (check-equal? (editor-text e) "first\n\nthird")
-  (cmd! e 'deleteToEndOfLine:)                             ; 行尾处删掉换行本身
+  (cmd! e 'delete-to-line-end)                             ; 行尾处删掉换行本身
   (check-equal? (editor-text e) "first\nthird"))
 
 ;; ---------------------------------------------------------------- 提交 / 历史
@@ -179,8 +179,8 @@
 (test-case "Enter asks the caller; Option-Enter inserts a newline"
   (define e (make-editor))
   (type! e "a")
-  (check-eq? (cmd! e 'insertNewline:) 'submit)
-  (cmd! e 'insertNewlineIgnoringFieldEditor:)
+  (check-eq? (cmd! e 'insert-newline) 'submit)
+  (cmd! e 'insert-line-break)
   (type! e "b")
   (check-equal? (editor-text e) "a\nb"))
 
@@ -223,7 +223,7 @@
 (test-case "starting composition replaces the selection; empty marked string cancels"
   (define e (make-editor))
   (type! e "abc")
-  (cmd! e 'selectAll:)
+  (cmd! e 'select-all)
   (editor-set-marked! e "wq" 2)
   (check-equal? (editor-text e) "")
   (editor-set-marked! e "" 0)
@@ -243,7 +243,7 @@
   (check-equal? (length (editor-chips e)) 1)
   (check-regexp-match #rx"^on host a .* tail$" (editor-text e))
   (check-equal? (editor-cursor e) (string-length (editor-text e)))
-  (editor-command! e 'undo:)                                                  ; 撤销栈跟着草稿
+  (editor-command! e 'undo)                                                  ; 撤销栈跟着草稿
   (check-false (regexp-match? #rx"tail$" (editor-text e))))
 
 (test-case "mark the selection as a secret: becomes a confirmed secret chip; empty / whitespace / chip-containing selections are refused; undo restores"
@@ -258,10 +258,10 @@
   (check-false (regexp-match? #rx"abcd1234" (editor-text e)))
   (check-regexp-match #rx"⟦secret:[0-9a-f]+⟧" (editor-flatten e))       ; 发出去的是占位符
   (check-false (editor-secret-selection! e))                            ; 没有选区
-  (editor-command! e 'selectAll:)
+  (editor-command! e 'select-all)
   (check-false (editor-secret-selection! e))                            ; 选区里有 chip
   (editor-move-to! e 0)
-  (editor-command! e 'undo:)
+  (editor-command! e 'undo)
   (check-regexp-match #rx"abcd1234efgh5678" (editor-text e)))
 
 (test-case "attachment chips: one atomic chip per file; sent text has nothing for it; label shows icon, name and size"
@@ -272,7 +272,7 @@
   (check-true (media-fold? f))
   (check-equal? (fold-label f) "🖼 screenshot 2026-10-25.png · 793.3 KB")
   (check-equal? (editor-flatten e) "see  please")
-  (editor-command! e 'deleteBackward:) (for ([i 6]) (editor-command! e 'deleteBackward:))   ; 删掉 " please"
-  (editor-command! e 'deleteBackward:)                                                       ; 一次退格删掉整个 chip
+  (editor-command! e 'delete-backward) (for ([i 6]) (editor-command! e 'delete-backward))   ; 删掉 " please"
+  (editor-command! e 'delete-backward)                                                       ; 一次退格删掉整个 chip
   (check-equal? (editor-chips e) '())
   (check-equal? (editor-text e) "see "))

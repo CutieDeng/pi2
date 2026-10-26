@@ -353,14 +353,14 @@ EOF
              (lambda (use config)
                (define g (gpu-open #:layer? (hash-ref config 'layer? #t) #:atlas-size (hash-ref config 'atlas-size 2048)))
                (list (implement gpu-port
-                                'layer (lambda () (gpu-layer g))
+                                'surface (lambda () (gpu-layer g))                ; macOS：CAMetalLayer 指针（窗口把它挂到视图上）
                                 'resize! (lambda (w h scale) (gpu-resize! g w h scale))
                                 'render! (lambda (dl clear w h scale) (gpu-render! g dl clear w h #:scale scale))
                                 'render-offscreen (lambda (dl clear pw ph scale) (gpu-render-offscreen g dl clear pw ph #:scale scale))
                                 'upload-atlas! (lambda (bytes rect) (gpu-atlas-upload! g bytes rect))
                                 'upload-images! (lambda (bytes rect) (gpu-images-upload! g bytes rect))
                                 ;; 液态玻璃：透明的第二张层（侧栏画在上面），清成全透明
-                                'overlay-layer (lambda () (gpu-overlay-layer! g))
+                                'overlay-surface (lambda () (gpu-overlay-layer! g))
                                 'set-opaque! (lambda (on?) (m-set-opaque (gpu-layer g) on?))   ; 主层透明：窗口透出桌面（液态玻璃·透出桌面）
                                 'render-overlay! (lambda (dl w h scale) (and (gpu-overlay g) (gpu-render! g dl '(0.0 0.0 0.0 0.0) w h #:scale scale #:layer (gpu-overlay g))))
                                 'device-name (lambda () (gpu-device-name g)))))))

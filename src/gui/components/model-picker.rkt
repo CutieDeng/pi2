@@ -8,17 +8,11 @@
 
 (require racket/list
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt"
+         "../compute/view.rkt" "../compute/tokens.rkt")                 ; 视图平面（元素树 → 布局 → drawlist + 命中）、设计参数
 
 (define WARN '(0.95 0.75 0.35 1.0))
 (define OK '(0.45 0.80 0.55 1.0))
-(define ROW-H 26.0)
-(define HEAD-H 24.0)
-(define TITLE-H 22.0)
-(define MENU-W 520.0)
-(define LEFT-W 200.0)
-(define MAX-H 360.0)
-(define PAD 10.0)
 
 ;; state：hash（provider model reasoning）；options：内核 providers 事件；scroll-l / scroll-r：两栏偏移；
 ;; reveal?：下一帧把选中项滚进视区；panes：(vector 左栏矩形 右栏矩形 菜单矩形)，矩形 = (vector x y w h)，滚轮路由用
@@ -121,27 +115,85 @@
   (for/list ([m (in-list ms)]) (list 'model m m (equal? m cur) (and (member m loaded) (cons (t 'mp.loaded) OK)) #f))
 ) ; end define right-rows
 
+;; 视图平面（compute/view.rkt）：界面是元素树（数据），坐标 / 裁剪 / 命中区由布局推出（2026-10-26 起；原来边算坐标边画、边登记命中区）。
+;; 尺寸来自设计参数（compute/tokens.rkt）。
+(define ROW-H (tk 'menu-row-h)) (define HEAD-H (tk 'menu-head-h)) (define TITLE-H (tk 'menu-title-h))
+(define MENU-W (tk 'picker-menu-w)) (define LEFT-W (tk 'picker-left-w)) (define MAX-H (tk 'menu-max-h)) (define PAD (tk 'menu-pad))
+(define MENU-BG '(0.14 0.15 0.18 1.0)) (define MENU-BORDER '(0.26 0.27 0.32 1.0)) (define SEP '(0.24 0.25 0.30 1.0))
+(define SEL-FILL '(0.20 0.28 0.45 1.0)) (define BAR '(0.40 0.42 0.48 1.0))
+(define HOVER-FILL (append HOVER-ON-MENU '(1.0)))
+;; 响应式规则（元数据）：菜单打开 / 当前供应商变了 → 两栏把选中项滚到视区中间（reveal?）；关菜单 → 清悬停
+(define REACTIVE-RULES '((reveal-selected #:on (opened provider-changed) #:panes (left right))
+                         (clear-hover #:on (closed))))
+
 (define (row-h r) (if (eq? (car r) 'group) TITLE-H ROW-H))
+
+;; 一行 → 元素
+(define (row-el s r)
+  (define-values (kind payload txt sel? note indent?) (apply values r))
+  (case kind
+    [(group)
+     (ui-box #:dir 'row #:h TITLE-H #:align 'end #:pad (vector 0.0 8.0 3.0 6.0)
+          (ui-text txt #:font 'small #:color DIM #:grow 1)
+          (and note (ui-text (car note) #:font 'small #:color (cdr note) #:fit? #f)))]
+    [else
+     (define hov? (equal? (mp-hover s) (cons kind payload)))
+     (define ind (if indent? 12.0 0.0))
+     (ui-box #:dir 'row #:h ROW-H #:pad (vector 0.0 6.0 0.0 0.0)            ; 右边 6：滚动条
+          (ui-box #:dir 'row #:grow 1 #:align 'center #:fill (cond [sel? SEL-FILL] [hov? HOVER-FILL] [else #f]) #:radius (tk 'radius-s)
+               #:hit (cons kind payload) #:pad (vector 0.0 6.0 0.0 (+ 6.0 ind))
+               (ui-box #:w 16.0 (and sel? (ui-text "✓" #:font 'body #:color TEXT)))   ; 选中标记占固定列
+               (ui-text txt #:font 'body #:color TEXT #:grow 1)                      ; 长名字截断成一行
+               (and note (ui-text (car note) #:font 'small #:fit? #f
+                               #:color (if (and sel? (equal? (cdr note) DIM)) DIM-ON-ACCENT (cdr note))))))]))   ; 选中行的蓝底上：DIM 只有 3.6
+
+(define (pane-el s id title rows offset)
+  (ui-box #:dir 'column #:grow 1
+       (ui-box #:dir 'row #:h HEAD-H #:align 'end #:pad (vector 0.0 6.0 4.0 6.0) (ui-text title #:font 'small #:color DIM #:grow 1))
+       (apply ui-scroll id #:offset offset #:bar BAR (for/list ([r (in-list rows)]) (row-el s r)))))
+
+(define (footer-el s)
+  (define levels (filter string? (j (mp-options s) 'reasoning_levels '("off" "low" "medium" "high" "max"))))
+  (define rules (filter hash? (j (mp-options s) 'adaptations '())))
+  (ui-box #:dir 'column #:pad (vector 0.0 PAD 0.0 PAD)
+       (ui-box #:dir 'row #:h TITLE-H #:align 'end #:pad (vector 0.0 0.0 2.0 0.0) (ui-text (t 'mp.reasoning) #:font 'small #:color DIM #:fit? #f))
+       ;; 推理档（分段按钮）
+       (apply ui-box #:dir 'row #:h ROW-H
+              (for/list ([l (in-list levels)])
+                (define cur? (equal? l (j (mp-state s) 'reasoning)))
+                (define hov? (equal? (mp-hover s) (cons 'reasoning l)))
+                (ui-box #:grow 1 #:pad 2.0 #:hit (cons 'reasoning l)
+                     (ui-box #:dir 'row #:grow 1 #:align 'center #:fill (cond [cur? SEL-FILL] [hov? HOVER-FILL] [else #f]) #:radius (tk 'radius-s)
+                          (ui-text l #:font 'small #:color (if cur? TEXT DIM) #:align 'center #:grow 1)))))
+       (ui-box #:dir 'row #:h TITLE-H #:align 'end #:pad (vector 0.0 0.0 2.0 0.0) (ui-text (t 'mp.adapt) #:font 'small #:color DIM #:fit? #f))
+       ;; 当前目标匹配到的增强适配规则（点 = 开 / 关；开着的带 ✓；放不下的不画）
+       (if (null? rules)
+           (ui-box #:dir 'row #:h ROW-H #:align 'center (ui-text (t 'mp.adapt-none) #:font 'small #:color DIM #:fit? #f))
+           (apply ui-box #:dir 'row #:h ROW-H #:gap 6.0 #:align 'center #:overflow 'hide
+                  (for/list ([r (in-list rules)])
+                    (define on? (eq? (j r 'enabled #t) #t))
+                    (define hov? (equal? (mp-hover s) (cons 'adapt (j r 'name))))
+                    (ui-box #:dir 'row #:h (- ROW-H 6.0) #:align 'center #:pad (vector 0.0 8.0 0.0 8.0) #:radius (tk 'radius-s)
+                         #:fill (if on? (list 0.18 0.30 0.24 (if hov? 1.0 0.9)) (list 0.15 0.16 0.19 (if hov? 1.0 0.9)))
+                         #:hit (cons 'adapt (vector (j r 'name) on?))
+                         (ui-text (string-append (if on? "✓ " "") (j r 'name "?")) #:font 'small #:color (if on? TEXT DIM) #:fit? #f)))))))
 
 ;; 芯片画在 (x, y)（y = 状态行文字顶）；打开时菜单底边贴芯片上方。返回芯片宽度（无状态时 0，不画）。
 (define (mp-render! s dl x y max-w win-h scale)
   (define rc (mp-rc s))
-  (define lay (rich-ctx-layout rc))
-  (define at (rich-ctx-atlas rc))
-  (define hits '())
-  (define (hit! kind payload hx hy hw hh) (set! hits (cons (vector kind payload hx hy hw hh) hits)))
   (cond
     [(not (mp-state s)) (set-mp-hits! s '()) (set-mp-panes! s #f) 0.0]
     [else
-     (define tb (fit-line lay (chip-text s) 'small (max 60.0 (- max-w 16.0))))
-     (define cw (+ (text-block-width tb) 16.0))
-     (define ch (+ (text-block-height tb) 4.0))
+     (define chip (ui-box #:dir 'row #:align 'center #:pad (vector 0.0 (tk 'chip-pad-x) 0.0 (tk 'chip-pad-x)) #:radius (tk 'radius-m)
+                       #:fill (if (mp-open? s) '(0.24 0.27 0.36 1.0) '(0.17 0.18 0.22 1.0)) #:hit (cons 'toggle #t)
+                       (ui-text (chip-text s) #:font 'small #:color (if (mp-open? s) DIM-ON-ACCENT DIM))))   ; 打开时芯片底是蓝灰：DIM 只有 3.8
+     (define-values (nw nh) (measure (rich-ctx-layout rc) chip (max 60.0 max-w)))
+     (define cw (min nw (max 60.0 max-w)))
+     (define ch (+ nh 4.0))
      (define cy (- y 2.0))
-     (drawlist-rect! dl x cy cw ch (if (mp-open? s) 0.24 0.17) (if (mp-open? s) 0.27 0.18) (if (mp-open? s) 0.36 0.22) 1.0 #:radius 6.0)
-     (paint-text! dl at tb (+ x 8.0) y (if (mp-open? s) DIM-ON-ACCENT DIM) #:scale scale)   ; 打开时芯片底是蓝灰：DIM 只有 3.8
-     (hit! 'toggle #t x cy cw ch)
-     (if (mp-open? s) (render-menu! s dl lay at x cy scale hit!) (set-mp-panes! s #f))
-     (set-mp-hits! s hits)
+     (define-values (chip-hits _r _s) (render-view! rc dl chip x cy cw ch scale))
+     (define menu-hits (if (mp-open? s) (render-menu! s dl x cy scale) (begin (set-mp-panes! s #f) '())))
+     (set-mp-hits! s (reverse (append chip-hits menu-hits)))       ; 找命中时从后画的找起
      cw])
 ) ; end define mp-render!
 
@@ -153,122 +205,37 @@
           [else (loop (cdr rs) (+ y (row-h (car rs))))]))
 ) ; end define selected-offset
 
-(define (render-menu! s dl lay at x chip-y scale hit!)
+;; 菜单：约束（宽 MENU-W；高 = 上限 MAX-H 与芯片上方可用空间的较小者，至少放得下表头 + 两行 + 底栏；底边贴芯片上方 6）
+;; → 元素树 → 布局 / 绘制；返回命中区（绘制顺序）
+(define (render-menu! s dl x chip-y scale)
   (define foot-h (* 2 (+ TITLE-H ROW-H)))                                     ; 推理档 + 适配规则
   (define mh (max (+ (* 2 PAD) foot-h HEAD-H (* 2 ROW-H)) (min MAX-H (- chip-y 6.0 8.0))))
   (define my (- chip-y 6.0 mh))
-  (define body-y (+ my PAD))
-  (define body-h (- mh (* 2 PAD) foot-h))
-  (define lx (+ x 4.0))
-  (define lw (- LEFT-W 8.0))
-  (define rx (+ x LEFT-W 4.0))
-  (define rw (- MENU-W LEFT-W 8.0))
-  (drawlist-rect! dl (- x 1.0) (- my 1.0) (+ MENU-W 2.0) (+ mh 2.0) 0.26 0.27 0.32 1.0 #:radius 9.0)   ; 描边
-  (drawlist-rect! dl x my MENU-W mh 0.14 0.15 0.18 1.0 #:radius 8.0)
-  (drawlist-rect! dl (+ x LEFT-W) (+ body-y 2.0) 1.0 (- body-h 4.0) 0.24 0.25 0.30 1.0)            ; 两栏分隔
-  (drawlist-rect! dl (+ x PAD) (+ body-y body-h) (- MENU-W (* 2 PAD)) 1.0 0.24 0.25 0.30 1.0)         ; 与底栏分隔
-  (hit! 'menu #t x my MENU-W mh)                                                                     ; 菜单底板：点空白不关闭
+  (define body-h (- mh (* 2 PAD) foot-h 1.0))
+  (define view-h (- body-h HEAD-H))
   (define lrows (left-rows s))
   (define rrows (right-rows s))
-  (define view-h (- body-h HEAD-H))
-  ;; 刚打开 / 刚换了供应商：两栏都把选中项滚到视区中间
-  (when (mp-reveal? s)
+  (when (mp-reveal? s)                                                        ; 规则 reveal-selected
     (set-mp-reveal?! s #f)
     (set-mp-scroll-l! s (- (selected-offset lrows) (/ (- view-h ROW-H) 2)))
     (set-mp-scroll-r! s (- (selected-offset rrows) (/ (- view-h ROW-H) 2))))
-  ;; 一栏：表头固定，行裁剪滚动；返回裁剪后的偏移
-  (define (pane! rows px pw title scroll)
-    (define tb (fit-line lay title 'small (- pw 12.0)))
-    (paint-text! dl at tb (+ px 6.0) (+ body-y (- HEAD-H (text-block-height tb) 4.0)) DIM #:scale scale)
-    (define vy (+ body-y HEAD-H))
-    (define content-h (for/sum ([r (in-list rows)]) (row-h r)))
-    (define smax (max 0.0 (- content-h view-h)))
-    (define sc (max 0.0 (min smax scroll)))
-    (drawlist-set-clip! dl (vector px vy pw view-h))
-    (for/fold ([ry (- vy sc)]) ([r (in-list rows)])
-      (define h (row-h r))
-      (when (and (< ry (+ vy view-h)) (> (+ ry h) vy)) (row! r px pw ry (cons vy (+ vy view-h))))
-      (+ ry h))
-    (drawlist-set-clip! dl #f)
-    (when (> smax 0.0)
-      (define th (max 20.0 (* view-h (/ view-h content-h))))
-      (drawlist-rect! dl (+ px pw -4.0) (+ vy (* (- view-h th) (/ sc smax))) 3.0 th 0.40 0.42 0.48 1.0 #:radius 1.5))
-    sc)
-  (define (row! r px pw ry clip)
-    (define-values (kind payload text sel? note indent?) (apply values r))
-    (define h (row-h r))
-    (define (hit-row! k p hx hw)
-      (define y0 (if clip (max ry (car clip)) ry))
-      (define y1 (if clip (min (+ ry h) (cdr clip)) (+ ry h)))
-      (when (> y1 y0) (hit! k p hx y0 hw (- y1 y0))))
-    (case kind
-      [(group)
-       (define tb (fit-line lay text 'small (- pw 80.0)))
-       (paint-text! dl at tb (+ px 6.0) (+ ry (- h (text-block-height tb) 3.0)) DIM #:scale scale)
-       (when note
-         (define nb (lay (car note) 'small 1000.0 #f))
-         (paint-text! dl at nb (- (+ px pw) 8.0 (text-block-width nb)) (+ ry (- h (text-block-height nb) 3.0)) (cdr note) #:scale scale))]
-      [else
-       (define hov? (equal? (mp-hover s) (cons kind payload)))
-       (when (or sel? hov?)
-         (drawlist-rect! dl px ry (- pw 6.0) h (if sel? 0.20 (car HOVER-ON-MENU)) (if sel? 0.28 (cadr HOVER-ON-MENU)) (if sel? 0.45 (caddr HOVER-ON-MENU)) 1.0 #:radius 5.0))
-       (define ind (if indent? 12.0 0.0))
-       (define tb (fit-line lay text 'body (- pw 30.0 ind (if note 58.0 6.0))))   ; 长名字截断成一行
-       (define ty (+ ry (/ (- h (text-block-line-height tb)) 2)))
-       (when sel? (paint-text! dl at (lay "✓" 'body 100.0 #f) (+ px 6.0 ind) ty TEXT #:scale scale))   ; 选中标记占固定列
-       (paint-text! dl at tb (+ px 22.0 ind) ty TEXT #:scale scale)
-       (when note
-         (define nb (lay (car note) 'small 1000.0 #f))
-         (paint-text! dl at nb (- (+ px pw) 12.0 (text-block-width nb)) (+ ry (/ (- h (text-block-height nb)) 2))
-                      (if (and sel? (equal? (cdr note) DIM)) DIM-ON-ACCENT (cdr note)) #:scale scale))   ; 选中行的蓝底上：DIM 只有 3.6
-       (hit-row! kind payload px (- pw 6.0))]))
-  (set-mp-scroll-l! s (pane! lrows lx lw (t 'mp.providers) (mp-scroll-l s)))
-  (set-mp-scroll-r! s (pane! rrows rx rw (let ([r (current-route s)]) (if r (t 'mp.members-of (j r 'name)) (t 'mp.models-of (j (mp-state s) 'provider "?"))))
-                             (mp-scroll-r s)))
-  (set-mp-panes! s (vector (vector lx body-y lw body-h) (vector rx body-y rw body-h) (vector x my MENU-W mh)))
-  ;; 底栏：推理档（分段按钮）
-  (define fy (+ body-y body-h))
-  (define ftb (lay (t 'mp.reasoning) 'small 1000.0 #f))
-  (paint-text! dl at ftb (+ x PAD) (+ fy (- TITLE-H (text-block-height ftb) 2.0)) DIM #:scale scale)
-  (define levels (filter string? (j (mp-options s) 'reasoning_levels '("off" "low" "medium" "high" "max"))))
-  (define ly (+ fy TITLE-H))
-  (define bw (/ (- MENU-W (* 2 PAD)) (max 1 (length levels))))
-  (for ([l (in-list levels)] [i (in-naturals)])
-    (define bx (+ x PAD (* i bw)))
-    (define cur? (equal? l (j (mp-state s) 'reasoning)))
-    (define hov? (equal? (mp-hover s) (cons 'reasoning l)))
-    (when (or cur? hov?)
-      (drawlist-rect! dl (+ bx 2.0) (+ ly 2.0) (- bw 4.0) (- ROW-H 4.0)
-                      (if cur? 0.20 (car HOVER-ON-MENU)) (if cur? 0.28 (cadr HOVER-ON-MENU)) (if cur? 0.45 (caddr HOVER-ON-MENU)) 1.0 #:radius 5.0))
-    (define tb (lay l 'small 1000.0 #f))
-    (paint-text! dl at tb (+ bx (/ (- bw (text-block-width tb)) 2)) (+ ly (/ (- ROW-H (text-block-height tb)) 2)) (if cur? TEXT DIM) #:scale scale)
-    (hit! 'reasoning l bx ly bw ROW-H))
-  ;; 底栏第二行：当前目标匹配到的增强适配规则（点 = 开 / 关；开着的带 ✓）
-  (define ay (+ ly ROW-H))
-  (define atb (lay (t 'mp.adapt) 'small 1000.0 #f))
-  (paint-text! dl at atb (+ x PAD) (+ ay (- TITLE-H (text-block-height atb) 2.0)) DIM #:scale scale)
-  (define rules (filter hash? (j (mp-options s) 'adaptations '())))
-  (define cy (+ ay TITLE-H))
-  (cond
-    [(null? rules)
-     (define tb (lay (t 'mp.adapt-none) 'small 1000.0 #f))
-     (paint-text! dl at tb (+ x PAD) (+ cy (/ (- ROW-H (text-block-height tb)) 2)) DIM #:scale scale)]
-    [else
-     (for/fold ([cx (+ x PAD)]) ([r (in-list rules)])
-       (define on? (eq? (j r 'enabled #t) #t))
-       (define label (string-append (if on? "✓ " "") (j r 'name "?")))
-       (define tb (fit-line lay label 'small (max 40.0 (- (+ x MENU-W) PAD cx 16.0))))
-       (define cw (+ (text-block-width tb) 16.0))
-       (cond
-         [(> (+ cx cw) (- (+ x MENU-W) PAD)) cx]                                ; 放不下的不画
-         [else
-          (define hov? (equal? (mp-hover s) (cons 'adapt (j r 'name))))
-          (drawlist-rect! dl cx (+ cy 3.0) cw (- ROW-H 6.0)
-                          (if on? 0.18 0.15) (if on? 0.30 0.16) (if on? 0.24 0.19) (if hov? 1.0 0.9) #:radius 5.0)
-          (paint-text! dl at tb (+ cx 8.0) (+ cy (/ (- ROW-H (text-block-height tb)) 2)) (if on? TEXT DIM) #:scale scale)
-          (hit! 'adapt (vector (j r 'name) on?) cx (+ cy 3.0) cw (- ROW-H 6.0))
-          (+ cx cw 6.0)]))])
-  (void)
+  (define tree
+    (ui-box #:dir 'column #:w MENU-W #:h mh #:pad (vector PAD 0.0 PAD 0.0) #:fill MENU-BG #:stroke MENU-BORDER #:radius (tk 'radius-l)
+         #:hit (cons 'menu #t) #:id 'menu                                     ; 菜单底板：点空白不关闭
+         (ui-box #:dir 'row #:h body-h
+              (ui-box #:dir 'column #:w LEFT-W #:pad (vector 0.0 4.0 0.0 4.0) #:id 'left-pane
+                   (pane-el s 'left (t 'mp.providers) lrows (mp-scroll-l s)))
+              (ui-box #:w 1.0 #:fill SEP)                                        ; 两栏分隔
+              (ui-box #:dir 'column #:grow 1 #:pad (vector 0.0 4.0 0.0 3.0) #:id 'right-pane
+                   (pane-el s 'right (let ([r (current-route s)]) (if r (t 'mp.members-of (j r 'name)) (t 'mp.models-of (j (mp-state s) 'provider "?"))))
+                            rrows (mp-scroll-r s))))
+         (ui-box #:dir 'row #:h 1.0 #:pad (vector 0.0 PAD 0.0 PAD) (ui-box #:grow 1 #:fill SEP))   ; 与底栏分隔
+         (footer-el s)))
+  (define-values (hits regions scrolls) (render-view! (mp-rc s) dl tree x my MENU-W mh scale))
+  (set-mp-scroll-l! s (vector-ref (hash-ref scrolls 'left) 0))
+  (set-mp-scroll-r! s (vector-ref (hash-ref scrolls 'right) 0))
+  (set-mp-panes! s (vector (hash-ref regions 'left-pane) (hash-ref regions 'right-pane) (hash-ref regions 'menu)))
+  hits
 ) ; end define render-menu!
 
 (define (in-rect? r x y)

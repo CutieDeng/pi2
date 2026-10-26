@@ -14,33 +14,35 @@
 ;;   build-frame! (dl thunk) → 实例数（atlas 满则重建一次）；take-dirty! () → #f | (cons 位图 rect)；glyph-count () → n
 (define-interface text-layout layout rich atlas build-frame! take-dirty! glyph-count)
 
-;; GPU 渲染
-;;   layer () → CAMetalLayer 指针或 #f；resize! (w h scale)；render! (dl clear w h scale) → bool
+;; GPU 渲染（drawlist 的契约见 drawlist.rkt；参考实现 softraster.rkt，一致性判据 conformance.rkt）
+;;   surface () → 平台的绘制面句柄（macOS：CAMetalLayer 指针；Windows：渲染器与窗口约定的对象，如交换链）或 #f（只离屏）；
+;;   resize! (w h scale)；render! (dl clear w h scale) → bool
 ;;   render-offscreen (dl clear pw ph scale) → BGRA bytes；upload-atlas! (bytes rect)；device-name ()
-;;   overlay-layer () → 第二张透明 CAMetalLayer（懒建）；render-overlay! (dl w h scale)：画到它上面（清成全透明）
+;;   overlay-surface () → 第二张透明绘制面（懒建；玻璃上的侧栏）；render-overlay! (dl w h scale)：画到它上面（清成全透明）
 ;;   set-opaque! (bool)：主层是否不透明（透出桌面时关）
-(define-interface gpu-port layer resize! render! render-offscreen upload-atlas! upload-images! device-name overlay-layer render-overlay! set-opaque!)
+(define-interface gpu-port surface resize! render! render-offscreen upload-atlas! upload-images! device-name overlay-surface render-overlay! set-opaque!)
 
-;; 窗口
-;;   size () → (values w h scale)；pump! () → 事件表；set-text-input-state! (caret-rect index)；
-;;   discard-marked! ()；on-live-resize! (proc)；set-content-size! (w h)；close! ()；set-cursor! ('arrow | 'resize-h)
-;;   glass? () → 有液态玻璃侧栏（窗口配置 'glass? 且系统有玻璃视图）；set-glass-rect! ((vector x y w h 圆角) | #f)：玻璃面板位置（#f = 不用）
-;;   set-transparent! (bool)：窗口透明（内容层画的是什么就是什么，没画的地方透出桌面）
+;; 窗口（GUI 元数据平面 2：能力与请求是数据，见 compute/platform.rkt）
+;;   size () → (values w h scale)；pump! () → 逻辑事件表（compute/event.rkt）
+;;   caps () → 能力记录 hash（键取自 platform.rkt CAPABILITIES：glass transparent-window ime capture native-input-sim precise-scroll pinch mouse-buttons）
+;;   apply! (请求表)：把平台状态设成请求的值（platform.rkt req：text-input material glass-rect caret cursor content-size）；
+;;     拼装层每帧算出想要的状态，state-diff 出变了的键再交给它——平台这一侧只认这一个入口
+;;   discard-marked! ()：丢掉输入法正在组的字；on-live-resize! (proc)：拖动改尺寸时的同步回调；close! ()
 ;;   capture (hide-overlay? below?) → #f | (vector 宽 高 RGBA 每point像素)：截内容区（系统合成后；显示效果的自动检查）。
 ;;     没有屏幕录制权限时 below? 截不到下面的窗口（那部分是透明的），只有本窗口自己的内容
-;;   set-text-input-enabled! (bool)：#f 时按键不进输入法（只有原始按键事件）——侧栏有键盘焦点时的单键操作
-(define-interface window-port size pump! set-text-input-state! discard-marked! on-live-resize! set-content-size! close! set-cursor! glass? set-glass-rect!
-  set-transparent! capture set-text-input-enabled!)
+(define-interface window-port size pump! caps apply! discard-marked! on-live-resize! close! capture)
 
 ;; 剪贴板：get () → 字符串或 #f；set! (s)；call-with-private (thunk) —— 测试用私有剪贴板
 (define-interface clipboard get set! call-with-private)
 
 ;; 窗口测试替身输入（冒烟 / 验收脚本用）：合成鼠标、滚轮 (x y dy)、按键（含带 CGEvent 的按键）、直接投递粘贴、模拟输入法、
+;;   post-key! (逻辑键 [逻辑修饰键])、post-key-cg! (逻辑键 [修饰键])：键与修饰键用 keys.rkt 的逻辑词汇（'escape、'(primary shift)），
+;;     平台按自己的对照表合成原生按键——冒烟脚本因此与平台无关；post-chars! (字符串)：逐字打字（进输入上下文）
 ;; 查询输入法状态、窗口是否为 key 窗口（应用不在前台时没有 key 窗口，Edit 菜单动作无处投递）
 ;;   post-attach! (items)：直接投递附件事件（ev:attach，同粘贴 / 拖放文件）
 ;;   post-mouse-ns! (kind x y [button 0] [mods '()] [clicks 1])：造 NSEvent 交给窗口的 sendEvent:（命中测试 → 视图的 mouseDown: / rightMouseDown: …），
 ;;     与真实点击同一条 AppKit 路径；post-mouse! 直接入队、不经 AppKit
-(define-interface window-input post-mouse! post-mouse-ns! post-scroll! post-key! post-key-cg! post-paste! post-attach! simulate-ime! ime-query ime-diagnostics key?)
+(define-interface window-input post-mouse! post-mouse-ns! post-scroll! post-key! post-key-cg! post-chars! post-paste! post-attach! simulate-ime! ime-query ime-diagnostics key?)
 
 ;; 输入框
 ;;   editor () → 编辑器对象（计算层 editor.rkt，拼装层直接用其操作）；render! (dl x bottom w scale focused? caret-on?) → 顶边 y

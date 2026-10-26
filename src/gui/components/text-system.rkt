@@ -4,14 +4,10 @@
 ;; （计算层定义的闭包契约）交给输入框、对话区。
 
 (require "../compute/text-backend.rkt" "../compute/atlas.rkt" "../compute/layout.rkt" "../compute/drawlist.rkt"
-         "../compute/rich.rkt" "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt")
+         "../compute/rich.rkt" "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt" "../compute/tokens.rkt")
 
-;; fonts：键 → (cons 字体族 字号)；族名可用 "system" / "system-bold" / "monospace"
-(define DEFAULT-FONTS
-  (hasheq 'body '("system" . 14) 'title '("system-bold" . 17) 'mono '("monospace" . 13) 'small '("system" . 11)
-          ;; Markdown（S14）：行内样式与标题
-          'bold '("system-bold" . 14) 'italic '("system-italic" . 14) 'bold-italic '("system-bold-italic" . 14)
-          'code '("monospace" . 12.5) 'h1 '("system-bold" . 21) 'h2 '("system-bold" . 18) 'h3 '("system-bold" . 15.5)))
+;; fonts：键 → (cons 字体角色 字号)——字号表是设计参数（compute/tokens.rkt TYPE-SCALE，各平台共用）；角色 → 实际字体由平台的文字后端决定
+(define DEFAULT-FONTS TYPE-SCALE)
 
 (struct text-system (backend atlas cache fonts))
 

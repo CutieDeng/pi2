@@ -5,7 +5,7 @@
 
 (require racket/list racket/string "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/linebreak.rkt"
          "../compute/fold.rkt" "../compute/editor.rkt" "../compute/rich.rkt" "../compute/hub.rkt" "../compute/interfaces.rkt"
-         "../compute/i18n.rkt")
+         "../compute/i18n.rkt" "../compute/view.rkt")                     ; 视图平面
 
 (define MAX-LINES 8)
 (define PAD 12.0)
@@ -28,13 +28,13 @@
   (for/list ([id (in-list (editor-chips e))]) (editor-fold e id))
 ) ; end define editor-folds-in-order
 
-;; ---------------------------------------------------------------- 预览面板
+;; ---------------------------------------------------------------- 预览面板（视图平面：元素树）
 
-;; 返回 (values 面板高度 按钮列表)；按钮：(vector 'unfold|'remove|'confirm fold-id x y w h)（'confirm：待选密钥「作为密钥」）
-(define (paint-peek! dl rc f x bottom w scale)
+;; 折叠内容的预览面板：标题（摘要）+ 右上角按钮（移除 / 转成文本 / 待选密钥「作为密钥」）+ 正文前 PEEK-LINES 行 + 「还有 N 行」
+;; → 元素树；按钮的命中 = (cons 'peek (cons 种类 fold-id))
+(define (peek-tree rc f w)
   (define lay (rich-ctx-layout rc))
   (define inner (- w (* 2 PAD)))
-  (define header (lay (fold-summary f) 'small inner #f))
   (define secret? (secret-fold? f))
   ;; 密钥：不显示原值，只说明它去了哪里
   (define body-src (cond [secret? (t 'input.secret-hidden (fold-preview f))]
@@ -46,36 +46,27 @@
                                                #:when (or (= (line-end l) (string-length body-src))
                                                           (char=? (string-ref body-src (line-end l)) #\newline)))
                                        1))))
-  (define footer (and (> more 0) (lay (t 'input.peek-more more (fold-lines f)) 'small inner #f)))
-  (define hh (+ (text-block-height header) 8.0))
-  (define bh (* shown (text-block-line-height body)))
-  (define fh (if footer (+ 6.0 (text-block-height footer)) 0.0))
-  (define h (+ PAD hh bh fh PAD))
-  (define y (- bottom h))
-  (drawlist-rect! dl x y w h 0.24 0.25 0.30 1.0 #:radius 10.0)
-  (drawlist-rect! dl (+ x 1) (+ y 1) (- w 2) (- h 2) 0.11 0.11 0.13 1.0 #:radius 9.0)
-  (rich-paint! dl rc header '#() '() (+ x PAD) (+ y PAD) DIM scale)
-  ;; 右上角两个按钮
-  (define buttons
-    (for/fold ([bx (+ x w (- PAD))] [acc '()] #:result acc)
-              ([b (in-list (append (list (list 'remove (t 'input.remove)) (list 'unfold (t 'input.to-text)))
-                                   (if (eq? (fold-kind f) 'secret-pending) (list (list 'confirm (t 'input.as-secret))) '())))])
-      (define ltb (lay (cadr b) 'small 1000.0 #f))
-      (define bw (+ (text-block-width ltb) 16.0))
-      (define bh* (+ (text-block-line-height ltb) 4.0))
-      (define x0 (- bx bw))
-      (define y0 (+ y PAD -2.0))
-      (drawlist-rect! dl x0 y0 bw bh* 0.22 0.23 0.28 1.0 #:radius 5.0)
-      (rich-paint! dl rc ltb '#() '() (+ x0 8.0) (+ y0 2.0) TEXT scale)
-      (values (- x0 8.0) (cons (vector (car b) (fold-id f) x0 y0 bw bh*) acc))))
-  (rich-paint! dl rc body '#() '() (+ x PAD) (+ y PAD hh) '(0.80 0.82 0.85 1.0) scale #:line-count shown)
-  (when footer (rich-paint! dl rc footer '#() '() (+ x PAD) (+ y PAD hh bh 6.0) DIM scale))
-  (values h buttons)
-) ; end define paint-peek!
+  (define buttons (append (list (list 'remove (t 'input.remove)) (list 'unfold (t 'input.to-text)))
+                          (if (eq? (fold-kind f) 'secret-pending) (list (list 'confirm (t 'input.as-secret))) '())))
+  (ui-box #:fill '(0.24 0.25 0.30 1.0) #:radius 10.0 #:pad 1.0
+          (ui-box #:dir 'column #:fill '(0.11 0.11 0.13 1.0) #:radius 9.0 #:pad (- PAD 1.0)
+                  (apply ui-box #:dir 'row #:align 'start #:gap 8.0 #:pad (vector 0.0 0.0 8.0 0.0)
+                         (ui-text (fold-summary f) #:font 'small #:color DIM #:fit? #f #:grow 1)
+                         (for/list ([b (in-list (reverse buttons))])
+                           (ui-box #:dir 'row #:align 'center #:pad (vector 2.0 8.0 2.0 8.0) #:fill '(0.22 0.23 0.28 1.0) #:radius 5.0
+                                   #:hit (cons 'peek (cons (car b) (fold-id f)))
+                                   (ui-text (cadr b) #:font 'small #:color TEXT #:fit? #f))))
+                  ;; 正文：排好的块只画前 shown 行（自画的叶子：块的部分行）
+                  (ui-custom #:measure (lambda (_w) (* shown (text-block-line-height body)))
+                             #:paint (lambda (dl x y w h scale)
+                                       (rich-paint! dl rc body '#() '() x y '(0.80 0.82 0.85 1.0) scale #:line-count shown)
+                                       '()))
+                  (and (> more 0) (ui-box #:pad (vector 6.0 0.0 0.0 0.0) (ui-text (t 'input.peek-more more (fold-lines f)) #:font 'small #:color DIM #:fit? #f))))))
 
 ;; ---------------------------------------------------------------- 输入框
 
 ;; 底边锚定在 bottom。返回输入框（含预览面板）顶边 y。
+;; 视图平面：框（描边 + 底，聚焦时描边是蓝）是元素树；编辑区是自画的叶子（编辑器本身就是图元：字、chip、选区、组字下划线、光标、按整行滚动）
 (define (input-render! iv dl x bottom w scale #:focused? [focused? #t] #:caret-on? [caret-on? #t])
   (define e (input-view-editor iv))
   (define rc (input-view-rich iv))
@@ -102,52 +93,62 @@
   (set-input-view-scroll! iv scroll)
   (define box-h (+ (* visible lh) (* 2 PAD)))
   (define box-y (- bottom box-h))
-  (define tx (+ x PAD))
-  (define ty (+ box-y PAD))
-  ;; 框：描边 + 底
-  (define-values (br bg bb) (if focused? (values 0.33 0.45 0.70) (values 0.24 0.25 0.30)))
-  (drawlist-rect! dl x box-y w box-h br bg bb 1.0 #:radius 12.0)
-  (drawlist-rect! dl (+ x 1) (+ box-y 1) (- w 2) (- box-h 2) 0.13 0.13 0.16 1.0 #:radius 11.0)
-  (define (line-y k) (+ ty (* (- k scroll) lh)))
-  (define (visible-line? k) (and (>= k scroll) (< k (+ scroll visible))))
-  ;; 选区
-  (unless (or empty? marked)
-    (define-values (a b) (editor-selection e))
-    (when (< a b)
-      (define-values (ka xa) (text-block-caret tb a))
-      (define-values (kb xb) (text-block-caret tb b))
+  (define geo (box #f))                                       ; 编辑区画的时候记下：文字原点、光标矩形、chip 矩形
+  (define (paint-editor! dl tx ty _w _h scale)
+    (define (line-y k) (+ ty (* (- k scroll) lh)))
+    (define (visible-line? k) (and (>= k scroll) (< k (+ scroll visible))))
+    ;; 选区
+    (unless (or empty? marked)
+      (define-values (a b) (editor-selection e))
+      (when (< a b)
+        (define-values (ka xa) (text-block-caret tb a))
+        (define-values (kb xb) (text-block-caret tb b))
+        (for ([k (in-range ka (add1 kb))] #:when (visible-line? k))
+          (define ln (list-ref (text-block-lines tb) k))
+          (define x0 (if (= k ka) xa 0.0))
+          (define x1 (if (= k kb) xb (+ (line-end-x ln) 6.0)))
+          (drawlist-rect! dl (+ tx x0) (line-y k) (max 2.0 (- x1 x0)) lh 0.22 0.36 0.62 0.85))))
+    ;; 文字与 chip
+    (define chip-rects
+      (rich-paint! dl rc tb labels (if empty? '() folds) tx ty (if empty? DIM TEXT) scale
+                   #:first-line scroll #:line-count visible #:expanded (editor-expanded e)))
+    ;; 组字下划线
+    (when marked
+      (define-values (ka xa) (text-block-caret tb (car marked)))
+      (define-values (kb xb) (text-block-caret tb (cdr marked)))
       (for ([k (in-range ka (add1 kb))] #:when (visible-line? k))
         (define ln (list-ref (text-block-lines tb) k))
         (define x0 (if (= k ka) xa 0.0))
-        (define x1 (if (= k kb) xb (+ (line-end-x ln) 6.0)))
-        (drawlist-rect! dl (+ tx x0) (line-y k) (max 2.0 (- x1 x0)) lh 0.22 0.36 0.62 0.85))))
-  ;; 文字与 chip
-  (define chip-rects
-    (rich-paint! dl rc tb labels (if empty? '() folds) tx ty (if empty? DIM TEXT) scale
-                 #:first-line scroll #:line-count visible #:expanded (editor-expanded e)))
-  ;; 组字下划线
-  (when marked
-    (define-values (ka xa) (text-block-caret tb (car marked)))
-    (define-values (kb xb) (text-block-caret tb (cdr marked)))
-    (for ([k (in-range ka (add1 kb))] #:when (visible-line? k))
-      (define ln (list-ref (text-block-lines tb) k))
-      (define x0 (if (= k ka) xa 0.0))
-      (define x1 (if (= k kb) xb (line-end-x ln)))
-      (drawlist-rect! dl (+ tx x0) (+ (line-y k) (text-block-baseline tb) 3.0) (max 1.0 (- x1 x0)) 1.5
-                      0.85 0.86 0.90 1.0)))
-  ;; 光标
-  (define caret-rect (vector (+ tx caret-x) (+ (line-y caret-line) 2.0) 2.0 (- lh 4.0)))
-  (when (and focused? caret-on? (visible-line? caret-line))
-    (drawlist-rect! dl (vector-ref caret-rect 0) (vector-ref caret-rect 1) 1.5 (vector-ref caret-rect 3)
-                    0.55 0.70 1.0 1.0))
-  ;; 预览面板（在框上方）
-  (define-values (peek-h buttons)
-    (let ([id (editor-expanded e)])
-      (if (and id (memv id (editor-chips e)))
-          (paint-peek! dl rc (editor-fold e id) x (- box-y 8.0) w scale)
-          (values 0.0 '()))))
-  (set-input-view-geom! iv (geom x box-y w box-h tx ty tb scroll visible (if empty? "" display)
-                                 caret-rect chip-rects buttons))
+        (define x1 (if (= k kb) xb (line-end-x ln)))
+        (drawlist-rect! dl (+ tx x0) (+ (line-y k) (text-block-baseline tb) 3.0) (max 1.0 (- x1 x0)) 1.5
+                        0.85 0.86 0.90 1.0)))
+    ;; 光标
+    (define caret-rect (vector (+ tx caret-x) (+ (line-y caret-line) 2.0) 2.0 (- lh 4.0)))
+    (when (and focused? caret-on? (visible-line? caret-line))
+      (drawlist-rect! dl (vector-ref caret-rect 0) (vector-ref caret-rect 1) 1.5 (vector-ref caret-rect 3)
+                      0.55 0.70 1.0 1.0))
+    (set-box! geo (vector tx ty caret-rect chip-rects))
+    '())
+  (define frame
+    (ui-box #:fill (if focused? '(0.33 0.45 0.70 1.0) '(0.24 0.25 0.30 1.0)) #:radius 12.0 #:pad 1.0
+            (ui-box #:fill '(0.13 0.13 0.16 1.0) #:radius 11.0 #:pad (- PAD 1.0)
+                    (ui-custom #:measure (lambda (_w) (* visible lh)) #:paint paint-editor!))))
+  (render-view! rc dl frame x box-y w box-h scale)
+  ;; 预览面板（在框上方 8）
+  (define id (editor-expanded e))
+  (define-values (peek-h peek-hits)
+    (cond
+      [(and id (memv id (editor-chips e)))
+       (define tree (peek-tree rc (editor-fold e id) w))
+       (define-values (_pw ph) (measure (rich-ctx-layout rc) tree w))
+       (define-values (hits _r _s) (render-view! rc dl tree x (- box-y 8.0 ph) w ph scale))
+       (values ph hits)]
+      [else (values 0.0 '())]))
+  (define buttons (for/list ([h (in-list peek-hits)] #:when (eq? (vector-ref h 0) 'peek))
+                    (vector (car (vector-ref h 1)) (cdr (vector-ref h 1)) (vector-ref h 2) (vector-ref h 3) (vector-ref h 4) (vector-ref h 5))))
+  (define g (unbox geo))
+  (set-input-view-geom! iv (geom x box-y w box-h (vector-ref g 0) (vector-ref g 1) tb scroll visible (if empty? "" display)
+                                 (vector-ref g 2) (vector-ref g 3) buttons))
   (- box-y (if (> peek-h 0) (+ peek-h 8.0) 0.0))
 ) ; end define input-render!
 

@@ -4,7 +4,7 @@
 ;; 文本是一个字符串；每个折叠 chip 在其中占一个 U+FFFC，chips 按出现顺序记录 fold id。
 ;; 光标、选区、撤销都在这个字符串上做，chip 天然是原子单元。
 ;; IME 组字（marked）不写进 text，显示时插在光标处；提交（insertText）时才写入。
-;; 编辑命令名沿用 AppKit 的 selector（moveLeft: / deleteBackward: …），平台层原样转交。
+;; 编辑命令名沿用 AppKit 的 selector（move-left / delete-backward …），平台层原样转交。
 
 (require racket/list racket/string "fold.rkt" "linebreak.rkt")
 
@@ -355,9 +355,9 @@
 
 ;; ---------------------------------------------------------------- 命令分派
 
-;; cmd：AppKit selector 名（符号）。返回：'submit（insertNewline:，交给调用方决定）、
-;; (cons 'copy 文本)（copy: / cut:，交给调用方写剪贴板）、'handled、'ignored。
-;; 上下移动（moveUp: / moveDown:）需要排版信息，由视图层处理。
+;; cmd：AppKit selector 名（符号）。返回：'submit（insert-newline，交给调用方决定）、
+;; (cons 'copy 文本)（copy / cut，交给调用方写剪贴板）、'handled、'ignored。
+;; 上下移动（move-up / move-down）需要排版信息，由视图层处理。
 (define (editor-command! e cmd)
   (define text (editor-text e))
   (define c (editor-cursor e))
@@ -368,38 +368,38 @@
     'handled)
   (define (del-or-sel! from to op) (if (has-selection? e) (del! a b #f) (del! from to op)))
   (case cmd
-    [(insertNewline:) 'submit]
-    [(insertNewlineIgnoringFieldEditor: insertLineBreak:) (editor-insert! e "\n") (break-coalescing! e) 'handled]
-    [(insertTab:) (editor-insert! e "\t") 'handled]
-    [(deleteBackward: deleteBackwardByDecomposingPreviousCharacter:) (del-or-sel! (grapheme-before text c) c 'delete)]
-    [(deleteForward:) (del-or-sel! c (grapheme-after text c) 'delete)]
-    [(deleteWordBackward:) (del-or-sel! (word-left text c) c #f)]
-    [(deleteWordForward:) (del-or-sel! c (word-right text c) #f)]
-    [(deleteToBeginningOfLine:) (del-or-sel! (text-line-start text c) c #f)]
-    [(deleteToEndOfLine: deleteToEndOfParagraph:)
+    [(insert-newline) 'submit]
+    [(insert-line-break) (editor-insert! e "\n") (break-coalescing! e) 'handled]
+    [(insert-tab) (editor-insert! e "\t") 'handled]
+    [(delete-backward) (del-or-sel! (grapheme-before text c) c 'delete)]
+    [(delete-forward) (del-or-sel! c (grapheme-after text c) 'delete)]
+    [(delete-word-backward) (del-or-sel! (word-left text c) c #f)]
+    [(delete-word-forward) (del-or-sel! c (word-right text c) #f)]
+    [(delete-to-line-start) (del-or-sel! (text-line-start text c) c #f)]
+    [(delete-to-line-end)
      (del-or-sel! c (let ([le (text-line-end text c)]) (if (= le c) (min (string-length text) (add1 c)) le)) #f)]
-    [(moveLeft:) (move! (if (has-selection? e) a (grapheme-before text c)))]
-    [(moveRight:) (move! (if (has-selection? e) b (grapheme-after text c)))]
-    [(moveLeftAndModifySelection:) (move! (grapheme-before text c) #t)]
-    [(moveRightAndModifySelection:) (move! (grapheme-after text c) #t)]
-    [(moveWordLeft:) (move! (word-left text c))]
-    [(moveWordRight:) (move! (word-right text c))]
-    [(moveWordLeftAndModifySelection:) (move! (word-left text c) #t)]
-    [(moveWordRightAndModifySelection:) (move! (word-right text c) #t)]
-    [(moveToBeginningOfLine: moveToLeftEndOfLine: moveToBeginningOfParagraph:) (move! (text-line-start text c))]
-    [(moveToEndOfLine: moveToRightEndOfLine: moveToEndOfParagraph:) (move! (text-line-end text c))]
-    [(moveToBeginningOfLineAndModifySelection: moveToLeftEndOfLineAndModifySelection:) (move! (text-line-start text c) #t)]
-    [(moveToEndOfLineAndModifySelection: moveToRightEndOfLineAndModifySelection:) (move! (text-line-end text c) #t)]
-    [(moveToBeginningOfDocument:) (move! 0)]
-    [(moveToEndOfDocument:) (move! (string-length text))]
-    [(moveToBeginningOfDocumentAndModifySelection:) (move! 0 #t)]
-    [(moveToEndOfDocumentAndModifySelection:) (move! (string-length text) #t)]
-    [(selectAll:) (set-editor-anchor! e 0) (set-editor-cursor! e (string-length text)) (break-coalescing! e) 'handled]
-    [(copy:) (if (has-selection? e) (cons 'copy (flatten-range e a b)) 'handled)]
-    [(cut:)
+    [(move-left) (move! (if (has-selection? e) a (grapheme-before text c)))]
+    [(move-right) (move! (if (has-selection? e) b (grapheme-after text c)))]
+    [(select-left) (move! (grapheme-before text c) #t)]
+    [(select-right) (move! (grapheme-after text c) #t)]
+    [(move-word-left) (move! (word-left text c))]
+    [(move-word-right) (move! (word-right text c))]
+    [(select-word-left) (move! (word-left text c) #t)]
+    [(select-word-right) (move! (word-right text c) #t)]
+    [(move-line-start) (move! (text-line-start text c))]
+    [(move-line-end) (move! (text-line-end text c))]
+    [(select-line-start) (move! (text-line-start text c) #t)]
+    [(select-line-end) (move! (text-line-end text c) #t)]
+    [(move-doc-start) (move! 0)]
+    [(move-doc-end) (move! (string-length text))]
+    [(select-doc-start) (move! 0 #t)]
+    [(select-doc-end) (move! (string-length text) #t)]
+    [(select-all) (set-editor-anchor! e 0) (set-editor-cursor! e (string-length text)) (break-coalescing! e) 'handled]
+    [(copy) (if (has-selection? e) (cons 'copy (flatten-range e a b)) 'handled)]
+    [(cut)
      (cond [(has-selection? e) (define out (flatten-range e a b)) (del! a b #f) (cons 'copy out)]
            [else 'handled])]
-    [(undo:)
+    [(undo)
      (cond [(pair? (editor-undo e))
             (set-editor-redo! e (cons (snapshot e) (editor-redo e)))
             (restore! e (car (editor-undo e)))
@@ -407,7 +407,7 @@
             (break-coalescing! e)
             'handled]
            [else 'ignored])]
-    [(redo:)
+    [(redo)
      (cond [(pair? (editor-redo e))
             (set-editor-undo! e (cons (snapshot e) (editor-undo e)))
             (restore! e (car (editor-redo e)))
@@ -415,7 +415,7 @@
             (break-coalescing! e)
             'handled]
            [else 'ignored])]
-    [(cancelOperation:)
+    [(cancel)
      (cond [(editor-expanded e) (set-editor-expanded! e #f) 'handled]
            [(has-selection? e) (set-editor-anchor! e c) 'handled]
            [else 'ignored])]

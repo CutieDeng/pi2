@@ -6,8 +6,8 @@
 ;; 规则1: 所有模块 #lang racket/base
 ;; 规则2: 只能向下引用：compute → compute；components → compute；assembly → 任意
 ;; 规则3: 组件之间不 require（组件间的调用只经 compute/interfaces.rkt 定义的接口，由拼装层装配）
-;; 规则4: 平台相关代码只在 mac-* 文件；ffi/unsafe 只许 mac-* 引用；ffi/unsafe/objc 全部禁止（自写桥）；
-;;        非 mac-* 的工具 / 组件不得引用 mac-*（保证可无窗口测试、可移植），拼装层除外
+;; 规则4: 平台相关代码只在平台文件（mac-* / win-*）；ffi/unsafe 只许平台文件引用；ffi/unsafe/objc 全部禁止（自写桥）；
+;;        非平台的工具 / 组件不得引用平台文件（保证可无窗口测试、可移植），拼装层除外；一个平台的文件不得引用另一个平台的
 ;; 规则5: symbol require 只许 racket/* 与纯 Racket 库白名单
 ;; 规则6: 只有三个目录，目录下不再分子目录
 
@@ -23,7 +23,8 @@
 ) ; end define rel-elements
 
 (define (layer-of p) (hash-ref LAYERS (first (rel-elements p)) (lambda () (error 'deps "outside the 3 layers: ~a" p))))
-(define (mac? p) (regexp-match? #rx"^mac-" (last (rel-elements p))))
+(define (platform-of p) (let ([m (regexp-match #rx"^(mac|win)-" (last (rel-elements p)))]) (and m (cadr m))))
+(define (mac? p) (and (platform-of p) #t))                     ; 平台文件（名字沿用：最早只有 mac-*）
 
 (define (module-form f)
   (parameterize ([read-accept-reader #t] [read-accept-lang #t]) (with-input-from-file f read))
@@ -62,7 +63,7 @@
     (for ([spec (in-list (requires-of form))])
       (cond
         [(eq? spec 'ffi/unsafe)
-         (check-true (mac? f) (format "ffi/unsafe outside mac-* files: ~a" name))]
+         (check-true (mac? f) (format "ffi/unsafe outside platform files (mac-* / win-*): ~a" name))]
         [(symbol? spec)
          (check-true (or (regexp-match? #rx"^racket(/|$)" (symbol->string spec)) (and (memq spec PURE-LIBS) #t))
                      (format "disallowed require ~a in ~a (ffi/unsafe/objc is banned; own bridge in mac-objc.rkt)" spec name))]
@@ -75,7 +76,9 @@
          (when (= my-layer 2)
            (check-false (= tl 2) (format "component requires another component: ~a → ~a (use an interface)" name spec)))
          (when (and (mac? target) (not (mac? f)) (< my-layer 3))
-           (fail (format "platform-neutral module requires mac-*: ~a → ~a" name spec)))]
+           (fail (format "platform-neutral module requires a platform file: ~a → ~a" name spec)))
+         (when (and (mac? target) (mac? f) (not (equal? (platform-of target) (platform-of f))))
+           (fail (format "one platform's file requires another platform's: ~a → ~a" name spec)))]
         ;; 编译期（宏）用的 racket/*：只允许 (for-syntax racket/…)
         [(and (pair? spec) (eq? (car spec) 'for-syntax) (andmap symbol? (cdr spec)))
          (check-true (andmap (lambda (m) (regexp-match? #rx"^racket(/|$)" (symbol->string m))) (cdr spec))

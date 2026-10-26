@@ -13,7 +13,8 @@
 (require racket/list racket/string racket/flonum json net/base64
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt" "../compute/fold.rkt"
          "../compute/markdown.rkt" "../compute/mdview.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt" "../compute/ansi.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt" "../compute/ansi.rkt"
+         "../compute/view.rkt")                                         ; 视图平面
 
 ;; ---------------------------------------------------------------- 显示条目
 
@@ -907,7 +908,7 @@
           [("trust") (t 'tr.level.trust)] [("approve") (t 'tr.level.approve)] [else (or l "?")])
 ) ; end define permission-level-label
 
-;; ---------------------------------------------------------------- 条目绘制（measure / paint 同一过程）
+;; ---------------------------------------------------------------- 条目绘制
 
 (define PAD 14.0)
 (define GAP 10.0)
@@ -978,210 +979,217 @@
   (if (and (eq? s 'running) (not (transcript-busy? tr))) 'unknown s)
 ) ; end define tool-status
 
-;; paint? #f 只量高度。hit!：登记命中矩形。返回条目高度。
-(define (draw-entry! tr e dl x y w scale paint? hit!)
+;; 条目 → 元素树（视图平面）：盒子与文字由 view.rkt 排；带 chip 的文字、Markdown、媒体块、工具输出（ANSI / diff / 提交行）是自画的叶子。
+;; 量（entry-height）与画（draw!）用同一棵树：量 = measure，画 = render-view!（命中区、文字行记录（选择 / 复制）在画的时候产生，按树的顺序 = 视觉顺序）
+
+(define (leaf measure paint) (ui-custom #:measure measure #:paint paint))
+(define (sp h) (ui-spacer #:h h))
+(define (col . els) (apply ui-box #:dir 'column els))
+(define (txt str font color) (ui-text str #:font font #:color color #:fit? #f))
+(define (ind n el #:right [r 0.0]) (ui-box #:pad (vector 0.0 r 0.0 n) el))
+;; 只在画的时候做的事（看得到才发的请求）：零高的叶子
+(define (on-paint thunk) (leaf (lambda (_w) 0.0) (lambda (dl x y w h scale) (thunk) '())))
+;; hit! 风格的绘制函数（md-draw! draw-media!）→ 叶子要返回的命中区表（登记顺序）
+(define (collect-hits f)
+  (define hs '())
+  (f (lambda (kind payload hx hy hw hh) (set! hs (cons (vector kind payload hx hy hw hh) hs))))
+  (reverse hs))
+
+;; 按换行分段的文字（段落排版走 para-blocks 缓存）；spans：ANSI 颜色片段（见 paint-ansi-blocks!）
+(define (blocks-leaf tr str font color #:ansi [spans '()])
+  (leaf (lambda (w) (blocks-height (para-blocks tr str font w)))
+        (lambda (dl x y w h scale)
+          (define bs (para-blocks tr str font w))
+          (if (pair? spans) (paint-ansi-blocks! dl tr bs spans x y color scale) (paint-blocks! dl tr bs x y color scale))
+          '())))
+
+;; diff：每行一块，按 +/-/@@ 着色，加 / 删行带底色（底色左右各多出 4）
+(define (diff-leaf tr shown)
+  (define ls (string-split shown "\n" #:trim? #f))
+  (leaf (lambda (w) (for/sum ([l (in-list ls)]) (blocks-height (para-blocks tr l 'mono (- w 8.0)))))
+        (lambda (dl x y w h scale)
+          (for/fold ([yy y]) ([l (in-list ls)])
+            (define bs (para-blocks tr l 'mono (- w 8.0)))
+            (define-values (bg fg) (diff-line-style l))
+            (when bg (drawlist-rect! dl (- x 4.0) yy (+ w 8.0) (blocks-height bs) (car bg) (cadr bg) (caddr bg) (cadddr bg)))
+            (paint-blocks! dl tr bs x yy fg scale))
+          '())))
+
+(define (media-leaf tr parts)
+  (leaf (lambda (w) (draw-media! tr parts #f 0.0 0.0 w 1.0 #f void))
+        (lambda (dl x y w h scale) (collect-hits (lambda (hit!) (draw-media! tr parts dl x y w scale #t hit!))))))
+
+;; Markdown 的高：量一次 = 一次完整排版；解析结果（块表）不变、宽与长代码块的展开状态不变就跨帧复用
+(define md-heights (make-weak-hasheq))                 ; 块表 → (vector 宽 展开版本 高)
+
+(define (entry-el tr e)
   (define rc (transcript-rc tr))
   (define lay (rich-ctx-layout rc))
-  (define inner (- w (* 2 PAD)))
   (cond
     [(e-user? e)
-     (define-values (tb labels) (rich-layout rc (e-user-text e) (e-user-folds e) inner 'body))
      (define text? (not (string=? (e-user-text e) "")))
-     (define th (if text? (text-block-height tb) 0.0))
-     (define mh (if (null? (e-user-media e)) 0.0
-                    (+ (if text? 8.0 0.0) (draw-media! tr (e-user-media e) dl (+ x PAD) (+ y PAD th (if text? 8.0 0.0)) inner scale #f void))))
-     (define h (+ th mh (* 2 PAD)))
-     (when paint?
-       (drawlist-rect! dl x y w h 0.17 0.22 0.32 1.0 #:radius 10.0)
-       (when text? (rich-paint! dl rc tb labels (e-user-folds e) (+ x PAD) (+ y PAD) TEXT scale)))
-     (unless (null? (e-user-media e))
-       (draw-media! tr (e-user-media e) dl (+ x PAD) (+ y PAD th (if text? 8.0 0.0)) inner scale paint? hit!))
-     h]
+     (define media (e-user-media e))
+     (ui-box #:fill '(0.17 0.22 0.32 1.0) #:radius 10.0 #:pad PAD
+             (and text? (leaf (lambda (w) (let-values ([(tb _l) (rich-layout rc (e-user-text e) (e-user-folds e) w 'body)]) (text-block-height tb)))
+                              (lambda (dl x y w h scale)
+                                (let-values ([(tb labels) (rich-layout rc (e-user-text e) (e-user-folds e) w 'body)])
+                                  (rich-paint! dl rc tb labels (e-user-folds e) x y TEXT scale))
+                                '())))
+             (and text? (pair? media) (sp 8.0))
+             (and (pair? media) (media-leaf tr media)))]
     [(e-asst? e)
-     (define rs (if (string=? (e-asst-reasoning e) "") '()
-                    (let-values ([(head more) (head-lines (e-asst-reasoning e) 4)])
-                      (para-blocks tr (if (> more 0) (t 'tr.reasoning-more head more) head) 'small inner))))
+     (define reasoning (and (not (string=? (e-asst-reasoning e) ""))
+                            (let-values ([(head more) (head-lines (e-asst-reasoning e) 4)]) (if (> more 0) (t 'tr.reasoning-more head more) head))))
      ;; 回答按 Markdown 画（S14）；流式中在末尾带光标
      (define src (string-append (e-asst-text e) (if (e-asst-open? e) " ▍" "")))
      (unless (equal? src (e-asst-md-src e))
        (set-e-asst-md-src! e src)
        (set-e-asst-md-blocks! e (parse-markdown src)))
-     (define rh (blocks-height rs))
-     (define my (+ y rh (if (null? rs) 0.0 6.0)))
+     (define blocks (e-asst-md-blocks e))
      (define code-open (transcript-code-open tr))
-     (define mh (md-draw! rc (e-asst-md-blocks e) dl (+ x PAD) my inner scale #:paint? paint? #:hit! hit!
-                          #:expanded? (lambda (k) (hash-ref code-open k #f)) #:key (eq-hash-code e)
-                          #:color (if (e-asst-interrupted? e) DIM TEXT)))
-     ;; 被中断时流到一半的文字：下面一行说明（不在模型上下文里）
-     (define ptb (and (e-asst-interrupted? e) (lay (t 'tr.partial) 'small inner #f)))
-     (define ph (if ptb (+ 4.0 (text-block-height ptb)) 0.0))
-     ;; 只给像样的回答配「复制」：一句话的过渡说明（"我先跑一下命令。"）不配
-     (define copy? (and (not (e-asst-open? e)) (not ptb)
-                        (let ([txt (string-trim (e-asst-text e))]) (or (>= (string-length txt) 60) (regexp-match? #rx"\n" txt)))))
-     (define ctb (and copy? (lay (t 'tr.copy) 'small 1000.0 #f)))
-     (define ch (if copy? (+ 6.0 (text-block-height ctb)) 0.0))
-     (define h (+ (- my y) mh ph ch 4.0))
-     (when paint?
-       (paint-blocks! dl tr rs (+ x PAD) y DIM scale)
-       (when ptb (paint-text! dl (rich-ctx-atlas rc) ptb (+ x PAD) (+ my mh 4.0) DIM #:scale scale))
-       (when copy? (paint-text! dl (rich-ctx-atlas rc) ctb (+ x PAD) (+ my mh 6.0) DIM #:scale scale)))
-     (when copy? (hit! 'copy (e-asst-text e) (+ x PAD -4.0) (+ my mh 2.0) (+ (text-block-width ctb) 8.0) (+ (text-block-height ctb) 8.0)))
-     h]
+     (define (md! dl x y w scale paint? hit!)
+       (md-draw! rc blocks dl x y w scale #:paint? paint? #:hit! hit!
+                 #:expanded? (lambda (k) (hash-ref code-open k #f)) #:key (eq-hash-code e)
+                 #:color (if (e-asst-interrupted? e) DIM TEXT)))
+     ;; 只给像样的回答配「复制」：一句话的过渡说明（"我先跑一下命令。"）不配；被中断的不配
+     (define copy? (and (not (e-asst-open? e)) (not (e-asst-interrupted? e))
+                        (let ([s (string-trim (e-asst-text e))]) (or (>= (string-length s) 60) (regexp-match? #rx"\n" s)))))
+     (col (and reasoning (ind PAD #:right PAD (blocks-leaf tr reasoning 'small DIM)))
+          (and reasoning (sp 6.0))
+          (ind PAD #:right PAD (leaf (lambda (w)
+                                       (define ver (transcript-code-version tr))
+                                       (define c (hash-ref md-heights blocks #f))
+                                       (if (and c (= (vector-ref c 0) w) (= (vector-ref c 1) ver))
+                                           (vector-ref c 2)
+                                           (let ([h (md! #f 0.0 0.0 w 1.0 #f void)]) (hash-set! md-heights blocks (vector w ver h)) h)))
+                                     (lambda (dl x y w h scale) (collect-hits (lambda (hit!) (md! dl x y w scale #t hit!))))))
+          ;; 被中断时流到一半的文字：下面一行说明（不在模型上下文里）
+          (and (e-asst-interrupted? e) (ind PAD #:right PAD (col (sp 4.0) (txt (t 'tr.partial) 'small DIM))))
+          (if copy?
+              (ui-box #:dir 'row #:pad (vector 2.0 0.0 0.0 (- PAD 4.0))
+                      (ui-box #:hit (cons 'copy (e-asst-text e)) #:pad 4.0 (ui-text (t 'tr.copy) #:font 'small #:color DIM)))
+              (sp 4.0)))]
     [(e-tool? e)
      (define status (tool-status tr e))
-     (define-values (icon icolor) (case status
-                                    [(running) (values "●" WARN)]
-                                    [(ok) (values "✓" '(0.45 0.85 0.55 1.0))]
-                                    [(aborted) (values (t 'tr.tool-aborted) WARN)]
-                                    [(unknown) (values (t 'tr.tool-unknown) DIM)]
-                                    [else (values "✗" ERR)]))
-     ;; 改文件的工具：正文是 diff（每行一块，按 +/-/@@ 着色、加 / 删行带底色），否则是工具输出
+     (define expanded? (e-tool-expanded? e))
+     (define id (e-tool-id e))
+     (define-values (icon _icolor) (case status
+                                     [(running) (values "●" WARN)]
+                                     [(ok) (values "✓" '(0.45 0.85 0.55 1.0))]
+                                     [(aborted) (values (t 'tr.tool-aborted) WARN)]
+                                     [(unknown) (values (t 'tr.tool-unknown) DIM)]
+                                     [else (values "✗" ERR)]))
+     ;; 改文件的工具：正文是 diff，否则是工具输出
      (define diff (and (eq? status 'ok) (e-tool-diff e)))
      ;; git_history：结构化的提交列表 → 画成一行行（hash、TYPE 标记、标题、标签片）而不是工具输出文字
      (define commits (and (eq? status 'ok) (not diff)
                           (let ([u (e-tool-ui e)]) (and (hash? u) (equal? (j u 'kind) "commits") (list? (j u 'commits)) (pair? (j u 'commits))
                                                         (filter hash? (j u 'commits))))))
      (define src (e-tool-source e))
-     (define head (lay (format "~a  ~a~a  ~a~a~a" icon
-                               (if (and (string? src) (not (equal? src "builtin"))) (format "[~a] " src) "")
-                               (e-tool-name e) (tool-summary (e-tool-name e) (e-tool-input e))
-                               (if diff (format "  +~a −~a" (j diff 'added 0) (j diff 'removed 0)) "")
-                               (if (real? (e-tool-ms e)) (format "  · ~a ms" (inexact->exact (round (e-tool-ms e)))) ""))
-                       'small inner #f))
+     (define head (format "~a  ~a~a  ~a~a~a" icon
+                          (if (and (string? src) (not (equal? src "builtin"))) (format "[~a] " src) "")
+                          (e-tool-name e) (tool-summary (e-tool-name e) (e-tool-input e))
+                          (if diff (format "  +~a −~a" (j diff 'added 0) (j diff 'removed 0)) "")
+                          (if (real? (e-tool-ms e)) (format "  · ~a ms" (inexact->exact (round (e-tool-ms e)))) "")))
      (define out (if diff (j diff 'text) (e-tool-output e)))
      (define-values (pn pmode pkeep pdrop) (preview-spec tr (e-tool-name e)))
-     (define smart? (and (equal? pmode "smart") (not diff) (not commits) (not (e-tool-expanded? e))))
+     (define smart? (and (equal? pmode "smart") (not diff) (not commits) (not expanded?)))
      (define-values (shown more)
-       (cond [commits (values "" (if (e-tool-expanded? e) 0 (max 0 (- (length commits) COMMITS-COLLAPSED))))]
-             [(e-tool-expanded? e) (head-lines out EXPANDED-LINES)]
+       (cond [commits (values "" (if expanded? 0 (max 0 (- (length commits) COMMITS-COLLAPSED))))]
+             [expanded? (head-lines out EXPANDED-LINES)]
              [diff (head-lines out DIFF-COLLAPSED-LINES)]
              [else (preview-lines out pn pmode #:keep pkeep #:drop pdrop #:picked (and smart? (e-tool-picked e)))]))
-     ;; smart：看得到的、行数够多的、有结果的卡片 → 请本机小模型挑行（每张卡片一次）
-     (when (and paint? smart? (> more 0) (not (e-tool-picked e)) (memq status '(ok error)) (exact-nonnegative-integer? (e-tool-rid e))
-                (>= (+ pn more) (let ([m (j (transcript-preview tr) 'min_lines 20)]) (if (exact-nonnegative-integer? m) m 20))))
-       (set-e-tool-picked! e 'pending)
-       (define cfg (transcript-preview tr))
-       (want! tr (hasheq 'type "select_lines" 'id (e-tool-rid e) 'call_id (e-tool-id e) 'tool (e-tool-name e)
-                         'summary (tool-summary (e-tool-name e) (e-tool-input e)) 'max_lines pn
-                         'model (let ([m (j cfg 'model)]) (if (string? m) m 'null))
-                         'endpoint (let ([m (j cfg 'endpoint)]) (if (string? m) m 'null))
-                         'allow_remote (and (j cfg 'allow_remote) #t))))
-     ;; ANSI（工具输出常带颜色）：去掉转义、颜色记成片段（diff 不带）
-     (define-values (plain ansi-spans) (if diff (values shown '()) (ansi-parse shown)))
+     ;; smart：看得到的（画的时候）、行数够多的、有结果的卡片 → 请本机小模型挑行（每张卡片一次）
+     (define pick? (and smart? (> more 0) (not (e-tool-picked e)) (memq status '(ok error)) (exact-nonnegative-integer? (e-tool-rid e))
+                        (>= (+ pn more) (let ([m (j (transcript-preview tr) 'min_lines 20)]) (if (exact-nonnegative-integer? m) m 20)))))
+     (define (pick!)
+       (unless (e-tool-picked e)
+         (set-e-tool-picked! e 'pending)
+         (define cfg (transcript-preview tr))
+         (want! tr (hasheq 'type "select_lines" 'id (e-tool-rid e) 'call_id id 'tool (e-tool-name e)
+                           'summary (tool-summary (e-tool-name e) (e-tool-input e)) 'max_lines pn
+                           'model (let ([m (j cfg 'model)]) (if (string? m) m 'null))
+                           'endpoint (let ([m (j cfg 'endpoint)]) (if (string? m) m 'null))
+                           'allow_remote (and (j cfg 'allow_remote) #t)))))
+     (define color (if (eq? status 'error) ERR OUT))
      (define body
-       (cond [(string=? shown "") '()]
-             [diff (for/list ([l (in-list (string-split shown "\n" #:trim? #f))])
-                     (cons l (para-blocks tr l 'mono (- inner 8.0))))]
-             [else (para-blocks tr plain 'mono inner)]))
-     (define footer-text
+       (cond [commits
+              (define rows (if expanded? commits (take commits (min COMMITS-COLLAPSED (length commits)))))
+              (leaf (lambda (w) (let-values ([(h _p) (commit-rows lay rows w)]) h))
+                    (lambda (dl x y w h scale) (let-values ([(_h p) (commit-rows lay rows w)]) (p dl (rich-ctx-atlas rc) x y scale)) '()))]
+             [(string=? shown "") #f]
+             [diff (diff-leaf tr shown)]
+             ;; ANSI（工具输出常带颜色）：去掉转义、颜色记成片段
+             [else (let-values ([(plain spans) (ansi-parse shown)]) (blocks-leaf tr plain 'mono color #:ansi spans))]))
+     (define footer
        (cond [(and commits (> more 0)) (t 'tr.more-commits more (t 'tr.expand))]
              [commits #f]
-             [(and (e-tool-expanded? e) (e-tool-fetching? e)) (t 'tr.full-loading)]
+             [(and expanded? (e-tool-fetching? e)) (t 'tr.full-loading)]
              [(and smart? (> more 0) (eq? (e-tool-picked e) 'pending)) (t 'tr.picking more)]
              [(and smart? (> more 0) (pair? (e-tool-picked e))) (t 'tr.picked more)]
-             [(> more 0) (t 'tr.more-lines more (if (e-tool-expanded? e) (t 'tr.collapse) (t 'tr.expand)))]
+             [(> more 0) (t 'tr.more-lines more (if expanded? (t 'tr.collapse) (t 'tr.expand)))]
              [(and (not diff) (e-tool-truncated? e)) (t 'tr.truncated-total (or (e-tool-total e) "?"))]
              [(and diff (eq? (j diff 'truncated) #t)) (t 'tr.diff-truncated)]
              [else #f]))
-     (define footer (and footer-text (lay footer-text 'small inner #f)))
-     (define-values (crh cpaint!) (if commits
-                                      (commit-rows lay (if (e-tool-expanded? e) commits (take commits (min COMMITS-COLLAPSED (length commits)))) inner)
-                                      (values 0.0 void)))
-     (define bh (cond [commits crh] [diff (for/sum ([b (in-list body)]) (blocks-height (cdr b)))] [else (blocks-height body)]))
-     (define body? (or (pair? body) (and commits #t)))
-     (define fh (if footer (+ 4.0 (text-block-height footer)) 0.0))
-     (define hh (text-block-height head))
-     ;; 子 agent 的步骤（P5）：收起时一行计数，展开时缩进画在输出下面
+     ;; 子 agent 的步骤（P5）：收起时一行计数（点了展开），展开时缩进画在输出下面
      (define kids (tool-children tr e))
-     (define ktb (and (pair? kids) (lay (t (if (e-tool-expanded? e) 'tr.sub-steps-open 'tr.sub-steps) (length kids)) 'small inner #f)))
-     (define kids-y0 (+ y PAD hh (if body? (+ 6.0 bh) 0.0) fh))
-     ;; 量（paint? #f）与画分两次：画要在卡片标题、输出之后（文字行的记录顺序 = 视觉顺序，选择 / 复制按它）
-     (define (draw-kids! paint? hit!)
-       (cond
-         [(not ktb) 0.0]
-         [else
-          (define th (+ 6.0 (text-block-height ktb)))
-          (when paint? (paint-text! dl (rich-ctx-atlas rc) ktb (+ x PAD) (+ kids-y0 6.0) DIM #:scale scale))
-          (hit! 'tool (e-tool-id e) x kids-y0 w th)
-          (+ th
-             (if (e-tool-expanded? e)
-                 (for/fold ([yy 6.0]) ([c (in-list kids)])
-                   (define ch (draw-entry! tr c dl (+ x PAD) (+ kids-y0 th yy) (- w PAD 6.0) scale paint? hit!))
-                   (+ yy ch 6.0))
-                 0.0))]))
-     (define kh (draw-kids! #f void))
-     (define h (+ PAD hh (if body? (+ 6.0 bh) 0.0) fh kh (* 0.7 PAD)))
-     (when paint?
-       (drawlist-rect! dl x y w h 0.16 0.16 0.18 1.0 #:radius 8.0)                 ; 工具卡片：0.13 与对话区的底只有 1.12
-       (paint-text! dl (rich-ctx-atlas rc) head (+ x PAD) (+ y (* 0.7 PAD)) (if (eq? status 'error) ERR DIM) #:scale scale)
-       (cond
-         [commits (cpaint! dl (rich-ctx-atlas rc) (+ x PAD) (+ y (* 0.7 PAD) hh 6.0) scale)]
-         [diff
-          (for/fold ([yy (+ y (* 0.7 PAD) hh 6.0)]) ([b (in-list body)])
-            (define-values (bg fg) (diff-line-style (car b)))
-            (define lh (blocks-height (cdr b)))
-            (when bg (drawlist-rect! dl (+ x PAD -4.0) yy (+ inner 8.0) lh (car bg) (cadr bg) (caddr bg) (cadddr bg)))
-            (paint-blocks! dl tr (cdr b) (+ x PAD) yy fg scale))]
-         [(pair? ansi-spans) (paint-ansi-blocks! dl tr body ansi-spans (+ x PAD) (+ y (* 0.7 PAD) hh 6.0) (if (eq? status 'error) ERR OUT) scale)]
-         [else (paint-blocks! dl tr body (+ x PAD) (+ y (* 0.7 PAD) hh 6.0) (if (eq? status 'error) ERR OUT) scale)])
-       (when footer (paint-text! dl (rich-ctx-atlas rc) footer (+ x PAD) (+ y (* 0.7 PAD) hh 6.0 bh 4.0) DIM #:scale scale)))
-     (when paint? (draw-kids! #t hit!))
-     (hit! 'tool (e-tool-id e) x y w (+ (* 0.7 PAD) hh))
-     (when footer (hit! 'tool (e-tool-id e) x (+ y h (- fh) (* -0.7 PAD)) w (+ fh PAD)))
-     h]
+     (define kids-el
+       (and (pair? kids)
+            (col (ui-box #:hit (cons 'tool id) #:pad (vector 6.0 PAD 0.0 PAD)
+                         (txt (t (if expanded? 'tr.sub-steps-open 'tr.sub-steps) (length kids)) 'small DIM))
+                 (and expanded? (apply ui-box #:pad (vector 6.0 6.0 6.0 PAD) #:gap 6.0 (for/list ([c (in-list kids)]) (entry-el tr c)))))))
+     ;; 工具卡片：0.13 与对话区的底只有 1.12 → 0.16；标题行与「还有 N 行」行可点（展开 / 收起）
+     (ui-box #:fill '(0.16 0.16 0.18 1.0) #:radius 8.0
+             (and pick? (on-paint pick!))
+             (ui-box #:hit (cons 'tool id) #:pad (vector (* 0.7 PAD) PAD 0.0 PAD) (txt head 'small (if (eq? status 'error) ERR DIM)))
+             (and body (ui-box #:pad (vector 6.0 PAD 0.0 PAD) body))
+             ;; 「还有 N 行 · 点标题展开」：可点的范围连同卡片底边距（没有子 agent 步骤时）
+             (and footer (ui-box #:hit (cons 'tool id) #:pad (vector 4.0 PAD (if kids-el 0.0 PAD) PAD) (txt footer 'small DIM)))
+             (and kids-el (sp (* 0.3 PAD)))
+             kids-el
+             (sp (cond [kids-el (* 0.7 PAD)] [footer 0.0] [else PAD])))]
     [(e-perm? e)
      (define tool (and (string? (e-perm-tool e)) (e-perm-tool e)))
      ;; 费用上限询问（内核借权限询问的通道）：自己的标题、说明与按钮文字
      (define budget? (equal? tool "budget"))
      (define bin (and budget? (hash? (e-perm-input e)) (e-perm-input e)))
-     (define title (lay (cond [budget? (t 'tr.budget-title)]
-                              [tool (t 'tr.perm-title tool (permission-level-label (e-perm-level e)))]
-                              [else (t 'tr.perm-title0)]) 'title inner #f))
+     (define title (cond [budget? (t 'tr.budget-title)]
+                         [tool (t 'tr.perm-title tool (permission-level-label (e-perm-level e)))]
+                         [else (t 'tr.perm-title0)]))
      (define-values (shown more)
        (head-lines (cond [bin (t (case (hash-ref bin 'scope #f) [("day") 'tr.budget-day] [("combined") 'tr.budget-combined] [else 'tr.budget-turn])
                                  (hash-ref bin 'spent "?") (hash-ref bin 'cap "?"))]
                          [(hash? (e-perm-input e)) (input->text (e-perm-input e))]
                          [else (e-perm-prompt e)]) 10))
-     (define body (para-blocks tr (if (> more 0) (t 'tr.more-lines-paren shown more) shown) (if budget? 'body 'mono) inner))
      (define ans (perm-answer tr e))
      (define buttons (if budget?
                          (list (list "yes" (t 'tr.budget-continue))
                                (list "always" (if (and bin (member (hash-ref bin 'scope #f) '("day" "combined"))) (t 'tr.budget-snooze) (t 'tr.budget-continue2)))
                                (list "no" (t 'tr.budget-stop)))
                          (list (list "yes" (t 'tr.allow)) (list "always" (t 'tr.always)) (list "no" (t 'tr.deny)))))
-     (define btn-tbs (for/list ([b (in-list buttons)]) (lay (cadr b) 'body 1000.0 #f)))
-     (define status-tb (and ans (lay (case ans
-                                       [("yes") (if budget? (t 'tr.budget-continued) (t 'tr.allowed))]
-                                       [("always") (if budget? (t 'tr.budget-continued) (t 'tr.always-allowed))]
-                                       [("no") (if budget? (t 'tr.budget-stopped) (t 'tr.denied))]
-                                       [else (t 'tr.void)])
-                                     'small inner #f)))
-     (define row-h (if ans (text-block-height status-tb) (+ 8.0 (text-block-line-height (car btn-tbs)))))
-     (define h (+ PAD (text-block-height title) 6.0 (blocks-height body) 10.0 row-h PAD))
-     (define by (+ y PAD (text-block-height title) 6.0 (blocks-height body) 10.0))
-     (when paint?
-       (drawlist-rect! dl x y w h 0.55 0.42 0.18 1.0 #:radius 10.0)
-       (drawlist-rect! dl (+ x 1.5) (+ y 1.5) (- w 3) (- h 3) 0.15 0.13 0.10 1.0 #:radius 9.0)
-       (paint-text! dl (rich-ctx-atlas rc) title (+ x PAD) (+ y PAD) WARN #:scale scale)
-       (paint-blocks! dl tr body (+ x PAD) (+ y PAD (text-block-height title) 6.0) OUT scale)
-       (when ans (paint-text! dl (rich-ctx-atlas rc) status-tb (+ x PAD) by DIM #:scale scale)))
-     (unless ans
-       (for/fold ([bx (+ x PAD)]) ([b (in-list buttons)] [tb (in-list btn-tbs)])
-         (define bw (+ (text-block-width tb) 28.0))
-         (when paint?
-           (define-values (r g bb) (if (equal? (car b) "no") (values 0.30 0.20 0.20) (values 0.24 0.36 0.26)))
-           (drawlist-rect! dl bx by bw row-h r g bb 1.0 #:radius 6.0)
-           (paint-text! dl (rich-ctx-atlas rc) tb (+ bx 14.0) (+ by 4.0) TEXT #:scale scale))
-         (hit! 'perm (cons (e-perm-id e) (car b)) bx by bw row-h)
-         (+ bx bw 10.0)))
-     h]
+     (define row-h (+ 8.0 (text-block-line-height (lay (cadr (car buttons)) 'body 1000.0 #f))))
+     ;; 橙色边框（1.5）里的深色卡片：标题、输入（最多 10 行）、按钮（允许 / 总是 / 拒绝）或已答的结果
+     (ui-box #:fill '(0.55 0.42 0.18 1.0) #:radius 10.0 #:pad 1.5
+             (ui-box #:fill '(0.15 0.13 0.10 1.0) #:radius 9.0 #:pad (- PAD 1.5)
+                     (txt title 'title WARN)
+                     (sp 6.0)
+                     (blocks-leaf tr (if (> more 0) (t 'tr.more-lines-paren shown more) shown) (if budget? 'body 'mono) OUT)
+                     (sp 10.0)
+                     (if ans
+                         (txt (case ans
+                                [("yes") (if budget? (t 'tr.budget-continued) (t 'tr.allowed))]
+                                [("always") (if budget? (t 'tr.budget-continued) (t 'tr.always-allowed))]
+                                [("no") (if budget? (t 'tr.budget-stopped) (t 'tr.denied))]
+                                [else (t 'tr.void)])
+                              'small DIM)
+                         (apply ui-box #:dir 'row #:gap 10.0
+                                (for/list ([b (in-list buttons)])
+                                  (ui-box #:h row-h #:pad (vector 4.0 14.0 0.0 14.0) #:radius 6.0 #:hit (cons 'perm (cons (e-perm-id e) (car b)))
+                                          #:fill (if (equal? (car b) "no") '(0.30 0.20 0.20 1.0) '(0.24 0.36 0.26 1.0))
+                                          (ui-text (cadr b) #:font 'body #:color TEXT)))))))]
     [(e-note? e)
-     (define tb (lay (e-note-text e) 'small inner #f))
-     (when paint?
-       (paint-text! dl (rich-ctx-atlas rc) tb (+ x PAD) y
-                    (case (e-note-level e) [(warn) WARN] [(error) ERR] [(info) TEXT] [else DIM]) #:scale scale))
-     (text-block-height tb)])
-) ; end define draw-entry!
+     (ind PAD #:right PAD (txt (e-note-text e) 'small (case (e-note-level e) [(warn) WARN] [(error) ERR] [(info) TEXT] [else DIM])))])
+) ; end define entry-el
 
 ;; ---------------------------------------------------------------- 渲染 / 滚动 / 命中
 
@@ -1200,7 +1208,7 @@
   (define sig (entry-signature tr e))
   (define c (hash-ref (transcript-heights tr) e #f))
   (cond [(and c (= (vector-ref c 0) w) (equal? (vector-ref c 1) sig)) (vector-ref c 2)]
-        [else (define hh (draw-entry! tr e #f 0.0 0.0 w scale #f void))
+        [else (define-values (_w hh) (measure (rich-ctx-layout (transcript-rc tr)) (entry-el tr e) w))
               (hash-set! (transcript-heights tr) e (vector w sig hh))
               hh])
 ) ; end define entry-height
@@ -1264,7 +1272,9 @@
                     (lambda (str xs ly lh soft?)
                       (set! recorded (cons (vector key k str xs ly lh soft?) recorded))
                       (set! k (add1 k)))])
-      (draw-entry! tr e dl x ey w scale #t hit!)))
+      (define-values (hs _regions _scrolls)
+        (render-view! (transcript-rc tr) dl (entry-el tr e) x ey w (entry-height tr e w scale) scale #:clip (vector x y w h)))
+      (for ([hv (in-list hs)]) (apply hit! (vector->list hv)))))
   (let loop ([s (fen-find tr (- sc GAP))] [sy (+ top (slot-top (fen-find tr (- sc GAP))))])
     (when (and (< s n) (< sy (+ y h)))
       (define r (sub1 s))
@@ -1296,18 +1306,16 @@
                         0.30 0.50 0.95 0.35))))
   ;; 上翻离开底部时：「↓ 回到底部」
   (when (< sc (- max-scroll 4.0))
-    (define tb ((rich-ctx-layout (transcript-rc tr)) (t 'tr.to-bottom) 'small 1000.0 #f))
-    (define bw (+ (text-block-width tb) 24.0))
-    (define bh (+ (text-block-height tb) 10.0))
-    (define bx (+ x (/ (- w bw) 2)))
-    (define by (- (+ y h) bh 10.0))
-    (drawlist-rect! dl bx by bw bh 0.24 0.36 0.62 0.95 #:radius (/ bh 2))
-    (paint-text! dl (rich-ctx-atlas (transcript-rc tr)) tb (+ bx 12.0) (+ by 5.0) TEXT #:scale scale)
-    (hit! 'to-bottom #t bx by bw bh))
+    (define th (text-block-height ((rich-ctx-layout (transcript-rc tr)) (t 'tr.to-bottom) 'small 1000.0 #f)))
+    (define pill (ui-box #:dir 'row #:pad (vector 5.0 12.0 5.0 12.0) #:fill '(0.24 0.36 0.62 0.95) #:radius (/ (+ th 10.0) 2) #:hit (cons 'to-bottom #t)
+                         (ui-text (t 'tr.to-bottom) #:font 'small #:color TEXT)))
+    (define-values (bw bh) (measure (rich-ctx-layout (transcript-rc tr)) pill w))   ; 胶囊：居中，离底 10
+    (define-values (hs _r _s) (render-view! (transcript-rc tr) dl pill (+ x (/ (- w bw) 2)) (- (+ y h) bh 10.0) bw bh scale #:clip (vector x y w h)))
+    (for ([hv (in-list hs)]) (apply hit! (vector->list hv))))
   (drawlist-set-clip! dl #f)
   ;; 小地图：画在对话区右侧的边距里（不占排版宽度）；只在内容超过一屏时
   (when (> total (* 1.5 h)) (draw-minimap! tr dl (+ x w 7.0) y 6.0 h sc total hit!))
-  (set-transcript-hits! tr (reverse hits))                    ; 后画的（浮在上面的）先命中
+  (set-transcript-hits! tr (reverse hits))                    ; 按绘制顺序；命中取最后一个（浮在上面的）
 ) ; end define transcript-render!
 
 ;; ---------------------------------------------------------------- 小地图（P3）
@@ -1463,9 +1471,9 @@
 
 ;; → (list 'perm id decision) | (list 'tool id) | (list 'copy 文本) | (list 'code-toggle 键) | (list 'to-bottom) | (list 'minimap)
 ;;   | (list 'media-play sha) | #f
-;; 命中表按「后画的在上」排序：浮层（回到底部）先于被它盖住的内容
+;; 命中表按绘制顺序：取最后一个相交的 = 最上面的（浮层「回到底部」先于被它盖住的工具卡片）
 (define (transcript-hit tr x y)
-  (for/first ([h (in-list (transcript-hits tr))]
+  (for/last ([h (in-list (transcript-hits tr))]
               #:when (and (<= (vector-ref h 2) x (+ (vector-ref h 2) (vector-ref h 4)))
                           (<= (vector-ref h 3) y (+ (vector-ref h 3) (vector-ref h 5)))))
     (case (vector-ref h 0)

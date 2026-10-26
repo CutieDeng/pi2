@@ -4,6 +4,8 @@
 ;; ObjC 子类在 app-init! 时才注册（模块被其它 place 加载时不会重复注册，P2）。
 
 (require ffi/unsafe racket/file "../compute/mac-objc.rkt" "../compute/mac-cf.rkt" "../compute/mac-geom.rkt" "../compute/event.rkt" "../compute/mac-capture.rkt"
+         "../compute/mac-keys.rkt"                    ; 原生 → 逻辑：键、修饰键、编辑命令（GUI 元数据平面的 macOS 对照表）
+         "../compute/platform.rkt"                    ; 能力记录、平台请求
          "../compute/hub.rkt" "../compute/interfaces.rkt")
 
 (define _libappkit (ffi-lib "/System/Library/Frameworks/AppKit.framework/AppKit"))
@@ -51,6 +53,19 @@
 (define-msg m-modifier-flags "modifierFlags" _uint64 ())
 (define-msg m-key-code "keyCode" _uint16 ())
 (define-msg m-characters "characters" _id ())
+(define-msg m-characters-ignoring "charactersIgnoringModifiers" _id ())
+
+;; 平台请求（platform.rkt req）→ 窗口操作。值的形状见 platform.rkt STATE-KEYS
+(define (apply-request! win r)
+  (define v (req-value r))
+  (case (req-key r)
+    [(text-input) (set-box! text-input-on (and v #t))]
+    [(material) (window-set-transparent! win (eq? v 'transparent))]
+    [(glass-rect) (window-set-glass-rect! win v)]
+    [(caret) (when (vector? v) (window-set-text-input-state! win (vector (vector-ref v 0) (vector-ref v 1) (vector-ref v 2) (vector-ref v 3)) (vector-ref v 4)))]
+    [(cursor) (set-cursor! v)]
+    [(content-size) (when (pair? v) (window-set-content-size! win (car v) (cdr v)))]
+    [else (void)]))
 (define-msg m-is-repeat "isARepeat" _BOOL ())
 (define-msg m-click-count "clickCount" _int64 ())
 (define-msg m-scrolling-dx "scrollingDeltaX" _double ())
@@ -119,12 +134,7 @@
 (define by-object (make-hash))           ; key-of(view|delegate) → window
 (define overlay-views (make-hash))       ; key-of(overlay view) → #t：它不做第一响应者（键盘留给主视图）
 
-(define (decode-mods flags)
-  (for/list ([bit (in-list '(#x20000 #x40000 #x80000 #x100000))]
-             [name (in-list '(shift ctrl alt cmd))]
-             #:when (not (zero? (bitwise-and flags bit))))
-    name)
-) ; end define decode-mods
+(define (decode-mods flags) (mac-logical-mods flags))   ; 逻辑修饰键：⌘ → primary（mac-keys.rkt）
 
 (define (decode-phase p momentum)
   (cond
@@ -196,14 +206,16 @@
 (define (key-handler down?)
   (lambda (self ev)
     (define mods (decode-mods (m-modifier-flags ev)))
-    (push! (ev:key down? (m-key-code ev) (cfstring->string (m-characters ev)) mods (m-is-repeat ev)))
-    (when (and down? (not (memq 'cmd mods)) (unbox text-input-on))
+    (define code (m-key-code ev))
+    (push! (ev:key down? code (cfstring->string (m-characters ev)) mods (m-is-repeat ev)
+                   (mac-logical-key code (cfstring->string (m-characters-ignoring ev)))))
+    (when (and down? (not (memq 'primary mods)) (unbox text-input-on))
       (define ctx (m-input-context self))
       (when ctx (m-handle-event ctx ev))))
 ) ; end define key-handler
 
 (define (edit-action name)
-  (lambda (self sender) (push! (ev:command name)))
+  (lambda (self sender) (push! (ev:command (mac-command name))))
 ) ; end define edit-action
 
 (define (with-window self proc)
@@ -293,7 +305,7 @@
                          #:default (rect 0.0 0.0 0.0 0.0))
             (objc-method "characterIndexForPoint:" _uint64 (list _CGPoint) (lambda (self p) NSNotFound))
             (objc-method "doCommandBySelector:" _void (list _SEL)
-                         (lambda (self s) (push! (ev:command (string->symbol (sel-name s)))))))
+                         (lambda (self s) (push! (ev:command (mac-command (string->symbol (sel-name s))))))))
       #:protocols '("NSTextInputClient")))
   (define delegate-class
     (define-objc-subclass "PiWindowDelegate" "NSObject"
@@ -551,8 +563,7 @@
 (define-msg m-post-event "postEvent:atStart:" _void ([e _id] [at-start _BOOL]))
 
 (define MOUSE-TYPES (hasheq 'down 1 'up 2 'move 5 'drag 6))
-(define FLAG-BITS (hasheq 'shift #x20000 'ctrl #x40000 'alt #x80000 'cmd #x100000))
-(define (encode-mods mods) (for/sum ([m (in-list mods)]) (hash-ref FLAG-BITS m)))
+(define (encode-mods mods) (mac-mod-flags mods))     ; 逻辑修饰键 → NSEventModifierFlags
 
 ;; 合成鼠标事件直接进本组件的事件队列（x y：内容区 point，左上原点）。
 ;; 不经 NSEvent：应用不在前台时，postEvent: 的鼠标事件坐标会被 AppKit 换算到别处（实测偏差约 (-46, -17) pt），
@@ -575,7 +586,7 @@
 (define-msg m-perform-selector "performSelector:withObject:" _id ([s _pointer] [o _id]))
 ;; 菜单里的编辑快捷键 → view 上的动作（应用不在前台时菜单的动作没有 key 窗口可去）
 (define (edit-selector chars mods)
-  (and (memq 'cmd mods)
+  (and (memq 'primary mods)
        (case (string-downcase chars)
          [("a") "selectAll:"] [("c") "copy:"] [("x") "cut:"] [("v") "paste:"]
          [("z") (if (memq 'shift mods) "redo:" "undo:")]
@@ -593,7 +604,7 @@
          (cond
            [(m-is-key-window (window-ns win)) (m-post-event app ev #f)]
            [(edit-selector chars mods) => (lambda (name) (m-perform-selector (window-view win) (sel name) #f))]
-           [(and (memq 'cmd mods) (equal? (string-downcase chars) "q")) (push! (ev:close))]       ; 菜单的「退出」（piQuit:）
+           [(and (memq 'primary mods) (equal? (string-downcase chars) "q")) (push! (ev:close))]       ; 菜单的「退出」（piQuit:）
            [else (m-send-event (window-ns win) ev)])))))
 ) ; end define window-post-key!
 
@@ -770,23 +781,20 @@
              (lambda (use config)
                (define glass? (and (hash-ref config 'glass? #f) (or (cls "NSGlassEffectView") (cls "NSVisualEffectView")) #t))
                (define win (window-open! (hash-ref config 'title "pi2") (hash-ref config 'width 960.0) (hash-ref config 'height 680.0)
-                                         #:layer ((use gpu-port) 'layer)
-                                         #:overlay (and glass? ((use gpu-port) 'overlay-layer))))
+                                         #:layer ((use gpu-port) 'surface)                  ; macOS：CAMetalLayer
+                                         #:overlay (and glass? ((use gpu-port) 'overlay-surface))))
                (when (hash-ref config 'dark? #f) (window-set-dark! win))                ; 界面只有暗色：标题栏、玻璃也按暗色
                (list (implement window-port
                                 'size (lambda () (window-size win))
                                 'pump! (lambda () (pump-events!))
-                                'set-text-input-state! (lambda (caret-rect index) (window-set-text-input-state! win caret-rect index))
+                                ;; 能力：照实报（没实现的就是 #f——中键 / 侧键没有 otherMouseDown:、捏合没有 magnifyWithEvent:）
+                                'caps (lambda () (hasheq 'glass (and (window-glass win) #t) 'transparent-window #t 'ime 'marked-text 'capture 'self
+                                                         'native-input-sim #t 'precise-scroll #t 'pinch #f 'mouse-buttons 2))
+                                'apply! (lambda (reqs) (for ([r (in-list reqs)]) (apply-request! win r)))
                                 'discard-marked! (lambda () (window-discard-marked-text! win))
                                 'on-live-resize! (lambda (proc) (window-set-on-live-resize! win proc))
-                                'set-content-size! (lambda (w h) (window-set-content-size! win w h))
                                 'close! (lambda () (window-close! win))
-                                'set-cursor! (lambda (kind) (set-cursor! kind))
-                                'glass? (lambda () (and (window-glass win) #t))
-                                'set-glass-rect! (lambda (r) (window-set-glass-rect! win r))
-                                'set-transparent! (lambda (on?) (window-set-transparent! win on?))
-                                'capture (lambda (hide-overlay? below?) (window-capture win hide-overlay? below?))
-                                'set-text-input-enabled! (lambda (on?) (set-box! text-input-on (and on? #t))))
+                                'capture (lambda (hide-overlay? below?) (window-capture win hide-overlay? below?)))
                      (implement clipboard
                                 'get (lambda () (clipboard-get-string))
                                 'set! (lambda (s) (clipboard-set-string! s))
@@ -795,8 +803,14 @@
                                 'post-mouse! (lambda (kind x y [mods '()]) (window-post-mouse! win kind x y #:mods mods))
                                 'post-mouse-ns! (lambda (kind x y [button 0] [mods '()] [clicks 1]) (window-post-mouse-ns! win kind x y #:button button #:mods mods #:clicks clicks))
                                 'post-scroll! (lambda (x y dy [dx 0.0] [phase 'none]) (push! (ev:scroll dx dy #t phase x y)))   ; 合成滚轮 / 触控板手势：直接进队列（同 post-mouse!）
-                                'post-key! (lambda (chars code [mods '()]) (window-post-key! win chars code #:mods mods))
-                                'post-key-cg! (lambda (code [mods '()]) (window-post-key-cg! win code #:mods mods))
+                                ;; 合成按键用逻辑键（keys.rkt）：冒烟脚本与平台无关，Windows 后端照同一套脚本跑
+                                'post-key! (lambda (key [mods '()])
+                                             (define-values (chars code _m) (mac-synthetic-key key mods))
+                                             (window-post-key! win chars code #:mods mods))
+                                'post-key-cg! (lambda (key [mods '()])
+                                                (define-values (_c code _m) (mac-synthetic-key key mods))
+                                                (window-post-key-cg! win code #:mods mods))
+                                'post-chars! (lambda (s) (for ([c (in-string s)]) (window-post-key! win (string c) 0)))   ; 打字：逐字合成（键码不相干，进输入上下文）
                                 'post-paste! (lambda () (push! (ev:paste (clipboard-get-string))))
                                 'post-attach! (lambda (items) (push! (ev:attach items)))
                                 'key? (lambda () (m-is-key-window (window-ns win)))

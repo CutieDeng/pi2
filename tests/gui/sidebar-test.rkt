@@ -152,7 +152,7 @@
   (check-false (s 'editing?))
   (s 'context! 100.0 (+ 40.0 92.0 10.0)) (render s)
   (let ([c (s 'hit-center 'rename "/d/c.rktd")]) (s 'hit (car c) (cdr c)))
-  (editor-command! (s 'editor) 'selectAll:) (editor-command! (s 'editor) 'deleteBackward:)
+  (editor-command! (s 'editor) 'select-all) (editor-command! (s 'editor) 'delete-backward)
   (check-false (s 'submit!))                                                       ; 空：不改
   (let ([c (s 'hit-center 'rename "/d/c.rktd")]) (void))
   (s 'context! 100.0 (+ 40.0 92.0 10.0)) (render s)

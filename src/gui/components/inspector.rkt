@@ -5,10 +5,10 @@
 
 (require racket/list racket/string
          "../compute/drawlist.rkt" "../compute/palette.rkt" "../compute/layout.rkt" "../compute/paint.rkt" "../compute/rich.rkt"
-         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt")
+         "../compute/hub.rkt" "../compute/interfaces.rkt" "../compute/i18n.rkt"
+         "../compute/view.rkt" "../compute/widgets.rkt")                ; 视图平面：元素树 → 布局 → drawlist + 命中
 
 (define HEAD '(0.55 0.70 1.0 1.0))
-(define PAD 18.0)
 (define KEY-W 150.0)
 
 (struct iv (rc [data #:mutable] [scroll #:mutable] [hits #:mutable] [content-h #:mutable] [view-h #:mutable]))
@@ -98,45 +98,19 @@
           (for/list ([x (in-list subs)]) (cons (format "~a" (j x 'call "?")) (t 'in.records-n (num (j x 'records)))))))))
 
 (define (render! s dl x y w h scale)
-  (define rc (iv-rc s))
-  (define lay (rich-ctx-layout rc))
-  (define at (rich-ctx-atlas rc))
-  (define hits '())
-  (define (hit! kind payload hx hy hw hh) (set! hits (cons (vector kind payload hx hy hw hh) hits)))
-  (hit! 'outside #t x y w h)
-  (define cw (min 640.0 (- w 40.0)))
-  (define cx (+ x (/ (- w cw) 2)))
-  (define cy (+ y 30.0))
-  (define ch (- h 60.0))
-  (drawlist-rect! dl (- cx 1.0) (- cy 1.0) (+ cw 2.0) (+ ch 2.0) 0.30 0.31 0.36 1.0 #:radius 11.0)
-  (drawlist-rect! dl cx cy cw ch 0.12 0.12 0.15 1.0 #:radius 10.0)
-  (hit! 'panel #t cx cy cw ch)
-  ;; 标题 + ✕
-  (define title (lay (t 'in.heading) 'title (- cw 80.0) #f))
-  (paint-text! dl at title (+ cx PAD) (+ cy 14.0) TEXT #:scale scale)
-  (define xb (lay "✕" 'body 100.0 #f))
-  (define xx (- (+ cx cw) PAD (text-block-width xb) 6.0))
-  (paint-text! dl at xb (+ xx 3.0) (+ cy 14.0) DIM #:scale scale)
-  (hit! 'close #t (- xx 6.0) (+ cy 6.0) (+ (text-block-width xb) 18.0) 30.0)
-  ;; 正文（裁剪 + 滚动）
-  (define by (+ cy 14.0 (text-block-height title) 12.0))
-  (define bh (- (+ cy ch) by 12.0))
-  (set-iv-view-h! s bh)
-  (drawlist-set-clip! dl (vector cx by cw bh))
-  (define y-end
-    (for/fold ([yy (- by (iv-scroll s))]) ([sec (in-list (sections (iv-data s)))])
-      (define hb (lay (car sec) 'small (- cw (* 2 PAD)) #f))
-      (paint-text! dl at hb (+ cx PAD) yy HEAD #:scale scale)
-      (for/fold ([ry (+ yy (text-block-height hb) 6.0)] #:result (+ ry 10.0)) ([kv (in-list (cadr sec))])
-        (define kb (lay (car kv) 'small (- KEY-W 10.0) #f))
-        (define vb (lay (cdr kv) 'body (- cw (* 2 PAD) KEY-W) #f))
-        (paint-text! dl at kb (+ cx PAD) (+ ry 2.0) DIM #:scale scale)
-        (paint-text! dl at vb (+ cx PAD KEY-W) ry TEXT #:scale scale)
-        (+ ry (max (text-block-height kb) (text-block-height vb)) 6.0))))
-  (drawlist-set-clip! dl #f)
-  (set-iv-content-h! s (+ (- y-end by) (iv-scroll s)))
-  (set-iv-scroll! s (max 0.0 (min (iv-scroll s) (max 0.0 (- (iv-content-h s) bh)))))
-  (set-iv-hits! s hits)
+  ;; 视图平面：模态卡片（compute/widgets.rkt）；正文 = 各节（标题 + 键值行）
+  (define body
+    (for/list ([sec (in-list (sections (iv-data s)))])
+      (apply ui-box #:dir 'column #:gap 6.0 #:pad (vector 0.0 0.0 10.0 0.0)
+             (ui-text (car sec) #:font 'small #:color HEAD #:fit? #f)
+             (for/list ([kv (in-list (cadr sec))]) (kv-row (car kv) (cdr kv) #:key-w KEY-W)))))
+  (define-values (hits regions scrolls)
+    (render-view! (iv-rc s) dl (modal-card #:title (t 'in.heading) #:body body #:offset (iv-scroll s)) x y w h scale))
+  (define sc (hash-ref scrolls 'body))
+  (set-iv-scroll! s (vector-ref sc 0))
+  (set-iv-content-h! s (vector-ref sc 1))
+  (set-iv-view-h! s (vector-ref sc 2))
+  (set-iv-hits! s (reverse hits))                                         ; 找命中时从最上面（后画的）找起
 ) ; end define render!
 
 ;; → (list 'close) | #f（点在卡片上）

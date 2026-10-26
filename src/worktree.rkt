@@ -4,7 +4,9 @@
 ;; 无文件竞态；完成后把分支 merge 回主分支。**未做隔离前绝不在共享 workdir 上并行写**。
 ;; 见 design-goalmode-p4.md。本模块只是纯 git 原语；调度/合并策略在 goal.rkt。
 
-(require racket/string racket/port)
+(require racket/string racket/port
+         (only-in (file "model.rkt") current-session-id)
+         (only-in (file "commit-datum.rkt") automation-tag automation-message datum-convention?))
 
 (define GIT-EXE (or (find-executable-path "git") "/usr/bin/git"))
 (define GIT-TIMEOUT-SECS 120)
@@ -63,9 +65,16 @@
     [else 'error]))
 
 ;; 撤销最近一次 merge commit（--no-ff 保证有 merge commit，HEAD~1=merge 前）。全局验收破坏时用。
+;; pi2 自己生成的提交消息（goal 的 worker / merge / driver）：带自动化标签 (pi2 种类 (session …))，
+;; 按仓库惯例写——最近 20 个提交多数是 datum → (TYPE "title" ((pi2 …)) "title")；否则纯文字 + Pi2-Automation trailer。
+(define (automation-commit-message dir type title kind)
+  (define-values (c out) (run-git-in dir "log" "-n20" "--format=%B%x1e"))
+  (define msgs (if (eqv? c 0) (string-split out "\x1e") '()))
+  (automation-message (datum-convention? msgs) type title (automation-tag kind #:session (current-session-id))))
+
 (define (revert-last-merge! repo-dir)
   (git-ok? repo-dir "reset" "--hard" "HEAD~1"))
 
 (provide
  run-git-in git-ok? git-repo? git-head
- worktree-create! worktree-remove! worktree-merge! git-commit-all! revert-last-merge!)
+ worktree-create! worktree-remove! worktree-merge! git-commit-all! revert-last-merge! automation-commit-message)

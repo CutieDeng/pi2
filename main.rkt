@@ -458,6 +458,7 @@
     ) ; end or
   ) ; end define sess-path
   (define sess (session-open! sess-path cfg*))
+  (current-session-id (session-id sess))                 ; 自动化提交的元数据 (pi2 … (session id))
 
   (cond
     ;; Goal 模式：外层驱动循环,自主多轮推进直到 --until 全过或轮数耗尽（design-goalmode.md）。

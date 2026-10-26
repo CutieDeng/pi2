@@ -5,6 +5,7 @@
  racket/string
  racket/port
  (file "../tool.rkt")
+ (file "../commit-watch.rkt")           ; bash 里直接 git commit → 没带 pi2 标签的提示模型（自动化提交必须写元数据）
 ) ; end require
 
 (define OUTPUT-CAP (* 30 1024))       ; 超过则头尾各留一半
@@ -43,6 +44,7 @@
      (cond
        [(not cmd) (err-outcome "missing required parameter: command")]
        [else
+        (watch-commits (tool-ctx-workdir ctx) (lambda ()
         (parameterize ([current-directory (tool-ctx-workdir ctx)])
           ;; 独立进程组：中断 / 超时时 subprocess-kill 杀整个组（复合命令的孙进程也一并结束）
           (define-values (proc out in _err)
@@ -86,6 +88,7 @@
             ] ; end done case
           ) ; end cond
         ) ; end parameterize
+        )) ; end watch-commits
        ] ; end else
      ) ; end cond
    ) ; end define tool-run

@@ -122,7 +122,9 @@
      (define base (hasheq 'type "tool_end" 'id (tool-use-block-id b) 'name (tool-use-block-name b)
                           'is_error (tool-outcome-is-error? r) 'ms (evt:tool-end-ms e)
                           'content (tool-outcome-content r)))
-     (if (tool-outcome-diff r) (hash-set base 'diff (tool-outcome-diff r)) base)]
+     (let* ([b (if (tool-outcome-diff r) (hash-set base 'diff (tool-outcome-diff r)) base)]
+            [b (if (tool-outcome-ui r) (hash-set b 'ui (tool-outcome-ui r)) b)])
+       b)]
     [(evt:message? e)
      (define m (evt:message-msg e))
      (if (eq? (message-role m) 'assistant)
@@ -725,6 +727,7 @@
                (cons 'ok (parameterize-break #t
                            (parameterize ([current-effect-ledger (ledger-of (unbox cur-sess))]   ; 本会话的效果账本
                                           [current-record-sink (session-record-sink (unbox cur-sess))]   ; 消息追加进历史时就落盘
+                                          [current-session-id (session-id (unbox cur-sess))]   ; 自动化提交的元数据
                                           [current-blob-root (blob-root-of (session-dir (unbox cur-sess)))]   ; 发请求时读媒体
                                           [current-tool-source (lambda (name) (host-tool-source host name))])   ; 工具来源标记（插件）
                              (call-with-route (unbox aff) host thunk))))))   ; 轮线程（及工具、子 agent）走路由

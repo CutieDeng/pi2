@@ -548,3 +548,31 @@
   (check-true (string-contains? s2 "count the files"))
   (check-true (string-contains? s2 "[plugin:echo-tool] echo"))
   (check-true (string-contains? s2 "echo: hi")))
+
+(test-case "git_history results carry structured commits (ui): rows with TYPE badges and label chips; pi2 automation chips in the accent fill; 8 rows collapsed"
+  (define tr (new-tr))
+  (define (row i type labels) (hasheq 'hash (format "abc~a" i) 'date "2026-10-26" 'type type 'title (format "commit ~a" i) 'files 1 'labels labels))
+  (define rows (for/list ([i 10])
+                 (row i (if (even? i) "FEAT" "FIX")
+                      (if (zero? (modulo i 3)) (list (hasheq 'text "pi2 agent" 'auto #t) (hasheq 'text "scope gui" 'auto #f)) '()))))
+  (tr 'apply! (asst 1 (call "h" "git_history" (hasheq 'limit 10))))
+  (tr 'apply! (it 2 "tool" 'call_id "h" 'name "git_history" 'ms 4 'error #f 'source "builtin" 'diff 'null
+                  'ui (hasheq 'kind "commits" 'total 10 'commits rows)))
+  (tr 'apply! (results 3 (res "h" "10 matching commit(s) of 10 scanned:\n...")))
+  (check-equal? (tr 'tool-uis) '(("git_history" "commits" 10)))
+  (define (fill-count dl rgb)
+    (for/sum ([i (in-range (drawlist-count dl))])
+      (define v (drawlist-ref dl i))
+      (if (and (= (list-ref v 13) KIND-RECT) (for/and ([c (in-list rgb)] [k (in-list '(4 5 6))]) (< (abs (- c (list-ref v k))) 0.002))) 1 0)))
+  (define FEAT '(0.17 0.33 0.24)) (define FIX '(0.42 0.20 0.22)) (define AUTO '(0.55 0.70 1.00))
+  (define dl1 (render tr 3000.0))                         ; 收起：前 8 行（0..7）：FEAT 0 2 4 6、FIX 1 3 5 7；自动化标签在 0 3 6
+  (check-equal? (list (fill-count dl1 FEAT) (fill-count dl1 FIX) (fill-count dl1 AUTO)) '(4 4 3))
+  (tr 'toggle-tool! "h")
+  (define dl2 (render tr 3000.0))                         ; 展开：10 行，自动化标签在 0 3 6 9
+  (check-equal? (list (fill-count dl2 FEAT) (fill-count dl2 FIX) (fill-count dl2 AUTO)) '(5 5 4))
+  ;; 没有 ui（旧会话、别的工具）→ 照旧画输出文字
+  (define tr2 (new-tr))
+  (tr2 'apply! (asst 1 (call "h" "git_history" (hasheq))))
+  (tr2 'apply! (results 2 (res "h" "1 matching commit(s)")))
+  (check-equal? (tr2 'tool-uis) '())
+  (check-equal? (fill-count (render tr2 3000.0) FEAT) 0))

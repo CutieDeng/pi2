@@ -114,6 +114,10 @@
   (append-rec! s (rec type (iso-now) data))
 ) ; end define session-append-rec!
 
+;; 会话 id = 文件名去掉 .rktd（自动化提交的元数据里用）
+(define (session-id s)
+  (let-values ([(_d n _x) (split-path (session-path s))]) (regexp-replace #rx"[.]rktd$" (path->string n) "")))
+
 ;; 内核的记录去向（model.rkt current-record-sink）→ 写这个会话文件
 (define (session-record-sink s)
   (lambda (kind payload)
@@ -579,6 +583,7 @@
  session-append-title! session-append-workspace! session-workspace records-of-type session-on-append! session-index session-record-count session-read-range session-media-records session-ephemeral?
  session?
  session-path
+ session-id
  session-open!
  session-append-msg!
  session-append-usage!

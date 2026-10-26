@@ -20,16 +20,17 @@
    is-error?   ; boolean
    display     ; (or/c #f string) — 给用户看的摘要（#f = 用 content）
    diff        ; (or/c #f jsexpr) — 文件改动（diff.rkt file-diff），只给界面显示，不回填模型
+   ui          ; (or/c #f jsexpr) — 给界面的结构化结果（如 git_history 的 {kind:"commits"}），不回填模型
   ) ; end fields
   #:transparent
 ) ; end struct tool-outcome
 
-(define (ok-outcome content #:display [display #f] #:diff [diff #f])
-  (tool-outcome content #f display diff)
+(define (ok-outcome content #:display [display #f] #:diff [diff #f] #:ui [ui #f])
+  (tool-outcome content #f display diff ui)
 ) ; end define ok-outcome
 
 (define (err-outcome content #:display [display #f])
-  (tool-outcome content #t display #f)
+  (tool-outcome content #t display #f #f)
 ) ; end define err-outcome
 
 (struct tool-ctx

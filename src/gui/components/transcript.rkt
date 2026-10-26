@@ -27,7 +27,8 @@
 (struct e-tool (id name input [status #:mutable] [output #:mutable] [ms #:mutable] [expanded? #:mutable]
                 [diff #:mutable] [total #:mutable] [rid #:mutable] [truncated? #:mutable] [source #:mutable]
                 [fetching? #:mutable]
-                [picked #:mutable]))                  ; smart 预览：#f 还没要 / 'pending / 'failed / 本地模型挑的行（0 起）
+                [picked #:mutable]                    ; smart 预览：#f 还没要 / 'pending / 'failed / 本地模型挑的行（0 起）
+                [ui #:mutable]))                      ; 结构化结果（git_history：{kind "commits" commits …}）或 #f
 (struct e-perm (id prompt tool level input [answer #:mutable]))
 (struct e-note (text level))                          ; level ∈ info dim warn error usage
 
@@ -250,6 +251,7 @@
        (when (hash-has-key? f 'ms) (set-e-tool-ms! e (let ([m (hash-ref f 'ms)]) (and (real? m) m))))
        (when (hash-has-key? f 'source) (set-e-tool-source! e (hash-ref f 'source)))
        (let ([d (hash-ref f 'diff #f)]) (when (and (hash? d) (string? (j d 'text))) (set-e-tool-diff! e d)))
+       (let ([u (hash-ref f 'ui #f)]) (when (hash? u) (set-e-tool-ui! e u)))
        (cond
          [(hash-has-key? f 'content)                   ; 有结果
           (define c (hash-ref f 'content))
@@ -304,7 +306,7 @@
 (define (make-tool! tr p)
   (define id (j p 'id))
   (define e (e-tool id (let ([n (j p 'name)]) (if (string? n) n "?")) (let ([i (j p 'input)]) (if (hash? i) i (hasheq)))
-                    'running "" #f #f #f #f #f #f "builtin" #f #f))
+                    'running "" #f #f #f #f #f #f "builtin" #f #f #f))
   (hash-set! (transcript-tools tr) id e)
   (apply-aux! tr (cons 'tool id))
   e
@@ -349,7 +351,8 @@
      (aux-update! tr rid (cons 'tool (j it 'call_id))
                   (let* ([f (hasheq 'ms (j it 'ms) 'error (and (j it 'error) #t))]
                          [f (if (string? (j it 'source)) (hash-set f 'source (j it 'source)) f)]
-                         [f (if (hash? (j it 'diff)) (hash-set f 'diff (j it 'diff)) f)])
+                         [f (if (hash? (j it 'diff)) (hash-set f 'diff (j it 'diff)) f)]
+                         [f (if (hash? (j it 'ui)) (hash-set f 'ui (j it 'ui)) f)])
                     f))
      '()]
     [("diff") (when (hash? (j it 'diff)) (aux-update! tr rid (cons 'tool (j it 'call_id)) (hasheq 'diff (j it 'diff)))) '()]
@@ -909,6 +912,56 @@
 (define PAD 14.0)
 (define GAP 10.0)
 (define EXPANDED-LINES 400)
+(define COMMITS-COLLAPSED 8)                           ; git_history 的卡片收起时画几行提交
+
+;; git_history 的提交行：hash（次要色）· TYPE 标记 · 标题（一行，放不下截断）；有标签 → 下一行一串标签片（放不下换行）。
+;; 颜色只用已有的：TYPE 标记用 chip 的种类色（rich.rkt KIND-COLORS 的同一组值，配浅色字已过对比度检查），普通标签用中性的 chip 灰，
+;; 自动化提交的 pi2 标签用「运行中」角标的实心浅蓝 + 深色字（palette.rkt BADGE-BUSY），一眼区分人写的和自动化的。
+(define TYPE-COLORS (hash "FEAT" '(0.17 0.33 0.24) "FIX" '(0.42 0.20 0.22) "REFACTOR" '(0.29 0.22 0.42)
+                          "TEST" '(0.17 0.28 0.37) "DOCS" '(0.38 0.31 0.15) "BUILD" '(0.27 0.28 0.32)))
+(define CHIP-FILL '(0.27 0.28 0.32))
+(define CHIP-TEXT '(0.93 0.94 0.96 1.0))
+(define CHIP-PX 6.0)
+;; → (values 高度 (dl atlas x y scale → void))
+(define (commit-rows lay rows w)
+  (define ops '())                                      ; (x y → 画)，相对坐标
+  (define (op! f) (set! ops (cons f ops)))
+  (define (chip! tb cx cy fill fg)
+    (define cw (+ (text-block-width tb) (* 2 CHIP-PX)))
+    (define ch (+ (text-block-height tb) 2.0))
+    (op! (lambda (dl atlas x y scale)
+           (drawlist-rect! dl (+ x cx) (+ y cy) cw ch (car fill) (cadr fill) (caddr fill) 1.0 #:radius 5.0)
+           (paint-text! dl atlas tb (+ x cx CHIP-PX) (+ y cy 1.0) fg #:scale scale)))
+    cw)
+  ;; 两列对齐：hash 列宽 = 最宽的 hash，TYPE 列宽 = 最宽的标记（比例字体下各行的 hash 宽度不同，不对齐时标记与标题参差）
+  (define htbs (for/list ([r (in-list rows)]) (lay (format "~a" (j r 'hash "")) 'small 1000.0 #f)))
+  (define (type-of r) (let ([v (j r 'type)]) (if (string? v) v "text")))
+  (define ttbs (for/list ([r (in-list rows)]) (lay (type-of r) 'small 1000.0 #f)))
+  (define x1 (+ (for/fold ([m 0.0]) ([tb (in-list htbs)]) (max m (text-block-width tb))) 8.0))
+  (define x2 (+ x1 (for/fold ([m 0.0]) ([tb (in-list ttbs)]) (max m (text-block-width tb))) (* 2 CHIP-PX) 8.0))
+  (define total
+    (for/fold ([yy 0.0]) ([r (in-list rows)] [htb (in-list htbs)] [tytb (in-list ttbs)])
+      (define lh (+ (text-block-height htb) 2.0))
+      (op! (lambda (dl atlas x y scale) (paint-text! dl atlas htb (+ x 0.0) (+ y yy 1.0) DIM #:scale scale)))
+      (chip! tytb x1 yy (hash-ref TYPE-COLORS (type-of r) CHIP-FILL) CHIP-TEXT)
+      (define ttb (fit-line lay (let ([v (j r 'title)]) (if (string? v) v "")) 'small (max 40.0 (- w x2))))
+      (op! (lambda (dl atlas x y scale) (paint-text! dl atlas ttb (+ x x2) (+ y yy 1.0) TEXT #:scale scale)))
+      (define labels (let ([v (j r 'labels)]) (if (list? v) (filter hash? v) '())))
+      (define label-h
+        (cond
+          [(null? labels) 0.0]
+          [else
+           (for/fold ([cx x1] [cy (+ yy lh 3.0)] #:result (- (+ cy lh) (+ yy lh)))
+                     ([l (in-list labels)])
+             (define tb (fit-line lay (format "~a" (j l 'text "")) 'small (- w x1 (* 2 CHIP-PX))))
+             (define cw (+ (text-block-width tb) (* 2 CHIP-PX)))
+             (define-values (px py) (if (and (> (+ cx cw) w) (> cx x1)) (values x1 (+ cy lh 3.0)) (values cx cy)))
+             (define auto? (eq? (j l 'auto #f) #t))
+             (chip! tb px py (if auto? BADGE-BUSY CHIP-FILL) (if auto? BADGE-BUSY-TEXT CHIP-TEXT))
+             (values (+ px cw 4.0) py))]))
+      (+ yy lh label-h 6.0)))                           ; label-h 已含标题行与标签行之间的 3
+  (values (max 0.0 (- total 6.0))
+          (lambda (dl atlas x y scale) (for ([f (in-list (reverse ops))]) (f dl atlas x y scale)))))
 (define DIFF-COLLAPSED-LINES 16)
 
 ;; diff 行 → (values 背景色或 #f 文字色)
@@ -984,6 +1037,10 @@
                                     [else (values "✗" ERR)]))
      ;; 改文件的工具：正文是 diff（每行一块，按 +/-/@@ 着色、加 / 删行带底色），否则是工具输出
      (define diff (and (eq? status 'ok) (e-tool-diff e)))
+     ;; git_history：结构化的提交列表 → 画成一行行（hash、TYPE 标记、标题、标签片）而不是工具输出文字
+     (define commits (and (eq? status 'ok) (not diff)
+                          (let ([u (e-tool-ui e)]) (and (hash? u) (equal? (j u 'kind) "commits") (list? (j u 'commits)) (pair? (j u 'commits))
+                                                        (filter hash? (j u 'commits))))))
      (define src (e-tool-source e))
      (define head (lay (format "~a  ~a~a  ~a~a~a" icon
                                (if (and (string? src) (not (equal? src "builtin"))) (format "[~a] " src) "")
@@ -993,9 +1050,10 @@
                        'small inner #f))
      (define out (if diff (j diff 'text) (e-tool-output e)))
      (define-values (pn pmode pkeep pdrop) (preview-spec tr (e-tool-name e)))
-     (define smart? (and (equal? pmode "smart") (not diff) (not (e-tool-expanded? e))))
+     (define smart? (and (equal? pmode "smart") (not diff) (not commits) (not (e-tool-expanded? e))))
      (define-values (shown more)
-       (cond [(e-tool-expanded? e) (head-lines out EXPANDED-LINES)]
+       (cond [commits (values "" (if (e-tool-expanded? e) 0 (max 0 (- (length commits) COMMITS-COLLAPSED))))]
+             [(e-tool-expanded? e) (head-lines out EXPANDED-LINES)]
              [diff (head-lines out DIFF-COLLAPSED-LINES)]
              [else (preview-lines out pn pmode #:keep pkeep #:drop pdrop #:picked (and smart? (e-tool-picked e)))]))
      ;; smart：看得到的、行数够多的、有结果的卡片 → 请本机小模型挑行（每张卡片一次）
@@ -1016,7 +1074,9 @@
                      (cons l (para-blocks tr l 'mono (- inner 8.0))))]
              [else (para-blocks tr plain 'mono inner)]))
      (define footer-text
-       (cond [(and (e-tool-expanded? e) (e-tool-fetching? e)) (t 'tr.full-loading)]
+       (cond [(and commits (> more 0)) (t 'tr.more-commits more (t 'tr.expand))]
+             [commits #f]
+             [(and (e-tool-expanded? e) (e-tool-fetching? e)) (t 'tr.full-loading)]
              [(and smart? (> more 0) (eq? (e-tool-picked e) 'pending)) (t 'tr.picking more)]
              [(and smart? (> more 0) (pair? (e-tool-picked e))) (t 'tr.picked more)]
              [(> more 0) (t 'tr.more-lines more (if (e-tool-expanded? e) (t 'tr.collapse) (t 'tr.expand)))]
@@ -1024,13 +1084,17 @@
              [(and diff (eq? (j diff 'truncated) #t)) (t 'tr.diff-truncated)]
              [else #f]))
      (define footer (and footer-text (lay footer-text 'small inner #f)))
-     (define bh (if diff (for/sum ([b (in-list body)]) (blocks-height (cdr b))) (blocks-height body)))
+     (define-values (crh cpaint!) (if commits
+                                      (commit-rows lay (if (e-tool-expanded? e) commits (take commits (min COMMITS-COLLAPSED (length commits)))) inner)
+                                      (values 0.0 void)))
+     (define bh (cond [commits crh] [diff (for/sum ([b (in-list body)]) (blocks-height (cdr b)))] [else (blocks-height body)]))
+     (define body? (or (pair? body) (and commits #t)))
      (define fh (if footer (+ 4.0 (text-block-height footer)) 0.0))
      (define hh (text-block-height head))
      ;; 子 agent 的步骤（P5）：收起时一行计数，展开时缩进画在输出下面
      (define kids (tool-children tr e))
      (define ktb (and (pair? kids) (lay (t (if (e-tool-expanded? e) 'tr.sub-steps-open 'tr.sub-steps) (length kids)) 'small inner #f)))
-     (define kids-y0 (+ y PAD hh (if (null? body) 0.0 (+ 6.0 bh)) fh))
+     (define kids-y0 (+ y PAD hh (if body? (+ 6.0 bh) 0.0) fh))
      ;; 量（paint? #f）与画分两次：画要在卡片标题、输出之后（文字行的记录顺序 = 视觉顺序，选择 / 复制按它）
      (define (draw-kids! paint? hit!)
        (cond
@@ -1046,11 +1110,12 @@
                    (+ yy ch 6.0))
                  0.0))]))
      (define kh (draw-kids! #f void))
-     (define h (+ PAD hh (if (null? body) 0.0 (+ 6.0 bh)) fh kh (* 0.7 PAD)))
+     (define h (+ PAD hh (if body? (+ 6.0 bh) 0.0) fh kh (* 0.7 PAD)))
      (when paint?
        (drawlist-rect! dl x y w h 0.16 0.16 0.18 1.0 #:radius 8.0)                 ; 工具卡片：0.13 与对话区的底只有 1.12
        (paint-text! dl (rich-ctx-atlas rc) head (+ x PAD) (+ y (* 0.7 PAD)) (if (eq? status 'error) ERR DIM) #:scale scale)
        (cond
+         [commits (cpaint! dl (rich-ctx-atlas rc) (+ x PAD) (+ y (* 0.7 PAD) hh 6.0) scale)]
          [diff
           (for/fold ([yy (+ y (* 0.7 PAD) hh 6.0)]) ([b (in-list body)])
             (define-values (bg fg) (diff-line-style (car b)))
@@ -1494,6 +1559,9 @@
                                 'wanted (lambda () (transcript-wanted! (D)))
                                 'minimap-jump! (lambda (y) (transcript-minimap-jump! (D) y))
                                 'stats (lambda () (transcript-stats (D)))
+                                'tool-uis (lambda ()
+                                            (for/list ([e (in-hash-values (transcript-tools (D)))] #:when (hash? (e-tool-ui e)))
+                                              (list (e-tool-name e) (j (e-tool-ui e) 'kind) (let ([c (j (e-tool-ui e) 'commits)]) (if (list? c) (length c) 0)))))
                                 'set-preview! (lambda (cfg)
                                                 (set! preview (if (hash? cfg) cfg DEFAULT-PREVIEW))
                                                 (for ([d (in-hash-values docs)]) (set-transcript-preview! d preview)))

@@ -20,6 +20,7 @@
    (make-glob-tool)
    (make-grep-tool)
    (make-git-tool)
+   (make-git-history-tool)              ; 只读：按 TYPE / 元数据查提交（datum 提交消息）
    (make-racket-eval-tool)
   ) ; end list
   ;; 工作区测试流程（没有 .pi/tests.rktd 时调用会说明「这个工作区没有测试流程」）

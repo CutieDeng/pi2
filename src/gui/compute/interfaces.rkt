@@ -62,6 +62,8 @@
   ;;   minimap-jump! (y) 点 / 拖小地图（hit 给出 (list 'minimap)）：跳到对应位置
   ;;   toggle-play! (sha) 音频块的 ▶ / ❚❚（hit 给出 (list 'media-play sha)）；add-user! 的第三个参数：附件（kind media_type sha name meta bytes）
   wanted stats set-preview! minimap-jump! toggle-play!
+  ;; tool-uis () → 带结构化结果的工具卡片：(listof (list 工具名 种类 条数))（冒烟流程断言用）
+  tool-uis
   use-doc! current-doc apply-to! note-to! reset-doc! drop-doc! doc-info)
 
 ;; 内核连接（一窗多主机：每个 pi2 内核一个主机 id；消息协议见 src/rpc.rkt）

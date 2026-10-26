@@ -9,7 +9,8 @@
 ;;   results     'parts（tool_result：call_id content is_error total_len truncated）
 ;;   permission  'perm_id 'tool 'level 'input 'prompt        answer   'perm_id 'decision
 ;;   note        'level 'code 'text 'data                       usage    'model 'input 'output 'cost
-;;   tool        'call_id 'name 'ms 'error 'display 'source 'diff    diff 'call_id 'diff（旧会话；新会话的 diff 在 tool 里）
+;;   tool        'call_id 'name 'ms 'error 'display 'source 'diff 'ui（结构化结果，如 git_history 的 {kind "commits"}）
+;;                                                               diff 'call_id 'diff（旧会话；新会话的 diff 在 tool 里）
 ;;   partial     'text 'reasoning                                compact  'count 'summary
 ;;   sub         'parent（父工具调用 id）'host（远端拉回的：主机）'inner（子 agent 那条记录的条目，没有 type / id）
 ;; 长工具输出：条目里只带预览（前 preview-bytes 字节），'total_len 全长，'truncated #t；全文用 item 请求按 id 取。
@@ -80,7 +81,8 @@
     [(req) (item "usage" 'model (j data 'model "?") 'input (j data 'input 0) 'output (j data 'output 0) 'cost (let ([c (j data 'cost #f)]) (if (real? c) c 'null)))]
     [(tool) (item "tool" 'call_id (j data 'id) 'name (j data 'name "?") 'ms (j data 'ms) 'error (j data 'error #f)
                   'display (let ([d (j data 'display)]) (if (string? d) d 'null)) 'source (let ([s (j data 'source)]) (if (string? s) s "builtin"))
-                  'diff (let ([d (j data 'diff)]) (if (hash? d) d 'null)))]
+                  'diff (let ([d (j data 'diff)]) (if (hash? d) d 'null))
+                  'ui (let ([u (j data 'ui)]) (if (hash? u) u 'null)))]
     [(diff) (and (list? data) (= (length data) 2) (item "diff" 'call_id (car data) 'diff (cadr data)))]
     [(sub)
      ;; 子 agent 的记录（P5）：本机的 = 内层记录（kind data）→ 同样投影；远端拉回的 = 已投影的条目（'item）

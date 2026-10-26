@@ -93,6 +93,7 @@
    'tr.copy           (hasheq 'zh "复制" 'en "Copy")
    'tr.tool-aborted   (hasheq 'zh "■ 已中断" 'en "■ interrupted")
    'tr.more-lines     (hasheq 'zh "… 还有 ~a 行 · 点标题~a" 'en "… ~a more lines · click the title to ~a")
+   'tr.more-commits   (hasheq 'zh "… 还有 ~a 个提交 · 点标题~a" 'en "… ~a more commits · click the title to ~a")
    'tr.collapse       (hasheq 'zh "收起" 'en "collapse")
    'tr.expand         (hasheq 'zh "展开" 'en "expand")
    'tr.diff-truncated (hasheq 'zh "… diff 过长，只显示前一部分" 'en "… diff too long, showing the beginning")

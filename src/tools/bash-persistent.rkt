@@ -17,6 +17,7 @@
  racket/file
  (file "../tool.rkt")
  (file "bash.rkt")                      ; truncate-output
+ (file "../commit-watch.rkt")           ; bash 里直接 git commit → 没带 pi2 标签的提示模型
 ) ; end require
 
 (define DEFAULT-TIMEOUT-SECS 300)      ; 上游 minimal 预设 timeoutMs 300000
@@ -72,6 +73,7 @@
        [(or (not cmd) (string=? (string-trim cmd) ""))
         (err-outcome "command must be a non-empty string")]
        [else
+        (watch-commits (tool-ctx-workdir ctx) (lambda ()
         (define cwd-f (path->string (persistent-bash-tool-cwd-file t)))
         (define env-f (path->string (persistent-bash-tool-env-file t)))
         (define cmd-f (persistent-bash-tool-cmd-file t))
@@ -124,6 +126,7 @@
            ) ; end if
           ] ; end done case
         ) ; end cond
+        )) ; end watch-commits
        ] ; end else
      ) ; end cond
    ) ; end define tool-run

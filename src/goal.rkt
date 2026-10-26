@@ -471,7 +471,7 @@
           [else
            ;; 丢弃 worker 对共享 PLAN.md 的改动（driver 独占 PLAN.md via mark-task-done!，避免 merge 冲突）。
            (run-git-in wt-dir "checkout" "--" "PLAN.md")
-           (git-commit-all! wt-dir f"goal worker: {safe-id}")
+           (git-commit-all! wt-dir (automation-commit-message wt-dir 'FEAT f"goal worker: {safe-id}" 'goal-worker))
            (values 'ready branch wt-dir (reset-workdir st-w repo-dir))])])]
   ) ; end cond
 ) ; end define spawn-worker!
@@ -482,7 +482,7 @@
   (dynamic-wind
    void
    (lambda ()
-     (define mres (worktree-merge! repo-dir branch f"merge {branch}"))
+     (define mres (worktree-merge! repo-dir branch (automation-commit-message repo-dir 'FEAT f"merge {branch}" 'goal-merge)))
      (cond
        [(not (eq? mres 'ok)) 'conflict]
        [else
@@ -494,7 +494,7 @@
 ;; worker merge 完才可能过，逐个验收是错的；全局由 run-goal-dag! 循环顶端把关）。→ 'ok|'conflict|'error。
 (define (merge-branch! repo-dir branch wt-dir)
   (dynamic-wind void
-    (lambda () (worktree-merge! repo-dir branch f"merge {branch}"))
+    (lambda () (worktree-merge! repo-dir branch (automation-commit-message repo-dir 'FEAT f"merge {branch}" 'goal-merge)))
     (lambda () (worktree-remove! repo-dir wt-dir branch))))
 
 ;; 在 main 的 PLAN.md 里把 id=tid 的未勾任务勾上并提交（driver 推进 DAG，不依赖模型自勾）。
@@ -507,7 +507,7 @@
                          (regexp-replace #px"\\[ \\]" l "[x]") l)))
     (call-with-output-file f #:exists 'truncate (lambda (o) (write-string (string-join lines* "\n") o)))
     (run-git-in repo-dir "add" "PLAN.md")
-    (run-git-in repo-dir "commit" "-m" f"mark task {tid} done")))
+    (run-git-in repo-dir "commit" "-m" (automation-commit-message repo-dir 'DOCS f"mark task {tid} done" 'goal-driver))))
 
 ;; P4.1 便捷式（N=1）：spawn + merge，自带日志。保持既有调用方/测试不变。
 (define (run-task-in-worktree! d st sess host repo-dir task-id task-desc task-until global-until

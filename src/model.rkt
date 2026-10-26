@@ -198,7 +198,7 @@
  (struct-out evt:turn-end)
  (struct-out evt:error)
  now-ms
- current-record-sink record!
+ current-record-sink record! current-session-id
 ) ; end provide
 
 ;; ---------------------------------------------------------------- 会话记录的去向
@@ -206,4 +206,6 @@
 ;;   'msg 消息（追加进历史）| 'compact 压缩后的完整历史（摘要 + 保留的消息；清空 = '()）| 'turn 'begin / 'revert（轮开始 / 出错撤回）
 ;; 由前端（RPC / TUI）设成写会话文件；#f = 不记（测试、子 agent）
 (define current-record-sink (make-parameter #f))
+;; 当前会话的 id（会话文件名去掉 .rktd，如 "20261026-1050-9463"）：自动化提交的元数据 (pi2 种类 (session id)) 用；#f = 不知道
+(define current-session-id (make-parameter #f))
 (define (record! kind payload) (let ([s (current-record-sink)]) (when s (s kind payload))))

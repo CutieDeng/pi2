@@ -458,7 +458,7 @@
                     #:synth-picker? [synth-picker? #f] #:synth-route? [synth-route? #f] #:synth-settings? [synth-settings? #f]
                     #:synth-secret? [synth-secret? #f] #:synth-reattach? [synth-reattach? #f] #:synth-settings2? [synth-settings2? #f]
                     #:synth-multihost? [synth-multihost? #f] #:synth-hosts? [synth-hosts? #f] #:synth-reconnect? [synth-reconnect? #f]
-                    #:synth-spend? [synth-spend? #f] #:synth-small? [synth-small? #f] #:synth-media? [synth-media? #f] #:synth-layout? [synth-layout? #f] #:synth-sessmenu? [synth-sessmenu? #f] #:synth-chat? [synth-chat? #f] #:synth-visual? [synth-visual? #f] #:synth-rightclick? [synth-rightclick? #f] #:synth-organize? [synth-organize? #f] #:synth-unicode? [synth-unicode? #f] #:synth-instructions? [synth-instructions? #f] #:synth-memory? [synth-memory? #f] #:synth-hostindex? [synth-hostindex? #f] #:synth-automem? [synth-automem? #f] #:synth-tests? [synth-tests? #f]
+                    #:synth-spend? [synth-spend? #f] #:synth-small? [synth-small? #f] #:synth-media? [synth-media? #f] #:synth-layout? [synth-layout? #f] #:synth-sessmenu? [synth-sessmenu? #f] #:synth-chat? [synth-chat? #f] #:synth-visual? [synth-visual? #f] #:synth-rightclick? [synth-rightclick? #f] #:synth-organize? [synth-organize? #f] #:synth-unicode? [synth-unicode? #f] #:synth-instructions? [synth-instructions? #f] #:synth-memory? [synth-memory? #f] #:synth-hostindex? [synth-hostindex? #f] #:synth-automem? [synth-automem? #f] #:synth-tests? [synth-tests? #f] #:synth-history? [synth-history? #f]
                     #:synth-live [live-prompt #f] #:allow-rx [allow-rx #f] #:ime-real [ime-real #f] #:snapshot-at-exit [snap-path #f]
                     #:journal-dir [journal-dir #f] #:replay [replay-path #f])
   (install-uncaught-exception-reporter!
@@ -1984,6 +1984,22 @@
                    (lambda () (log! 'hidden-raw (gsetting 'hidden-text-mode #f)) (click-at! (svp 'hit-center 'hidden-text-mode 'mark))))
              (cons (lambda () (eq? (gsetting 'hidden-text-mode #f) 'mark))
                    (lambda () (log! 'hidden-mark (gsetting 'hidden-text-mode #f)) (snapshot-and-quit!))))]
+      [synth-history?
+       ;; datum 提交的工具卡片（git_history；夹具 PI2_SEED_HISTORY=1，10 个提交）：让模型查历史 → 卡片画成提交行（hash、TYPE 标记、标题、标签片；
+       ;; pi2 自动化的标签用强调色）→ 截图检查 → 点标题展开（真实点击）→ 再检查
+       (define (log! k v) (set! sessions-log (cons (cons k v) sessions-log)))
+       (define (cur) (findf (lambda (se) (hash-ref se 'current #f)) (sbp 'sessions)))
+       (define (ns! kind pt [button 0]) (wi 'post-mouse-ns! kind (* zoom (car pt)) (* zoom (cdr pt)) button))
+       (define (lclick! pt) (ns! 'down pt) (ns! 'up pt))
+       (define frames-at 0)
+       (define (after n) (lambda () (> frames (+ frames-at n))))
+       (define (step pred act) (cons pred (lambda () (act) (set! frames-at frames))))
+       (define (answered? n) (and (not (busy?)) (let ([c (cur)]) (and c (>= (hash-ref c 'messages 0) n)))))
+       (list (step (lambda () (and ready (cur))) (lambda () (post-text! "show history") (enter!)))
+             (step (lambda () (and (answered? 4) (pair? (tr 'tool-uis)))) (lambda () (log! 'cards (tr 'tool-uis))))
+             (step (lambda () (and ((after 4)) (tr 'hit-center 'tool "call-git_history")))
+                   (lambda () (log! 'visual (visual-check "history-card")) (lclick! (tr 'hit-center 'tool "call-git_history"))))
+             (step (after 6) (lambda () (log! 'visual-expanded (visual-check "history-expanded")) (snapshot-and-quit!))))]
       [synth-tests?
        ;; 工作区测试流程面板（design-goalmode.md §12 T2；夹具 PI2_SEED_TESTFLOW=1）：⌘⇧T 打开 → 截图检查 → 信任 → 全部运行（check 失败、unit 通过）→
        ;; 展开失败的输出 → 截图检查 → Esc → 让模型 tests_propose 加一步 → 再打开 → 提议在 → 批准 → 步骤里有了 lint（真实点击 / 按键）
@@ -3281,6 +3297,8 @@ first question" c)))
            (printf "G17 automem: ~s\n" (reverse sessions-log)))
          (when synth-tests?
            (printf "G18 tests: ~s\n" (reverse sessions-log)))
+         (when synth-history?
+           (printf "G19 history: ~s\n" (reverse sessions-log)))
          (when lint-active? (print-lint-summary!))
          (when kernel-history
            (printf "G3 kernel-history-tail=~s\n"
@@ -3356,6 +3374,7 @@ first question" c)))
   (define synth-hostindex? #f)
   (define synth-automem? #f)
   (define synth-tests? #f)
+  (define synth-history? #f)
   (define remote-host #f)
   (define remote-cmd #f)
   (define remote-name #f)
@@ -3401,6 +3420,7 @@ first question" c)))
      [("--synth-organize") "smoke: the agent proposes a changeset; review panel, sidebar preview, apply selected, undo (scripted core)" (set! synth-organize? #t)]
      [("--synth-unicode") "check: Unicode display policy markers and ANSI colors in the transcript, with contrast checks (scripted core)" (set! synth-unicode? #t)]
      [("--synth-tests") "smoke: workspace test flow panel — open (⌘⇧T), trust, run all, failing output, the agent proposes a change, approve (scripted core; PI2_SEED_TESTFLOW=1)" (set! synth-tests? #t)]
+   [("--synth-history") "smoke: git_history tool card — datum commits drawn as rows with TYPE badges and label chips, collapsed and expanded (scripted core; PI2_SEED_HISTORY=1)" (set! synth-history? #t)]
      [("--synth-automem") "smoke: automatic memory — off does nothing; turned on in Settings: extract + merge with the (fake) local model, global ones pending, no reprocessing, a new session gets them (scripted core; PI2_MEM_IDLE_SECONDS=0)" (set! synth-automem? #t)]
      [("--synth-hostindex") "smoke: project index — scan, local-model descriptions, host_projects (Chinese query), session switch, edit / regenerate in Settings (scripted core; PI2_SEED_REPOS=1)" (set! synth-hostindex? #t)]
      [("--synth-memory") "smoke: memory — /remember (workspace, global), the model's memory_note to global waits for Keep in Settings, write switch, a new session gets them, info panel (scripted core)" (set! synth-memory? #t)]
@@ -3476,6 +3496,6 @@ first question" c)))
              [(getenv "PI2_JOURNAL_DIR") => values]
              [else (build-path (find-system-path 'home-dir) "Library" "Logs" "pi2")]))
      (run-window #:hosts (if replay-path '() host-specs) #:active (and remote-spec (car remote-spec)) #:journal-dir jdir #:replay replay-path #:exit-after exit-after #:resize-to resize-to
-                 #:synth? synth? #:synth-core? synth-core? #:synth-sessions? synth-sessions? #:synth-picker? synth-picker? #:synth-route? synth-route? #:synth-settings? synth-settings? #:synth-secret? synth-secret? #:synth-reattach? synth-reattach? #:synth-settings2? synth-settings2? #:synth-multihost? synth-multihost? #:synth-hosts? synth-hosts? #:synth-reconnect? synth-reconnect? #:synth-spend? synth-spend? #:synth-small? synth-small? #:synth-media? synth-media? #:synth-layout? synth-layout? #:synth-sessmenu? synth-sessmenu? #:synth-chat? synth-chat? #:synth-visual? synth-visual? #:synth-rightclick? synth-rightclick? #:synth-organize? synth-organize? #:synth-unicode? synth-unicode? #:synth-instructions? synth-instructions? #:synth-memory? synth-memory? #:synth-hostindex? synth-hostindex? #:synth-automem? synth-automem? #:synth-tests? synth-tests? #:synth-live live-prompt #:allow-rx allow-rx
+                 #:synth? synth? #:synth-core? synth-core? #:synth-sessions? synth-sessions? #:synth-picker? synth-picker? #:synth-route? synth-route? #:synth-settings? synth-settings? #:synth-secret? synth-secret? #:synth-reattach? synth-reattach? #:synth-settings2? synth-settings2? #:synth-multihost? synth-multihost? #:synth-hosts? synth-hosts? #:synth-reconnect? synth-reconnect? #:synth-spend? synth-spend? #:synth-small? synth-small? #:synth-media? synth-media? #:synth-layout? synth-layout? #:synth-sessmenu? synth-sessmenu? #:synth-chat? synth-chat? #:synth-visual? synth-visual? #:synth-rightclick? synth-rightclick? #:synth-organize? synth-organize? #:synth-unicode? synth-unicode? #:synth-instructions? synth-instructions? #:synth-memory? synth-memory? #:synth-hostindex? synth-hostindex? #:synth-automem? synth-automem? #:synth-tests? synth-tests? #:synth-history? synth-history? #:synth-live live-prompt #:allow-rx allow-rx
                  #:ime-real ime-real #:snapshot-at-exit snap-at-exit)])
 ) ; end module+ main

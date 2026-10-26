@@ -215,6 +215,7 @@
     (record! 'tool (hasheq 'id (tool-use-block-id call) 'name (tool-use-block-name call) 'ms (vector-ref times i)
                            'error (and (tool-outcome-is-error? oc) #t) 'display (or (tool-outcome-display oc) 'null)
                            'diff (or (tool-outcome-diff oc) 'null)                 ; 改文件的工具：diff（界面显示，不回填模型）
+                           'ui (or (tool-outcome-ui oc) 'null)                     ; 结构化结果（git_history 的提交列表等），只给界面
                            'source ((current-tool-source) (tool-use-block-name call))))
     (tool-result-block (tool-use-block-id call)
                        (tool-outcome-content oc)

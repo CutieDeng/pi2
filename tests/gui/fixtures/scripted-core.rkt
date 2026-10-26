@@ -65,6 +65,7 @@
             (stream-text! ch (if m (string-trim (substring sys (caar m))) "no memory"))]
            [(regexp-match? #rx"note pref" user-text) (call! "memory_note" (hasheq 'text "MODEL-MEM: indent with tabs" 'scope "global"))]
            [(regexp-match #rx"find projects (.*)$" user-text) => (lambda (m) (call! "host_projects" (hasheq 'query (cadr m))))]
+           [(regexp-match? #rx"show history" user-text) (call! "git_history" (hasheq 'limit 10))]   ; datum 提交的工具卡片（标签片冒烟）
            [(regexp-match? #rx"propose tests" user-text)                        ; 工作区测试流程（T2 冒烟）：提议加一步
             (call! "tests_propose" (hasheq 'reason "add a lint step"
                                            'content "(test-flow (name \"demo\") (step check \"grep -q READY app.txt\") (step unit \"sh tests/t.sh\" #:parse unittest) (step lint \"true\"))"))]
@@ -132,6 +133,24 @@
     (with-output-to-file (build-path dir ".pi" "tests.rktd")
       (lambda () (write-string "(test-flow (name \"demo\") (step check \"grep -q READY app.txt\") (step unit \"sh tests/t.sh\" #:parse unittest))")))
     (with-output-to-file (build-path dir "tests" "t.sh") (lambda () (write-string "echo 'Ran 2 tests in 0.0s'; echo; echo OK"))))
+  ;; datum 提交的冒烟（--synth-history）：工作目录是 git 仓库，提交有人写的、带标签的、pi2 自动化的（datum 元数据 / trailer）、旧 3 项形状、很长的标题
+  (when (getenv "PI2_SEED_HISTORY")
+    (define (git . args) (parameterize ([current-directory dir] [current-output-port (open-output-nowhere)])
+                           (apply system* (find-executable-path "git") "-c" "user.email=t@t" "-c" "user.name=t" args)))
+    (git "init" "-q")
+    (for ([m (list "(FEAT \"Add the model picker\"\n\n(breaking (scope gui kernel))\n\"Picker in the title bar.\"\n)"
+                   "(FIX \"Fix the crash when the session list is empty\"\n\n()\n\"Guard the empty case.\"\n)"
+                   "(FEAT \"Add the commit history card\"\n\n((pi2 agent (session \"20261026-1200-0001\") (model \"deepseek-v4-flash\")))\n\"Automated.\"\n)"
+                   "(DOCS \"Old three-field message\"\n\n\"no metadata\"\n)"
+                   "mark task t3 done\n\nPi2-Automation: goal-driver; session=20261026-1200-0001"
+                   "(TEST \"Cover the picker\"\n\n()\n\"t\"\n)"
+                   "(BUILD \"Bump the CI image\"\n\n((CI github))\n\"b\"\n)"
+                   "(FIX \"Fix the reconnect loop\"\n\n((scope kernel))\n\"r\"\n)"
+                   "(FEAT \"Add the tests panel\"\n\n((pi2 goal-worker (session \"20261026-1200-0002\")))\n\"w\"\n)"
+                   "(REFACTOR \"A deliberately long title that will not fit on one line of the tool card so it has to be truncated with an ellipsis\"\n\n((scope gui) wip)\n\"x\"\n)")]
+          [i (in-naturals)])
+      (with-output-to-file (build-path dir (format "f~a.txt" i)) (lambda () (displayln i)))
+      (git "add" "-A") (git "commit" "-q" "-m" m)))
   ;; 指令分层冒烟（--synth-instructions）：全局文件 + 工作目录当 git 根、放一个 AGENTS.md
   (when (getenv "PI2_SEED_INSTRUCTIONS")
     (with-output-to-file (build-path cfg-home "AGENTS.md") (lambda () (write-string "GLOBAL-RULE: reply in English")))
